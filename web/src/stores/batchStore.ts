@@ -361,12 +361,20 @@ export const useBatchStore = create<BatchState>((set, get) => ({
     const { activeTaskId } = get()
     if (!activeTaskId) return
     if (!confirm('确定要终止当前批处理任务吗？')) return
-    await fetch(`/api/batch/${activeTaskId}/stop`, { method: 'POST' })
-    set({ isRunning: false })
-    if (eventSource) {
-      eventSource.close()
-      eventSource = null
+    try {
+      const response = await fetch(`/api/batch/${activeTaskId}/stop`, { method: 'POST' })
+      const result = await response.json()
+      if (!response.ok || !['CANCELLED', 'COMPLETED', 'FAILED'].includes(result.task_status)) {
+        throw new Error(result.detail || '后端未确认任务终止')
+      }
+      set({ isRunning: result.task_status === 'RUNNING' })
+      if (eventSource) {
+        eventSource.close()
+        eventSource = null
+      }
+      get().addLog('WARN', '批量任务已被用户强制终止')
+    } catch (error: any) {
+      get().addLog('FAILED', `终止任务失败: ${error.message}`)
     }
-    get().addLog('WARN', '批量任务已被用户强制终止')
   },
 }))

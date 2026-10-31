@@ -6,6 +6,7 @@ import csv
 import io
 import json
 import os
+import zipfile
 from typing import Any
 
 import openpyxl
@@ -14,6 +15,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from starlette.concurrency import run_in_threadpool
 
 from apis.agent import router as agent_router
 from core.cloud_client import UniversalCloudClient
@@ -22,7 +24,6 @@ from core.config import (
     delete_environment,
     get_environments_payload,
     load_config,
-    mask_secret,
     save_environment,
     switch_environment,
 )
@@ -175,10 +176,17 @@ class ConfigUpdate(BaseModel):
 @app.get("/api/config")
 def get_config():
     cfg = load_config()
-    masked = dict(cfg)
-    masked["secret_key"] = mask_secret(masked.get("secret_key", ""))
-    masked["has_secret"] = bool(cfg.get("secret_key"))
-    return {"status": "success", "data": masked}
+    env_payload = get_environments_payload(mask=True)
+    active_env = env_payload.get("active_env") or {}
+    # Return only the masked active environment and masked environment list.
+    # Never serialize the raw cfg because it contains nested cloud/live secrets.
+    safe_data = {
+        **active_env,
+        "active_env_id": env_payload.get("active_env_id"),
+        "environments": env_payload.get("environments", []),
+        "has_secret": bool(cfg.get("secret_key")),
+    }
+    return {"status": "success", "data": safe_data}
 
 
 @app.post("/api/config")
@@ -498,6 +506,76 @@ def sync_common_specs(service: str = Query("live")):
         raise HTTPException(status_code=500, detail=f"同步公共规范失败: {exc!s}") from exc
 
 
+MAX_BATCH_UPLOAD_BYTES = 10 * 1024 * 1024
+MAX_SPREADSHEET_EXPANDED_BYTES = 64 * 1024 * 1024
+MAX_SPREADSHEET_ROWS = 100_000
+MAX_SPREADSHEET_COLUMNS = 200
+
+
+def _validate_xlsx_archive(content: bytes) -> None:
+    try:
+        with zipfile.ZipFile(io.BytesIO(content)) as archive:
+            total_size = 0
+            for info in archive.infolist():
+                if info.file_size > MAX_SPREADSHEET_EXPANDED_BYTES:
+                    raise ValueError("Excel 压缩成员解压后超过限制")
+                total_size += info.file_size
+                if total_size > MAX_SPREADSHEET_EXPANDED_BYTES:
+                    raise ValueError("Excel 文件解压后总大小超过限制")
+                if info.compress_size and info.file_size / info.compress_size > 200:
+                    raise ValueError("检测到异常高压缩比，拒绝可能的压缩炸弹")
+    except (OSError, zipfile.BadZipFile) as exc:
+        raise ValueError("Excel 压缩包结构无效") from exc
+
+def _parse_batch_upload(filename: str, content: bytes) -> tuple[list[dict], str | None]:
+    rows: list[dict] = []
+    if filename.endswith(".xls"):
+        return [], "不支持旧版 .xls 格式，请另存为 .xlsx 后重新上传"
+    if filename.endswith(".xlsx"):
+        try:
+            _validate_xlsx_archive(content)
+            wb = openpyxl.load_workbook(io.BytesIO(content), read_only=True)
+            sheet = wb.active
+            if sheet is None:
+                return [], "Excel 工作表为空"
+            row_iter = sheet.iter_rows(values_only=True)
+            header_row = next(row_iter, None)
+            if not header_row:
+                return [], "Excel 文件为空"
+            header = [str(c or "").strip() for c in header_row[:MAX_SPREADSHEET_COLUMNS]]
+            for row_index, row in enumerate(row_iter, start=1):
+                if row_index > MAX_SPREADSHEET_ROWS:
+                    return [], "Excel 行数超过限制"
+                if any(row):
+                    rows.append({
+                        header[index]: str(value) if value is not None else ""
+                        for index, value in enumerate(row[:MAX_SPREADSHEET_COLUMNS])
+                        if index < len(header) and header[index]
+                    })
+        except (OSError, ValueError, zipfile.BadZipFile) as exc:
+            return [], str(exc)
+    elif filename.endswith(".csv"):
+        text = content.decode("utf-8-sig", errors="ignore")
+        reader = csv.DictReader(io.StringIO(text))
+        for row_index, row in enumerate(reader, start=1):
+            if row_index > MAX_SPREADSHEET_ROWS:
+                return [], "CSV 行数超过限制"
+            rows.append({k.strip(): str(v).strip() for k, v in row.items() if k})
+    elif filename.endswith(".json"):
+        try:
+            data = json.loads(content.decode("utf-8", errors="ignore"))
+        except json.JSONDecodeError as exc:
+            return [], f"JSON 格式无效: {exc.msg}"
+        if not isinstance(data, list):
+            return [], "JSON 必须为对象数组格式"
+        if len(data) > MAX_SPREADSHEET_ROWS:
+            return [], "JSON 行数超过限制"
+        rows = data
+    else:
+        return [], "仅支持 .xlsx, .csv, .json 格式文件"
+    return rows, None
+
+
 # ---------------- 批处理任务 ----------------
 @app.post("/api/batch/upload")
 async def upload_batch_file(file: UploadFile = File(...)):
@@ -505,45 +583,12 @@ async def upload_batch_file(file: UploadFile = File(...)):
     filename = raw_filename.lower()
     if not filename:
         raise HTTPException(status_code=400, detail="上传文件名不能为空")
-    content = await file.read()
-    rows = []
-
-    if filename.endswith((".xlsx", ".xls")):
-        wb = openpyxl.load_workbook(io.BytesIO(content), read_only=True)
-        sheet = wb.active
-        if sheet is None:
-            return {"status": "fail", "message": "Excel 工作表为空"}
-        all_rows = list(sheet.iter_rows(values_only=True))
-        if not all_rows:
-            return {"status": "fail", "message": "Excel 文件为空"}
-        header = [str(c or "").strip() for c in all_rows[0]]
-        for r in all_rows[1:]:
-            if any(r):
-                row_dict = {}
-                for index, val in enumerate(r):
-                    if index >= len(header):
-                        break
-                    h = header[index]
-                    if h:
-                        row_dict[h] = str(val) if val is not None else ""
-                rows.append(row_dict)
-    elif filename.endswith(".csv"):
-        text = content.decode("utf-8-sig", errors="ignore")
-        reader = csv.DictReader(io.StringIO(text))
-        for r in reader:
-            rows.append({k.strip(): str(v).strip() for k, v in r.items() if k})
-    elif filename.endswith(".json"):
-        text = content.decode("utf-8", errors="ignore")
-        try:
-            data = json.loads(text)
-        except json.JSONDecodeError as exc:
-            return {"status": "fail", "message": f"JSON 格式无效: {exc.msg}"}
-        if isinstance(data, list):
-            rows = data
-        else:
-            return {"status": "fail", "message": "JSON 必须为对象数组格式"}
-    else:
-        return {"status": "fail", "message": "仅支持 .xlsx, .csv, .json 格式文件"}
+    raw_content = await file.read(10 * 1024 * 1024 + 1)
+    if len(raw_content) > 10 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="批处理文件超过 10 MiB 限制")
+    rows, error_message = await run_in_threadpool(_parse_batch_upload, filename, raw_content)
+    if error_message:
+        return {"status": "fail", "message": error_message}
 
     return {
         "status": "success",

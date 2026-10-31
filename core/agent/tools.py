@@ -82,7 +82,13 @@ class CloudCallTool(Tool):
         high_risk_kws = self.bot_manager.get_high_risk_keywords() if self.bot_manager else HIGH_RISK_API_KEYWORDS
         is_high_risk = any(k in target_name.lower() for k in high_risk_kws)
 
-        if is_high_risk and self.approval_requester:
+        if is_high_risk:
+            if not self.approval_requester:
+                return {
+                    "ActionStatus": "CANCELLED",
+                    "ErrorCode": -998,
+                    "ErrorInfo": "高危操作缺少审批上下文，已按 fail-closed 策略拒绝执行。",
+                }
             target_desc = []
             if isinstance(clean_payload, dict):
                 # Live 云直播破坏性操作标识提取
@@ -132,7 +138,12 @@ class CloudCallTool(Tool):
                 return {
                     "ActionStatus": "CANCELLED",
                     "ErrorCode": -999,
-                    "ErrorInfo": f"⚠️ 操作已安全取消：用户拒绝了「{target_name}」高危调用的执行授权。未产生任何不可逆修改。"
+                    "RequiredApprovalPath": target_name,
+                    "ErrorInfo": (
+                        f"⚠️ 操作已安全取消：用户拒绝或未获得「{target_name}」高危调用的执行授权。"
+                        f"手动调试请同时设置 confirm_high_risk=true，"
+                        f"并将 approved_high_risk_paths 设为包含该 API 路径。"
+                    ),
                 }
 
         try:
@@ -1100,7 +1111,14 @@ class CallAgentTool(Tool):
     }
     output_type = "string"
 
-    def __init__(self, bot_id: str, bot_manager: BotManager, engine: Any | None = None, call_chain: list[str] | None = None):
+    def __init__(
+        self,
+        bot_id: str,
+        bot_manager: BotManager,
+        engine: Any | None = None,
+        call_chain: list[str] | None = None,
+        approval_requester: Any | None = None,
+    ):
 
 
 
@@ -1109,6 +1127,7 @@ class CallAgentTool(Tool):
         self.bot_manager = bot_manager
         self.engine = engine
         self.call_chain = call_chain or [bot_id]
+        self.approval_requester = approval_requester
 
     def forward(self, agent_name: str, task: str) -> str:
         raw_name = (agent_name or "").strip()
@@ -1180,7 +1199,8 @@ class CallAgentTool(Tool):
                 caller_bot_id=self.bot_id,
                 target_bot_id=target_bot.id,
                 task=task,
-                call_chain=self.call_chain
+                call_chain=self.call_chain,
+                approval_requester=self.approval_requester,
             )
             elapsed = round(time.time() - t0, 2)
             preview = result.strip()
@@ -1381,7 +1401,7 @@ def build_bot_tools(
             approval_requester=approval_requester
         ),
         ListAgentsTool(bot_manager),
-        CallAgentTool(bot_id, bot_manager, engine, call_chain),
+        CallAgentTool(bot_id, bot_manager, engine, call_chain, approval_requester),
         ReadFileTool(bot_id, bot_manager),
         SearchKnowledgeTool(bot_id)
     ]

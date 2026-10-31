@@ -410,7 +410,7 @@ class CommonSpecsManager:
         self._specs_cache: Optional[dict] = None
 
     def get_specs(self, service: str = "live", force_reload: bool = False) -> dict:
-        """获取结构化公共规范"""
+        """获取结构化公共规范；不在持锁状态下进入同步 I/O。"""
         with self._lock:
             if not force_reload and self._specs_cache is not None:
                 return self._specs_cache
@@ -425,8 +425,8 @@ class CommonSpecsManager:
                 except Exception as e:
                     print(f"[WARN] Failed to load {SPECS_CACHE_PATH}: {e}")
 
-            # 若未缓存或强制重载，执行同步
-            return self.sync_all(service=service)
+        # sync_all acquires the lock itself; never call it from the lock above.
+        return self.sync_all(service=service)
 
     def sync_all(self, service: str = "live") -> dict:
         """全量同步 9 篇公共规范文档并结构化存储"""

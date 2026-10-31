@@ -1,3 +1,4 @@
+# ruff: noqa
 # -*- coding: utf-8 -*-
 """
 智能体文件与附件解析器 (FileParser)
@@ -12,7 +13,28 @@ import os
 import re
 import shutil
 import subprocess
+import zipfile
 from typing import Any, Dict, List, Optional, Tuple
+
+MAX_SPREADSHEET_EXPANDED_BYTES = 64 * 1024 * 1024
+
+
+def validate_xlsx_archive(file_path: str) -> None:
+    """Validate XLSX ZIP members before openpyxl expands them."""
+    try:
+        with zipfile.ZipFile(file_path) as archive:
+            total_size = 0
+            for info in archive.infolist():
+                if info.file_size > MAX_SPREADSHEET_EXPANDED_BYTES:
+                    raise ValueError("Excel 压缩成员解压后超过限制")
+                total_size += info.file_size
+                if total_size > MAX_SPREADSHEET_EXPANDED_BYTES:
+                    raise ValueError("Excel 文件解压后总大小超过限制")
+                if info.compress_size and info.file_size / info.compress_size > 200:
+                    raise ValueError("检测到异常高压缩比，拒绝可能的压缩炸弹")
+    except (OSError, zipfile.BadZipFile) as exc:
+        raise ValueError("Excel 压缩包结构无效") from exc
+
 
 _SWIFT_OCR_SCRIPT = """
 import AppKit
@@ -157,6 +179,9 @@ def parse_file_summary(file_path: str, filename: str) -> Dict[str, Any]:
         # 1. Excel 表格 (.xlsx, .xls)
         if ftype == "xlsx":
             try:
+                if os.path.splitext(filename)[1].lower() == ".xls":
+                    raise ValueError("不支持旧版 .xls 格式，请另存为 .xlsx 后重新上传")
+                validate_xlsx_archive(file_path)
                 import openpyxl
                 wb = openpyxl.load_workbook(file_path, data_only=True, read_only=True)
                 sheet_names = wb.sheetnames

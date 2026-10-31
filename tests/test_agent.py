@@ -808,11 +808,11 @@ def test_tim_call_tool_high_risk_notice():
         res_normal = tool.forward("group_open_http_svc/get_group_info", {"GroupIdList": ["@TGS#1"]})
         assert "_security_notice" not in res_normal
 
-        # 2. 高危解散群接口，触发安全警告
+        # 2. 无审批上下文的高危接口必须 fail-closed，不得调用云端
         res_danger = tool.forward("group_open_http_svc/destroy_group", {"GroupId": "@TGS#1"})
-        assert "_security_notice" in res_danger
-        assert res_danger["_security_notice"]["is_high_risk"] is True
-        assert "破坏性高危操作" in res_danger["_security_notice"]["warning"]
+        assert res_danger["ActionStatus"] == "CANCELLED"
+        assert res_danger["ErrorCode"] == -998
+        mock_invoke.assert_not_called()
 
 
 def test_file_hub_and_regenerate_api(temp_bot_manager):
@@ -1007,7 +1007,8 @@ def test_rag_manager_and_knowledge_api(temp_bot_manager, tmp_path):
             json={"enabled": False}
         )
         assert res_toggle.status_code == 200
-        assert rag.get_document(bot_id, doc_meta["id"])["enabled"] is False
+        toggled_doc = rag.get_document(bot_id, doc_meta["id"])
+        assert toggled_doc is not None and toggled_doc["enabled"] is False
 
         # 4.4 删除文档
         res_del = client.delete(f"/api/agent/bots/{bot_id}/knowledge/docs/{doc_meta['id']}")
@@ -1249,10 +1250,13 @@ def test_fetch_available_models_api():
             {"id": "custom-tuned-v1", "object": "model"}
         ]
     }
-    with patch("requests.get", return_value=mock_resp):
+    with patch("requests.get", return_value=mock_resp), patch(
+        "apis.agent.socket.getaddrinfo",
+        return_value=[(2, 1, 6, "", ("93.184.216.34", 443))],
+    ):
         res2 = client.post("/api/agent/models", json={
             "provider": "custom",
-            "base_url": "http://mock-llm.local/v1",
+            "base_url": "https://example.com/v1",
             "api_key": "sk-mock-key"
         })
         assert res2.status_code == 200
@@ -1263,7 +1267,10 @@ def test_fetch_available_models_api():
         assert "custom-tuned-v1" in data2["models"]
 
     # 3. 模拟远程超时/异常时的优雅降级
-    with patch("requests.get", side_effect=Exception("Connection timed out")):
+    with patch("requests.get", side_effect=Exception("Connection timed out")), patch(
+        "apis.agent.socket.getaddrinfo",
+        return_value=[(2, 1, 6, "", ("93.184.216.34", 443))],
+    ):
         res3 = client.post("/api/agent/models", json={
             "provider": "openai",
             "base_url": "https://api.openai.com/v1",
@@ -1612,6 +1619,7 @@ def test_agent_multicloud_tools():
     # 4. Engine 组装与沙箱安全门禁覆盖
     engine = AgentEngine()
     bot = engine.manager.get_bot("default_assistant")
+    assert bot is not None
     sys_prompt = engine.assemble_system_prompt(bot)
     assert "cloud_call" in sys_prompt
     assert "云直播" in sys_prompt

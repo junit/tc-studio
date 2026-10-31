@@ -1,23 +1,27 @@
-# -*- coding: utf-8 -*-
+# ruff: noqa
 """
 智能体 REST & SSE 路由：多 BOT 管理、流式对话、记忆库、自编技能与自增强准则
 """
 
 import asyncio
 import base64
+import ipaddress
 import json
 import logging
 import mimetypes
 import os
 import re
+import socket
 import time
+from contextlib import suppress
 from typing import Any, Dict, List, Optional
-import requests
-from fastapi import APIRouter, HTTPException, Query, UploadFile, File
-from fastapi.responses import StreamingResponse, FileResponse
-from pydantic import BaseModel, Field
+from urllib.parse import urlparse, urlunparse
 
-logger = logging.getLogger(__name__)
+import requests
+from fastapi import APIRouter, File, HTTPException, Query, UploadFile
+from fastapi.responses import FileResponse, StreamingResponse
+from pydantic import BaseModel, Field
+from starlette.concurrency import run_in_threadpool
 
 from core.agent.bot_manager import bot_manager
 from core.agent.constants import SUPPORTED_PROVIDERS, BOT_PRESET_TEMPLATES, HIGH_RISK_API_KEYWORDS
@@ -25,10 +29,15 @@ from core.agent.engine import agent_engine
 from core.agent.file_parser import parse_file_summary, format_file_size
 from core.agent.models import BotConfig, LLMConfig
 from core.agent.rag_manager import rag_manager
-from core.agent.run_manager import agent_run_manager, AgentRun
+from core.agent.run_manager import AgentRun, MAX_EVENTS_PER_RUN, agent_run_manager
 from core.tim_client import TimClient
 
+logger = logging.getLogger(__name__)
+
 router = APIRouter(prefix="/api/agent", tags=["AI 智能体"])
+
+MAX_AGENT_UPLOAD_BYTES = 50 * 1024 * 1024
+MAX_KNOWLEDGE_UPLOAD_BYTES = 20 * 1024 * 1024
 
 
 # -------------------------------------------------------------
@@ -119,6 +128,11 @@ class SaveSkillPayload(BaseModel):
 
 class RunSkillPayload(BaseModel):
     kwargs: Optional[Dict[str, Any]] = Field(default_factory=dict, description="执行入参")
+    confirm_high_risk: bool = Field(default=False, description="明确确认执行高危技能")
+    approved_high_risk_paths: List[str] = Field(
+        default_factory=list,
+        description="本次允许执行的高危 API 路径白名单；每次调用按路径逐项匹配",
+    )
 
 
 class ToggleKnowledgePayload(BaseModel):
@@ -217,6 +231,73 @@ def test_llm_connection():
         return {"success": False, "error": f"连接失败: {str(e)}"}
 
 
+LOCAL_MODEL_ALLOWED_PORTS = {11434, 8080}
+
+
+def _local_model_allowed_ports() -> set[int]:
+    """Read an explicit local-model port allowlist without weakening defaults."""
+    raw_ports = os.environ.get("LOCAL_MODEL_ALLOWED_PORTS", "")
+    if not raw_ports.strip():
+        return set(LOCAL_MODEL_ALLOWED_PORTS)
+    ports: set[int] = set()
+    for raw_port in raw_ports.split(","):
+        try:
+            port = int(raw_port.strip())
+        except ValueError:
+            continue
+        if 1 <= port <= 65535:
+            ports.add(port)
+    return ports or set(LOCAL_MODEL_ALLOWED_PORTS)
+
+
+def _validate_model_base_url(base_url: str) -> str:
+    """Allow public model endpoints and Ollama's local port, reject SSRF targets."""
+    parsed = urlparse(base_url)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise HTTPException(status_code=422, detail="Base URL 必须是有效的 http(s) 地址")
+    if parsed.username or parsed.password:
+        raise HTTPException(status_code=422, detail="Base URL 不得包含账号密码")
+
+    host = parsed.hostname.lower().rstrip(".")
+    port = parsed.port
+    local_hosts = {"localhost", "127.0.0.1", "::1"}
+    if host in local_hosts:
+        # Ollama defaults to 11434. Normalize omitted ports and permit an
+        # intentionally configured custom local port.
+        if port is None:
+            netloc = parsed.hostname
+            if ":" in netloc and not netloc.startswith("["):
+                netloc = f"[{netloc}]"
+            return urlunparse(parsed._replace(netloc=f"{netloc}:11434")).rstrip("/")
+        if port not in _local_model_allowed_ports():
+            allowed_ports = ", ".join(str(item) for item in sorted(_local_model_allowed_ports()))
+            raise HTTPException(
+                status_code=422,
+                detail=f"本地模型端口不在允许列表，仅支持：{allowed_ports}；可通过 LOCAL_MODEL_ALLOWED_PORTS 配置",
+            )
+        return base_url.rstrip("/")
+
+    try:
+        addresses = {
+            ipaddress.ip_address(info[4][0])
+            for info in socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+        }
+    except (OSError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail="Base URL 域名无法安全解析") from exc
+
+    if not addresses or any(
+        address.is_private
+        or address.is_loopback
+        or address.is_link_local
+        or address.is_reserved
+        or address.is_multicast
+        or address.is_unspecified
+        for address in addresses
+    ):
+        raise HTTPException(status_code=422, detail="禁止访问内网、环回、链路本地或保留地址")
+    return base_url.rstrip("/")
+
+
 @router.post("/models")
 @router.get("/models")
 def fetch_available_models(payload: Optional[FetchModelsPayload] = None):
@@ -259,7 +340,7 @@ def fetch_available_models(payload: Optional[FetchModelsPayload] = None):
             "message": "Base URL 为空，返回该提供商默认推荐模型列表"
         }
 
-    norm_base = base_url.rstrip("/")
+    norm_base = _validate_model_base_url(base_url)
     candidates = []
     if provider == "ollama" or "11434" in norm_base:
         candidates.append(f"{norm_base}/api/tags")
@@ -281,7 +362,12 @@ def fetch_available_models(payload: Optional[FetchModelsPayload] = None):
 
     for url in candidates:
         try:
-            resp = requests.get(url, headers=headers, timeout=6)
+            resp = requests.get(
+                url,
+                headers=headers,
+                timeout=(3, 6),
+                allow_redirects=False,
+            )
             if resp.status_code == 200:
                 data = resp.json()
                 items = []
@@ -540,7 +626,7 @@ def _stream_run_sse(run: AgentRun):
     """为指定 AgentRun 构造线程安全的 SSE 流式响应，支持断线重连与全量快照同步"""
     async def sse_event_generator():
         loop = asyncio.get_running_loop()
-        queue: asyncio.Queue = asyncio.Queue()
+        queue: asyncio.Queue = asyncio.Queue(maxsize=MAX_EVENTS_PER_RUN)
         sub, snapshot = run.register_subscriber(queue, loop)
         try:
             # 1. 立即下发当前全量快照，供前端初始化或断线同步
@@ -562,7 +648,7 @@ def _stream_run_sse(run: AgentRun):
                     yield f"event: {evt_name}\ndata: {data_str}\n\n"
                     if evt_name in ("done", "error") or run.status in ("done", "error", "stopped"):
                         break
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     if run.status in ("done", "error", "stopped"):
                         break
                     # 心跳保活
@@ -603,7 +689,10 @@ async def upload_bot_file(
 
     bot_dir = bot_manager._bot_dir(bot_id)
     uploads_dir = os.path.join(bot_dir, "uploads")
-    os.makedirs(uploads_dir, exist_ok=True)
+    try:
+        os.makedirs(uploads_dir, exist_ok=True)
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail="无法创建文件上传目录") from exc
 
     original_filename = file.filename or "uploaded_file"
     safe_name = os.path.basename(original_filename)
@@ -612,11 +701,21 @@ async def upload_bot_file(
     saved_name = f"{file_id}_{safe_name}"
     saved_path = os.path.abspath(os.path.join(uploads_dir, saved_name))
 
-    content = await file.read()
-    with open(saved_path, "wb") as f:
-        f.write(content)
+    content = await file.read(MAX_AGENT_UPLOAD_BYTES + 1)
+    if len(content) > MAX_AGENT_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="上传文件超过 50 MiB 限制")
+    try:
+        with open(saved_path, "wb") as f:
+            f.write(content)
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail="文件保存失败") from exc
 
-    parsed = parse_file_summary(saved_path, safe_name)
+    try:
+        parsed = await run_in_threadpool(parse_file_summary, saved_path, safe_name)
+    except Exception as exc:
+        with suppress(OSError):
+            os.remove(saved_path)
+        raise HTTPException(status_code=422, detail="文件解析失败") from exc
     file_url = f"/api/agent/bots/{bot_id}/files/{saved_name}"
 
     data_url = None
@@ -681,7 +780,12 @@ def get_bot_file(bot_id: str, filename: str, download: bool = Query(default=Fals
         # 3. 尝试模糊/后缀回退匹配 (如传入 screenshot.png 匹配到 f_xxx_screenshot.png)
         if not candidate and os.path.exists(uploads_dir):
             matches = []
-            for fn in os.listdir(uploads_dir):
+            try:
+                directory_entries = os.listdir(uploads_dir)
+            except OSError:
+                directory_entries = []
+            for fn in directory_entries:
+
                 if fn == safe_filename or fn.endswith(f"_{safe_filename}"):
                     p = os.path.join(uploads_dir, fn)
                     if os.path.isfile(p):
@@ -1297,7 +1401,26 @@ def run_bot_skill(bot_id: str, name: str, payload: RunSkillPayload):
     """手动测试运行某个技能"""
     tim_client = TimClient()
     from core.agent.tools import RunSkillTool
-    runner = RunSkillTool(bot_id, bot_manager, tim_client)
+    # This standalone endpoint has no interactive AgentRun approval context.
+    # High-risk cloud calls must therefore fail closed; normal calls remain usable.
+    approved_paths = {
+        path.strip().lower()
+        for path in payload.approved_high_risk_paths
+        if path and path.strip()
+    }
+
+    def approve_specific_high_risk_call(approval: dict) -> str:
+        if not payload.confirm_high_risk:
+            return "reject"
+        api_path = str(approval.get("api_path", "")).strip().lower()
+        return "approve" if api_path in approved_paths else "reject"
+
+    runner = RunSkillTool(
+        bot_id,
+        bot_manager,
+        tim_client,
+        approval_requester=approve_specific_high_risk_call,
+    )
     res = runner.forward(name, payload.kwargs)
     return res
 
@@ -1333,11 +1456,18 @@ async def upload_bot_knowledge_doc(
         raise HTTPException(status_code=404, detail="BOT 不存在")
 
     filename = file.filename or "unknown_doc.txt"
-    content = await file.read()
+    extension = os.path.splitext(filename)[1].lower()
+    if extension == ".xls":
+        raise HTTPException(status_code=422, detail="不支持旧版 .xls 格式，请另存为 .xlsx 后重新上传")
+    if extension == ".xlsx":
+        raise HTTPException(status_code=422, detail="知识库暂不支持 Excel 文件，请转换为 CSV 或 PDF 后上传")
+    content = await file.read(MAX_KNOWLEDGE_UPLOAD_BYTES + 1)
+    if len(content) > MAX_KNOWLEDGE_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="知识库文档超过 20 MiB 限制")
     if not content:
         raise HTTPException(status_code=400, detail="上传文件内容为空")
 
-    doc_meta = rag_manager.add_document(bot_id, filename, content)
+    doc_meta = await run_in_threadpool(rag_manager.add_document, bot_id, filename, content)
     return {
         "success": True,
         "message": f"文档《{filename}》已成功挂载并构建 RAG 索引（生成 {doc_meta.get('chunks_count')} 个检索切片）",

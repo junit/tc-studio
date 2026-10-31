@@ -79,6 +79,8 @@ class BotManager:
                 cfg["api_key_masked"] = "***"
         else:
             cfg["api_key_masked"] = ""
+        # The raw credential must never cross the API boundary.
+        cfg["api_key"] = ""
         cfg["has_api_key"] = bool(key)
         return cfg
 

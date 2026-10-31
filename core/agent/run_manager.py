@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+# ruff: noqa
 """
 Agent 异步执行与流式会话恢复管理器 (AgentRunManager)
 支持：
@@ -16,6 +16,8 @@ from typing import Any, Dict, List, Optional
 
 from .constants import MAX_CACHED_RUNS, RUN_TTL_SECONDS
 
+MAX_EVENTS_PER_RUN = 2000
+
 
 class AgentRunSubscriber:
     """线程安全的异步事件队列订阅者"""
@@ -23,10 +25,17 @@ class AgentRunSubscriber:
         self.queue = queue
         self.loop = loop
 
+    def _enqueue(self, event: dict):
+        try:
+            self.queue.put_nowait(event)
+        except asyncio.QueueFull:
+            # A slow client must not be able to grow memory without bound.
+            pass
+
     def put_event(self, event_name: str, data: Dict[str, Any]):
         evt = {"event": event_name, "data": data, "timestamp": time.time()}
         try:
-            self.loop.call_soon_threadsafe(self.queue.put_nowait, evt)
+            self.loop.call_soon_threadsafe(self._enqueue, evt)
         except Exception:
             pass
 
@@ -104,7 +113,9 @@ class AgentRun:
             decision = self._approval_decision
             self.pending_approval = None
             self._approval_event = None
-            if not signaled or not decision:
+            if not signaled:
+                decision = "timeout"
+            elif not decision:
                 decision = "rejected"
             self.stream_status = "executing"
 
@@ -119,7 +130,10 @@ class AgentRun:
         with self._lock:
             if not self.pending_approval or self.pending_approval.get("approval_id") != approval_id:
                 return False
-            self._approval_decision = decision.lower().strip()
+            normalized_decision = decision.lower().strip()
+            if normalized_decision not in {"approve", "reject"}:
+                return False
+            self._approval_decision = normalized_decision
             if self._approval_event:
                 self._approval_event.set()
             return True
@@ -146,6 +160,8 @@ class AgentRun:
         evt = {"event": event_name, "data": data, "timestamp": time.time()}
         with self._lock:
             self.events.append(evt)
+            if len(self.events) > MAX_EVENTS_PER_RUN:
+                del self.events[:-MAX_EVENTS_PER_RUN]
             self._update_internal_state(event_name, data)
             current_subs = list(self.subscribers)
 

@@ -595,7 +595,8 @@ class AgentEngine:
         caller_bot_id: str,
         target_bot_id: str,
         task: str,
-        call_chain: list[str] | None = None
+        call_chain: list[str] | None = None,
+        approval_requester: Any | None = None,
     ) -> str:
         """为协同调度执行子任务 (同步返回目标智能体的最终输出)"""
         chain = call_chain or [caller_bot_id]
@@ -619,12 +620,27 @@ class AgentEngine:
         llm_cfg = self.get_effective_llm_config(target_bot)
         model = self.create_model(llm_cfg)
         new_chain = chain + [target_bot_id]
+        delegated_approval_requester = approval_requester
+        if approval_requester:
+            def delegated_approval_request(request: dict):
+                enriched = dict(request)
+                enriched.update({
+                    "caller_bot_id": caller_bot_id,
+                    "caller_bot_name": caller_name,
+                    "target_bot_id": target_bot_id,
+                    "target_bot_name": target_bot.name,
+                    "delegation_chain": list(new_chain),
+                })
+                return approval_requester(enriched)
+            delegated_approval_requester = delegated_approval_request
+
         tools = build_bot_tools(
             target_bot_id,
             self.manager,
             self.tim_client,
             engine=self,
             call_chain=new_chain,
+            approval_requester=delegated_approval_requester,
             cloud_client=self.cloud_client
         )
         system_prompt = self.assemble_system_prompt(target_bot)
@@ -677,7 +693,11 @@ class AgentEngine:
         def subtask_bot_open(file, mode="r", *args, **kwargs):
             return _confined_open(target_uploads_dir, file, mode, *args, **kwargs)
 
-        subtask_cloud_call = next((t for t in tools if isinstance(t, CloudCallTool)), None) or CloudCallTool(bot_manager=self.manager, tim_client=self.tim_client)
+        subtask_cloud_call = next((t for t in tools if isinstance(t, CloudCallTool)), None) or CloudCallTool(
+            bot_manager=self.manager,
+            tim_client=self.tim_client,
+            approval_requester=delegated_approval_requester,
+        )
         subtask_search_tool = next((t for t in tools if isinstance(t, CloudSearchApisTool)), None) or CloudSearchApisTool()
         subtask_doc_tool = next((t for t in tools if isinstance(t, CloudGetDocTool)), None) or CloudGetDocTool()
 

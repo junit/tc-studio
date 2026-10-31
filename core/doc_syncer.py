@@ -728,11 +728,17 @@ class DocSyncManager:
                 # 温和间隔避免过于激进的请求突发
                 time.sleep(0.08)
 
-            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-                futures = [executor.submit(process_item, item) for item in apis_list]
+            executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
+            futures = [executor.submit(process_item, item) for item in apis_list]
+            try:
                 for f in concurrent.futures.as_completed(futures):
                     if self._cancel_requested:
                         break
+            finally:
+                for future in futures:
+                    future.cancel()
+                # Do not block the cancellation response on in-flight network work.
+                executor.shutdown(wait=False, cancel_futures=True)
 
             with self._lock:
                 self._is_running = False

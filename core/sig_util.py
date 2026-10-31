@@ -7,23 +7,30 @@ import base64
 import hashlib
 import hmac
 import json
+import threading
 import time
 import zlib
+from collections import OrderedDict
 
-_sig_cache = {}
+_SIG_CACHE_MAX = 1024
+_sig_cache: OrderedDict[tuple[int, str, str, int], tuple[str, int, int]] = OrderedDict()
+_sig_cache_lock = threading.Lock()
 
 
 def gen_user_sig(sdkappid: int, key: str, identifier: str, expire: int = 86400 * 7) -> str:
-    """
-    生成腾讯云 IM UserSig (TLSSigAPIv2)，内置内存缓存
-    """
-    cache_key = (sdkappid, key, identifier)
+    """生成 UserSig；缓存不保存原始密钥，且按 expire 隔离。"""
     curr_time = int(time.time())
-    if cache_key in _sig_cache:
-        cached_sig, gen_time, exp = _sig_cache[cache_key]
-        # 缓存有效期还剩 1 小时以上直接复用
-        if curr_time < gen_time + exp - 3600:
-            return cached_sig
+    # A one-way fingerprint prevents the process cache from retaining the secret itself.
+    key_fingerprint = hashlib.sha256(key.encode("utf-8")).hexdigest()
+    cache_key = (int(sdkappid), key_fingerprint, str(identifier), int(expire))
+    with _sig_cache_lock:
+        cached = _sig_cache.get(cache_key)
+        if cached:
+            cached_sig, gen_time, cached_expire = cached
+            if curr_time < gen_time + cached_expire - 3600:
+                _sig_cache.move_to_end(cache_key)
+                return cached_sig
+            _sig_cache.pop(cache_key, None)
 
     sig_doc = {
         "TLS.ver": "2.0",
@@ -45,5 +52,9 @@ def gen_user_sig(sdkappid: int, key: str, identifier: str, expire: int = 86400 *
     base64_str = base64.b64encode(compressed).decode("utf-8")
     user_sig = base64_str.replace("+", "*").replace("/", "-").replace("=", "_")
 
-    _sig_cache[cache_key] = (user_sig, curr_time, expire)
+    with _sig_cache_lock:
+        _sig_cache[cache_key] = (user_sig, curr_time, int(expire))
+        _sig_cache.move_to_end(cache_key)
+        while len(_sig_cache) > _SIG_CACHE_MAX:
+            _sig_cache.popitem(last=False)
     return user_sig

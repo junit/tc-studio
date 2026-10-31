@@ -16,9 +16,11 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
+from fastapi import HTTPException
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
+from apis.agent import _validate_model_base_url
 from apis.base import safe_int
 from apis.c2c_msg import BatchSendMsgApi, SendMsgApi
 from apis.group import AddGroupMemberApi
@@ -135,8 +137,58 @@ def test_run_skill_ast_security_gate(tmp_path):
 
 
 
+def test_local_ollama_url_defaults_and_custom_port():
+    """本地 Ollama 省略默认端口与自定义端口都应可被安全规范化。"""
+    assert _validate_model_base_url("http://localhost") == "http://localhost:11434"
+    assert _validate_model_base_url("http://localhost:8080") == "http://localhost:8080"
+    assert _validate_model_base_url("http://127.0.0.1") == "http://127.0.0.1:11434"
+
+    with pytest.raises(HTTPException) as exc_info:
+        _validate_model_base_url("http://localhost:6379")
+    assert exc_info.value.status_code == 422
+    assert "允许列表" in str(exc_info.value.detail)
+
+def test_legacy_xls_has_actionable_upload_error():
+    """合法/非法 .xls 均不应被误报为损坏的 xlsx 压缩包。"""
+    from app import _parse_batch_upload
+
+    rows, error = _parse_batch_upload("legacy.xls", b"not-a-zip")
+    assert rows == []
+    assert error == "不支持旧版 .xls 格式，请另存为 .xlsx 后重新上传"
+
+
+def test_file_parser_rejects_legacy_xls_before_openpyxl(tmp_path):
+    """会话附件解析也必须给旧版 XLS 明确提示。"""
+    from core.agent.file_parser import parse_file_summary
+
+    path = tmp_path / "legacy.xls"
+    path.write_bytes(b"not-a-zip")
+    result = parse_file_summary(str(path), path.name)
+    assert "不支持旧版 .xls" in result["summary"]
+
+
+
+def test_approval_timeout_is_distinguished_from_rejection():
+    """审批超时应向前端发出 timeout，便于恢复快照展示正确语义。"""
+    run = AgentRun("run-timeout", "bot-timeout", "test")
+    decision = run.request_approval({"approval_id": "approval-timeout", "timeout_seconds": 0.01})
+    assert decision == "timeout"
+    assert run.pending_approval is None
+    assert run.stream_status == "executing"
+    assert run.events[-1]["event"] == "approval_resolved"
+    assert run.events[-1]["data"]["decision"] == "timeout"
+
+
+def test_invalid_approval_decision_is_rejected():
+    """审批接口不得接受 approve/reject 之外的任意字符串。"""
+    run = AgentRun("run-invalid", "bot-invalid", "test")
+    run.request_approval({"approval_id": "approval-invalid", "timeout_seconds": 1})
+    assert run.resolve_approval("approval-invalid", "maybe") is False
+
+
 def test_run_skill_approval_wait_does_not_consume_timeout(tmp_path, monkeypatch):
     """审批等待超过技能 deadline 后仍应返回明确的用户取消结果。"""
+
     import core.agent.tools as tools_module
     from core.agent.bot_manager import BotManager
 
@@ -522,4 +574,36 @@ def test_config_transaction_is_reentrant(tmp_path, monkeypatch):
             config_module.save_config(initial)
 
     assert config_module.load_raw_config()["active_env_id"] == "env_default"
+
+
+def test_local_model_ports_can_be_explicitly_configured(monkeypatch):
+    """第三方本地运行时端口只能通过显式白名单启用。"""
+    with pytest.raises(HTTPException) as exc_info:
+        _validate_model_base_url("http://localhost:1234")
+    assert exc_info.value.status_code == 422
+    monkeypatch.setenv("LOCAL_MODEL_ALLOWED_PORTS", "11434,1234")
+    assert _validate_model_base_url("http://localhost:1234") == "http://localhost:1234"
+
+
+def test_high_risk_rejection_exposes_required_path(tmp_path):
+    """手动高危调试拒绝时返回可直接复制的 API 路径。"""
+    from core.agent.bot_manager import BotManager
+
+    mgr = BotManager(data_dir=str(tmp_path / "data"))
+    bot = mgr.create_bot("test_manual_approval", "手动审批测试")
+    mgr.save_skill(
+        bot.id,
+        "dangerous_skill",
+        "高危技能",
+        "result = cloud_call('destroy_group', {'GroupId': 'test'})",
+    )
+    from core.agent.tools import CloudCallTool
+    runner = CloudCallTool(
+        bot_manager=mgr,
+        tim_client=TimClient(),
+        approval_requester=lambda _approval: "reject",
+    )
+    result = runner.forward("group_open_http_svc/destroy_group", {"GroupId": "test"})
+    assert result["RequiredApprovalPath"] == "group_open_http_svc/destroy_group"
+    assert "approved_high_risk_paths" in result["ErrorInfo"]
 

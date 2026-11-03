@@ -60,7 +60,7 @@ TC Studio 彻底告别零散脚本与繁琐鉴权，提供开箱即用的浏览�
 ### 2. 🧪 Postman 级接口调试工作台 (Workbench)
 - **多标签页与状态持久化**：支持同时打开多个跨业务接口独立调试；标签页、表单参数草稿与激活状态**自动在本地持久化记忆**，刷新页面或切换菜单不丢失上下文。
 - **动态表单与专业 JSON 双向无缝转换**：支持友好**表单模式（Form）**与**专业 JSON 模式**实时双向同步，自适应嵌套对象与数组结构体。
-- **TC3 签名与 cURL 实时预览**：实时展示当前请求生成的 `Authorization: TC3-HMAC-SHA256` 头部与标准 cURL 命令，方便开发者一键复制联调。
+- **TC3 签名与 cURL 终端脱机运行**：实时组装标准可执行 cURL 脚本（自动计算当前时间戳 `X-TC-Timestamp`、合规紧凑 JSON 报文签名与防重放随机数），直接粘贴至终端即可脱机运行；界面默认采用国际通用星号掩码（`...******...`）防投屏窥视，支持一键切换显隐及双向复制（「复制脱敏模板」用于安全分享，「复制可执行真实命令」用于脱机调试并附带安全合规警示）。
 - **高频与最近打开智能推荐**：无打开标签页时，自动聚合展示高频常用接口与最近调试记录。
 - **预览模式（Dry-Run）**：开启后仅执行入参校验与请求报文结构生成，不向腾讯云发起真实网络写入，防止生产误操作。
 - **调用历史对账**：每个接口独立记录本地调用历史与完整回执，支持一键清空与回放。
@@ -296,6 +296,8 @@ python3 app.py
 
 企业局域网中的 Ollama、vLLM 或 OpenAI 兼容模型默认仍会被出站 SSRF 守卫拦截。部署方明确批准后，可用逗号分隔的精确主机名、IP 或 CIDR 配置 `ALLOW_PRIVATE_MODEL_HOSTS`，例如 `ALLOW_PRIVATE_MODEL_HOSTS=10.20.0.15,gpu.internal,192.168.20.0/24`；域名解析到的所有地址都必须是私有地址，通配符和 `host:port` 不受支持。Ollama 以外的端口可另用 `LOCAL_MODEL_ALLOWED_PORTS` 配置。
 
+> 💡 **代理/TUN 模式避坑提示**：若本地开启了 Clash / Surge / Shadowrocket 等代理客户端的 TUN 增强模式（Fake-IP），公网模型域名（如 `api.deepseek.com`）可能会被宿主机解析为 `198.18.x.x` 保留网段而触发 SSRF 拦截。此时可在启动时配置环境变量显式放行，例如：`ALLOW_PRIVATE_MODEL_HOSTS="api.deepseek.com,dashscope.aliyuncs.com,api.openai.com" python3 app.py`。
+
 ---
 
 ## 🔌 扩展接入腾讯云其它 API 3.0 业务 (TRTC / VOD 等)
@@ -332,32 +334,58 @@ pytest
 
 ---
 
-## 🔐 可插拔认证（本地 / OIDC / Keycloak / Authentik）
+## 🔐 可插拔企业级认证（本地开发 / OIDC / Keycloak / Authentik）
 
-认证默认关闭，仅限本地开发模式（`APP_ENV=development`、`dev` 或 `local`）使用；任何其他环境（包括拼写错误的环境名，如 `prodcution`）在未启用认证时将直接拒绝 API 请求（除非显式设置 `ALLOW_INSECURE_LOCAL_AUTH=true`）。内网或公网部署必须启用 OIDC；Keycloak、Authentik 及企业 OIDC 均可使用同一接口。
+系统提供**开箱即用与生产严格防御（Fail-Closed）兼备**的可插拔鉴权机制。在本地开发模式（`APP_ENV=development/dev/local`）下认证默认关闭并自动使用本地管理员身份；在任何非本地或生产部署中，系统默认阻断匿名访问，必须启用标准 OIDC 认证。
+
+### 1. 环境变量配置指南
 
 ```bash
+# 启用 OIDC 认证
 export AUTH_ENABLED=true
 export AUTH_PROVIDER=oidc
 export OIDC_ISSUER_URL=https://sso.example.com/realms/ops
 export OIDC_AUDIENCE=tim-studio
 export OIDC_CLIENT_ID=tim-studio
-# 可选：不填则使用 Keycloak 默认 JWKS 地址
+
+# 可选：自定义 JWKS 公钥验签端点（默认自动取 Keycloak 标准端点）
 export OIDC_JWKS_URL=https://sso.example.com/realms/ops/protocol/openid-connect/certs
+
+# 启动服务
 python3 app.py
 ```
 
-前端可将短期 OIDC access token 写入 `sessionStorage` 的 `tim_access_token`；普通 `fetch` 和批处理流式请求会自动附加 Bearer Token，且仅限同源 `/api/` 请求。仅在 `pnpm dev` 的 Vite 开发构建中，可通过未提交的 `.env.development.local` 设置 `VITE_OIDC_DEV_ACCESS_TOKEN` 作为临时联调凭据；生产构建会忽略该变量，绝不要把生产令牌写入 `VITE_*` 配置、源码或 `localStorage`。
+### 2. RBAC 角色与权限矩阵
 
-管理员角色可通过 OIDC claims 的 `roles`、`groups`、`realm_access.roles` 或 `resource_access[OIDC_CLIENT_ID].roles` 提供。配置、LLM 配置和安全策略接口要求 `admin`/`administrator`；技能运行和云操作要求 `admin`/`operator`/`editor`。本地模式自动使用本地管理员身份，仅适用于可信单用户部署。
+系统通过解码 OIDC Token claims（自动识别 `roles`、`groups`、`realm_access.roles` 或 `resource_access`）提取用户角色，并实行严格分级授权：
 
-启用 OIDC 后，当前前端负责携带已有 access token，但不内置 OAuth Authorization Code 登录/回调页面。生产环境应配合 Keycloak/Authentik 登录页、oauth2-proxy、企业 SSO 网关或后续专用前端登录流程。没有这些组件时，直接打开页面会得到 401，这是预期的 fail-closed 行为。
+| 角色 / 身份 | 允许操作的范围 | 核心限制与保护策略 |
+| :--- | :--- | :--- |
+| **`admin` / `administrator`** (系统管理员) | • 系统与 LLM 大模型配置<br>• 多环境凭证增删改与测试<br>• 转移私有 Bot 归属<br>• 查看/复制完整未脱敏签名凭据<br>• 查看并清空所有人的批处理台账 | 具备最高控制权限，向剪贴板写入未脱敏签名时系统自动弹出安全操作警示。 |
+| **`operator` / `editor`** (业务运维/开发) | • 接口单次调用与预览（Dry-Run）<br>• 发起/管理自己的批处理任务<br>• 使用 AI 智能体并持久化独立会话记忆<br>• 执行已授权的 Agent 运维技能 | **凭据自动脱敏保护**：cURL 脚本与响应中的有效签名（UserSig/TC3）由服务端自动抹除（`<redacted>`），从源头阻断权限越界与外泄。 |
+| **未授权 / 匿名访问** | • 仅限静态资产及文档中心浏览 | 在 `AUTH_ENABLED=true` 时，所有 `/api/` 路由严格返回 HTTP 401。 |
 
-认证启用后，旧版本创建且 `owner_id` 为空的私有 BOT 不会自动归属到任何用户；管理员应通过 `POST /api/agent/bots/{bot_id}/ownership` 显式转移到正确的 OIDC subject，避免错误自动认领造成越权。
+### 3. 生产部署与单点登录（SSO）接入推荐
 
-当前云 API、批处理和 Agent 操作默认使用服务端激活环境中的全局腾讯云凭据。`operator` 角色控制“谁可以发起操作”，不提供租户级云账号、费用或配额隔离。需要严格的租户成本/配额边界时，必须为租户配置独立凭据或云 RAM 子账号，并增加配额、审计和计费归属。
+TC Studio 前端为纯静态轻量单页应用（SPA），支持在请求头中自动携带 `Authorization: Bearer <token>`：
+* **Token 注入**：前端加载时会自动读取 `sessionStorage.getItem('tim_access_token')` 并附加到所有同源 `/api/` 请求中；
+* **生产推荐架构**：TC Studio 本身不内置 OAuth 授权码重定向页面。生产环境推荐前置部署 **[oauth2-proxy](https://oauth2-proxy.github.io/oauth2-proxy/)**、API 网关（如 APISIX/Traefik）或企业反向代理：
+  ```text
+  [ 浏览器客户端 ] 
+         │
+         ▼
+  [ oauth2-proxy / SSO 网关 ] ── (未登录跳 Keycloak 登录页，登录后注入 Bearer Token)
+         │
+         ▼
+  [ TC Studio (FastAPI) ] ──── (OIDC JWKS 本地验签 + 角色判定 + 租户记忆隔离)
+  ```
 
-> 认证只解决“用户是谁”；Bot、文件、历史和知识库的 owner/member 资源授权仍需在业务层继续实现。公网部署还必须使用 HTTPS、反向代理、速率限制和出站网络控制。
+### 4. 升级与租户安全注意事项
+
+1. **私有 Bot 资产迁移**：开启认证后，旧版本创建且 `owner_id` 为空的私有 Bot 不会自动认领给任何人（避免越权）。管理员可通过 `POST /api/agent/bots/{bot_id}/ownership` 显式分配给指定用户的 OIDC Subject。
+2. **云凭证配额隔离**：当前所有云操作默认使用激活环境配置的腾讯云 API 密钥。`operator` 控制“谁有权发起操作”，如需物理级租户费用与额度隔离，需为对应租户配置独立子账号（RAM Role）。
+
+> 💡 **架构原则**：认证解决“用户是谁”与系统级 RBAC，Bot、任务历史与知识库由系统按 `owner_id` 自动实行逻辑租户隔离。公网生产部署建议配合 HTTPS、反向代理速率限制与出站安全控制。
 
 ---
 
@@ -365,7 +393,7 @@ python3 app.py
 
 1. **零第三方网络依赖**：除向腾讯云官方 API 域名（如 `console.tim.qq.com` 或 `live.tencentcloudapi.com`）发起您主动调试的请求外，TC Studio 不向任何第三方服务器发送用户数据或凭据。
 2. **高危人机协同门禁**：对断流、禁推、解散群、删除账号等破坏性 API 实施沙箱拦截与人机确认，严防模型幻觉造成线上事故。
-3. **密钥全链路脱敏**：控制台接口返回的密钥全部经过掩码脱敏处理，防止屏幕截屏或分享时泄露核心 Key。
+3. **凭据与签名全链路脱敏**：环境密钥与 cURL 命令中的敏感签名（UserSig / TC3 Authorization）在界面默认采用星号脱敏防截屏泄露；企业模式下非管理员在服务端自动剥离凭据，向剪贴板写入有效高权凭据时自动触发醒目警示。
 4. **本地离线审计**：批量执行的明细台账、请求日志全部保存在本地 `storage/` 与 `data/` 目录中，随时可在页面上一键彻底清空。
 
 ---

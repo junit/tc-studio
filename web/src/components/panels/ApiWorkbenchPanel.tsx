@@ -27,6 +27,7 @@ import {
   Eye,
   EyeOff,
   ShieldCheck,
+  ShieldAlert,
   X,
   Plus,
   Search,
@@ -148,7 +149,13 @@ export function sanitizePayloadTypes(
         delete result[key]
       } else if (typeof val === 'string') {
         const num = Number(val)
-        if (!isNaN(num)) result[key] = num
+        // JSON/JavaScript numbers cannot represent integer IDs above 2^53-1
+        // exactly. Keep those values as strings so MsgSeq/timestamps are sent
+        // losslessly to the API.
+        const looksLikeInteger = /^[+-]?\d+$/.test(val.trim())
+        if (!isNaN(num) && !(looksLikeInteger && !Number.isSafeInteger(num))) {
+          result[key] = num
+        }
       }
     } else if (category === 'boolean') {
       if (typeof val === 'string') {
@@ -2132,11 +2139,97 @@ export const ApiWorkbenchPanel: React.FC<ApiWorkbenchPanelProps> = ({
     return `curl -X POST "${queryUrl}" \\\n  -H "Content-Type: application/json;charset=utf-8" \\\n  -d '${currentPayload}'`
   }, [fullUrl, activeApi, isApi3, bodyMode, jsonText, formData, config])
 
-  const handleCopyCurl = () => {
-    navigator.clipboard.writeText(curlCommand)
+  const [showPlainCurl, setShowPlainCurl] = useState<boolean>(false)
+
+  const effectiveCurlCommand = useMemo(() => {
+    return invokeResponse?.curl_command || curlCommand
+  }, [invokeResponse?.curl_command, curlCommand])
+
+  // 判断当前 cURL 命令是否包含已生成的真实有效签名凭据（UserSig 或 TC3 Authorization）
+  const hasRealCredentials = useMemo(() => {
+    if (!effectiveCurlCommand) return false
+    const usersigMatch = effectiveCurlCommand.match(/[?&]usersig=([^&"'\s\\]+)/)
+    if (
+      usersigMatch &&
+      usersigMatch[1] !== 'USER_SIG_HERE' &&
+      usersigMatch[1] !== '<redacted>' &&
+      !usersigMatch[1].includes('***')
+    ) {
+      return true
+    }
+    const tc3Match = effectiveCurlCommand.match(/Authorization:\s*TC3-HMAC-SHA256\s+Credential=([^/\s"']+)/i)
+    if (
+      tc3Match &&
+      tc3Match[1] !== 'YOUR_SECRET_ID' &&
+      tc3Match[1] !== '<redacted>' &&
+      !effectiveCurlCommand.includes('Credential=YOUR_SECRET_ID') &&
+      !effectiveCurlCommand.includes('<redacted>') &&
+      !effectiveCurlCommand.includes('Signature=***')
+    ) {
+      return true
+    }
+    return false
+  }, [effectiveCurlCommand])
+
+  // 脱敏后的 cURL 命令（用于屏幕默认安全展示与安全分享模板）
+  const maskedCurlCommand = useMemo(() => {
+    if (!effectiveCurlCommand) return ''
+    let masked = effectiveCurlCommand
+    // 脱敏 IM UserSig: 保留前 10 位与后 6 位，中间使用国际通用的星号掩码
+    masked = masked.replace(/([?&]usersig=)([^&"'\s\\]+)/g, (fullMatch, prefix, sig) => {
+      if (sig === 'USER_SIG_HERE' || sig === '<redacted>') return fullMatch
+      if (sig.length > 24) {
+        return `${prefix}${sig.slice(0, 10)}...******...${sig.slice(-6)}`
+      }
+      return `${prefix}******`
+    })
+    // 脱敏 TC3 Authorization 签名与 SecretId
+    masked = masked.replace(
+      /(-H\s*["']Authorization:\s*TC3-HMAC-SHA256\s+Credential=)([^/]+)(\/[^"']*)(["'])/g,
+      (_match, p1, secId, rest, p4) => {
+        const maskedSecId = secId.length > 8 ? `${secId.slice(0, 4)}...${secId.slice(-4)}` : '****'
+        return `${p1}${maskedSecId}${rest.replace(/Signature=[^"',\s]+/, 'Signature=******')}${p4}`
+      }
+    )
+    return masked
+  }, [effectiveCurlCommand])
+
+  // 复制可执行的真实命令（含实时签名，用于终端脱机运行）
+  const handleCopyExecutableCurl = () => {
+    navigator.clipboard.writeText(effectiveCurlCommand)
     setCopiedCurl(true)
     setTimeout(() => setCopiedCurl(false), 2000)
+
+    if (hasRealCredentials) {
+      showToast({
+        type: 'warning',
+        message: '⚠️ 已复制包含管理员实时有效签名（UserSig）的可执行命令，可直接在终端脱机运行。凭据具备最高权限，请妥善保管勿外泄！',
+      })
+    } else if (effectiveCurlCommand.includes('USER_SIG_HERE')) {
+      showToast({
+        type: 'info',
+        message: '已复制 cURL 模板。提示：点击「预览执行」或「发送」可自动注入实时签名。',
+      })
+    } else {
+      showToast({
+        type: 'success',
+        message: '已复制 cURL 命令',
+      })
+    }
   }
+
+  // 复制脱敏命令模板（用于分享、工单提交与归档）
+  const handleCopyMaskedCurl = () => {
+    navigator.clipboard.writeText(maskedCurlCommand)
+    setCopiedCurl(true)
+    setTimeout(() => setCopiedCurl(false), 2000)
+    showToast({
+      type: 'success',
+      message: '已复制脱敏 cURL 模板（适合工单提交与公开分享）',
+    })
+  }
+
+  const handleCopyCurl = handleCopyExecutableCurl
 
   // 计算应答报文大小
   const responseSize = useMemo(() => {
@@ -2634,14 +2727,18 @@ export const ApiWorkbenchPanel: React.FC<ApiWorkbenchPanelProps> = ({
               size="sm"
               onClick={handleCopyCurl}
               className="h-7 gap-1 text-[11px] font-semibold text-slate-700 dark:text-slate-300 hover:text-blue-600 dark:hover:text-blue-400 border-slate-200 dark:border-slate-750 hover:border-blue-300 dark:hover:border-blue-600 bg-white dark:bg-slate-800 shrink-0"
-              title="生成并复制该接口的完整 cURL 脚本"
+              title={
+                hasRealCredentials
+                  ? '复制含管理员实时有效凭据的完整可执行命令（可直接在终端脱机运行）'
+                  : '生成并复制该接口的 cURL 脚本'
+              }
             >
               {copiedCurl ? (
                 <Check className="h-3 w-3 text-emerald-600 dark:text-emerald-400" />
               ) : (
                 <Terminal className="h-3 w-3" />
               )}
-              <span>{copiedCurl ? '已复制 cURL' : 'cURL'}</span>
+              <span>{copiedCurl ? '已复制' : hasRealCredentials ? '复制可执行 cURL' : 'cURL'}</span>
             </Button>
 
             {/* 以此接口建批量调用 */}
@@ -3591,10 +3688,10 @@ export const ApiWorkbenchPanel: React.FC<ApiWorkbenchPanelProps> = ({
 
               {/* Response Body Area */}
               <div className="flex-1 min-h-0 flex flex-col p-3 sm:p-4 font-mono text-xs overflow-hidden">
-                {invokeResponse ? (
+                {invokeResponse || responseTab === 'curl' ? (
                   <div className="flex-1 min-h-0 flex flex-col h-full">
                     {/* 预览模式专有详细说明条 */}
-                    {invokeResponse.dry_run && (
+                    {invokeResponse?.dry_run && (
                       <div className="mb-3 shrink-0 rounded-xl bg-violet-50 dark:bg-violet-950/70 border border-violet-200 dark:border-violet-800/80 p-3 text-xs text-violet-800 dark:text-violet-200 font-sans shadow-2xs">
                         <div className="flex items-center gap-2 font-bold text-violet-900 dark:text-violet-300 mb-1">
                           <Sparkles className="h-4 w-4 text-violet-600 dark:text-violet-400" />
@@ -3607,7 +3704,7 @@ export const ApiWorkbenchPanel: React.FC<ApiWorkbenchPanelProps> = ({
                     )}
 
                     {/* 腾讯云 API 3.0 官方错误码智能诊断与排查指引 (基于 Doc 30427) */}
-                    {invokeResponse.response?.Response?.Error && (
+                    {invokeResponse?.response?.Response?.Error && (
                       <div className="mb-3 shrink-0 rounded-xl bg-rose-50/90 dark:bg-rose-950/60 border border-rose-200 dark:border-rose-900/70 p-3.5 text-xs text-rose-900 dark:text-rose-200 font-sans shadow-2xs space-y-1.5">
                         <div className="flex items-center justify-between">
                           <div className="flex items-center gap-2 font-bold text-rose-900 dark:text-rose-200">
@@ -3632,7 +3729,7 @@ export const ApiWorkbenchPanel: React.FC<ApiWorkbenchPanelProps> = ({
                       </div>
                     )}
 
-                    {responseTab === 'pretty' && (
+                    {responseTab === 'pretty' && invokeResponse && (
                       <div className="flex-1 min-h-0 flex flex-col h-full">
                         <JsonCodeEditor
                           value={JSON.stringify(invokeResponse.response || invokeResponse, null, 2)}
@@ -3644,7 +3741,7 @@ export const ApiWorkbenchPanel: React.FC<ApiWorkbenchPanelProps> = ({
                       </div>
                     )}
 
-                    {responseTab === 'sent' && (
+                    {responseTab === 'sent' && invokeResponse && (
                       <div className="flex-1 min-h-0 flex flex-col space-y-2 h-full">
                         <p className="text-[11px] text-slate-500 dark:text-slate-400 font-sans shrink-0">
                           {invokeResponse.dry_run ? '预览模式构建出的标准发送报文包体：' : '实际发送至网关的报文数据包：'}
@@ -3663,22 +3760,95 @@ export const ApiWorkbenchPanel: React.FC<ApiWorkbenchPanelProps> = ({
 
                     {responseTab === 'curl' && (
                       <div className="flex-1 min-h-0 flex flex-col space-y-2 h-full">
-                        <div className="flex items-center justify-between font-sans text-[11px] text-slate-500 dark:text-slate-400 shrink-0">
-                          <span>可在 Linux/macOS 终端中直接粘贴执行：</span>
-                          <button
-                            onClick={handleCopyCurl}
-                            className="text-orange-600 hover:underline cursor-pointer dark:text-orange-400 font-medium"
-                          >
-                            {copiedCurl ? '已复制' : '复制命令'}
-                          </button>
+                        <div className="flex items-center justify-between font-sans text-[11px] text-slate-500 dark:text-slate-400 shrink-0 flex-wrap gap-2">
+                          <div className="flex items-center gap-1.5">
+                            <span>可在 Linux/macOS 终端中直接脱机执行：</span>
+                            {hasRealCredentials ? (
+                              <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium bg-amber-50 text-amber-700 dark:bg-amber-950/40 dark:text-amber-400 border border-amber-200/60 dark:border-amber-800/60">
+                                <ShieldAlert className="h-3 w-3 text-amber-600 dark:text-amber-400" />
+                                包含实时有效管理员凭据
+                              </span>
+                            ) : invokeResponse?.credentials_redacted ? (
+                              <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-400 border border-slate-200 dark:border-slate-700">
+                                <ShieldCheck className="h-3 w-3 text-emerald-600 dark:text-emerald-400" />
+                                企业权限脱敏保护
+                              </span>
+                            ) : (
+                              <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium bg-blue-50 text-blue-600 dark:bg-blue-950/40 dark:text-blue-400 border border-blue-200/60 dark:border-blue-800/60">
+                                模板（点击预览执行可注入实时签名）
+                              </span>
+                            )}
+                          </div>
+
+                          <div className="flex items-center gap-1.5">
+                            {hasRealCredentials && (
+                              <button
+                                type="button"
+                                onClick={() => setShowPlainCurl(!showPlainCurl)}
+                                className="flex items-center gap-1 px-2 py-0.5 rounded text-[11px] text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800 border border-slate-200 dark:border-slate-750 transition-colors cursor-pointer"
+                                title={showPlainCurl ? '隐藏屏幕上的明文签名凭据' : '在屏幕上显示完整明文签名凭据'}
+                              >
+                                {showPlainCurl ? (
+                                  <>
+                                    <EyeOff className="h-3 w-3 text-slate-500" />
+                                    <span>隐藏明文凭据</span>
+                                  </>
+                                ) : (
+                                  <>
+                                    <Eye className="h-3 w-3 text-slate-500" />
+                                    <span>显示明文凭据</span>
+                                  </>
+                                )}
+                              </button>
+                            )}
+
+                            {hasRealCredentials && (
+                              <button
+                                type="button"
+                                onClick={handleCopyMaskedCurl}
+                                className="px-2 py-0.5 rounded text-[11px] text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800 border border-slate-200 dark:border-slate-750 transition-colors cursor-pointer"
+                                title="复制脱敏后的命令模板，适合提交工单、代码审查或公开分享"
+                              >
+                                复制脱敏模板
+                              </button>
+                            )}
+
+                            <Button
+                              size="sm"
+                              variant="outline"
+                              onClick={handleCopyExecutableCurl}
+                              className="h-6 px-2.5 text-[11px] font-medium text-orange-600 dark:text-orange-400 hover:text-orange-700 dark:hover:text-orange-300 border-orange-200 dark:border-orange-900/60 hover:bg-orange-50 dark:hover:bg-orange-950/40 gap-1 cursor-pointer"
+                              title="复制含有效签名的完整可执行命令，可在终端中直接粘贴脱机运行"
+                            >
+                              {copiedCurl ? (
+                                <>
+                                  <Check className="h-3 w-3 text-emerald-600 dark:text-emerald-400" />
+                                  <span>已复制真实命令</span>
+                                </>
+                              ) : (
+                                <>
+                                  <Terminal className="h-3 w-3" />
+                                  <span>{hasRealCredentials ? '复制可执行真实命令' : '复制命令'}</span>
+                                </>
+                              )}
+                            </Button>
+                          </div>
                         </div>
-                        <pre className="flex-1 min-h-0 text-amber-800 dark:text-amber-300 leading-relaxed overflow-auto whitespace-pre bg-white dark:bg-slate-900/60 p-4 rounded-xl border border-slate-200/80 dark:border-slate-800 shadow-2xs font-mono text-xs">
-                          {curlCommand}
-                        </pre>
+
+                        <div className="relative flex-1 min-h-0 flex flex-col">
+                          <pre className="flex-1 min-h-0 text-amber-800 dark:text-amber-300 leading-relaxed overflow-auto whitespace-pre bg-white dark:bg-slate-900/60 p-4 rounded-xl border border-slate-200/80 dark:border-slate-800 shadow-2xs font-mono text-xs select-all">
+                            {showPlainCurl ? effectiveCurlCommand : maskedCurlCommand}
+                          </pre>
+                          {!showPlainCurl && hasRealCredentials && (
+                            <div className="absolute bottom-2 right-3 pointer-events-none text-[10px] text-slate-400 dark:text-slate-500 bg-white/80 dark:bg-slate-900/80 px-2 py-0.5 rounded backdrop-blur border border-slate-200/50 dark:border-slate-800/50">
+                              🔒 屏幕已脱敏保护（复制时包含真实有效凭据）
+                            </div>
+                          )}
+                        </div>
                       </div>
                     )}
 
-                    {responseTab === 'raw' && (
+                    {responseTab === 'raw' && invokeResponse && (
                       <div className="flex-1 min-h-0 flex flex-col h-full">
                         <JsonCodeEditor
                           value={JSON.stringify(invokeResponse.response || invokeResponse)}

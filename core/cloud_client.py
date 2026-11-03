@@ -5,6 +5,7 @@
 """
 
 import json
+import random
 from typing import Any, Dict, Optional
 
 from .config import load_config
@@ -77,7 +78,7 @@ class UniversalCloudClient:
             sdkappid = self.config.get("sdkappid", 1400000000)
             admin_user = self.config.get("admin_user", "administrator")
             domain = self.config.get("domain", "console.tim.qq.com")
-            rand = 12345678
+            rand = random.randint(10000000, 99999999)
             usersig = "eJx1j...mock_usersig_for_preview"
             try:
                 usersig = self.tim_client.get_usersig()

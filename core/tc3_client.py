@@ -220,7 +220,7 @@ class TencentCloudApi3Client:
         req_region = region or self.config.get("tc_region") or "ap-guangzhou"
         req_endpoint = self.clean_endpoint(endpoint, service=service)
 
-        timestamp = 1700000000
+        timestamp = int(time.time())
         headers = self.build_auth_headers(
             service=service,
             action=action,
@@ -233,11 +233,12 @@ class TencentCloudApi3Client:
             timestamp=timestamp
         )
 
+        body_str = json.dumps(payload, separators=(',', ':'), ensure_ascii=False)
         headers_str = " \\\n  ".join([f'-H "{k}: {v}"' for k, v in headers.items()])
         curl_cmd = (
             f'curl -X POST "https://{req_endpoint}" \\\n'
             f'  {headers_str} \\\n'
-            f"  -d '{json.dumps(payload, ensure_ascii=False, indent=2)}'"
+            f"  -d '{body_str}'"
         )
 
         return {

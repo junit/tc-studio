@@ -19,7 +19,18 @@ _OFFICIAL_MODEL_HOSTS = {
     "deepseek": {"api.deepseek.com"},
     "qwen": {"dashscope.aliyuncs.com"},
     "openai": {"api.openai.com"},
+    "anthropic": {"api.anthropic.com"},
+    "moonshot": {"api.moonshot.cn"},
+    "zhipu": {"open.bigmodel.cn"},
+    "siliconflow": {"api.siliconflow.cn"},
+    "groq": {"api.groq.com"},
+    "mistral": {"api.mistral.ai"},
 }
+
+_TRUSTED_OFFICIAL_HOSTS = frozenset(
+    host for hosts in _OFFICIAL_MODEL_HOSTS.values() for host in hosts
+)
+_FAKE_IP_NETWORKS = (ipaddress.ip_network("198.18.0.0/15"),)
 
 
 class UnsafeModelUrlError(ValueError):
@@ -84,6 +95,33 @@ def _is_configured_private_host(host: str, addresses: set[ipaddress._BaseAddress
     return host_matches and bool(addresses) and all(_is_private_network_address(address) for address in addresses)
 
 
+def _is_trusted_official_model_host(host: str, addresses: set[ipaddress._BaseAddress]) -> bool:
+    """对已知的官方公共模型服务进行安全放行（免配置开箱即用）。
+
+    当宿主机运行 Clash、Surge 等开启 TUN 模式的透明代理时，公网域名常被映射至
+    RFC 2544 测量/Fake-IP 保留网段 198.18.0.0/15。
+    只要目标域名严格属于内置官方公网服务域名列表，且未被重定向至
+    环回（127.0.0.1）或链路本地（169.254.x.x）等高危内网目标，即自动予以信任放行。
+    """
+    if host not in _TRUSTED_OFFICIAL_HOSTS:
+        return False
+    if not addresses:
+        return False
+    for address in addresses:
+        if (
+            address.is_loopback
+            or address.is_link_local
+            or address.is_multicast
+            or address.is_unspecified
+        ):
+            return False
+        # 允许真正的公网 IP 或 Clash/Surge 常见的 198.18.0.0/15 Fake-IP 保留网段
+        is_fake_ip = any(address in net for net in _FAKE_IP_NETWORKS)
+        if address.is_private and not is_fake_ip:
+            return False
+    return True
+
+
 def _local_model_allowed_ports() -> set[int]:
     """读取显式配置的本地模型端口白名单，默认不放宽。"""
     raw_ports = os.environ.get("LOCAL_MODEL_ALLOWED_PORTS", "")
@@ -144,6 +182,9 @@ def validate_model_base_url(base_url: str) -> str:
     if _is_configured_private_host(host, addresses):
         return base_url.rstrip("/")
 
+    if _is_trusted_official_model_host(host, addresses):
+        return base_url.rstrip("/")
+
     if not addresses or any(
         address.is_private
         or address.is_loopback
@@ -171,4 +212,6 @@ def is_local_model_base_url(base_url: str) -> bool:
 
 def is_official_model_base_url(provider: str, base_url: str) -> bool:
     host = (urlparse(base_url).hostname or "").lower().rstrip(".")
-    return provider != "ollama" and host in _OFFICIAL_MODEL_HOSTS.get(provider, set())
+    if provider == "ollama":
+        return False
+    return host in _OFFICIAL_MODEL_HOSTS.get(provider, set()) or host in _TRUSTED_OFFICIAL_HOSTS

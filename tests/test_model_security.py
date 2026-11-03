@@ -151,3 +151,40 @@ def test_malformed_model_url_is_rejected_as_policy_error():
 
     with pytest.raises(UnsafeModelUrlError):
         validate_model_base_url("http://gpu.internal:not-a-port/v1")
+
+
+def test_official_model_hosts_support_transparent_proxy_fake_ip_out_of_the_box(monkeypatch):
+    """内置官方公共模型服务在被透明代理（Clash/Surge TUN 模式）映射为 198.18.0.0/15 Fake-IP 时应免配自动放行。"""
+    import pytest
+
+    from core.agent.model_url_guard import UnsafeModelUrlError, validate_model_base_url
+
+    monkeypatch.delenv("ALLOW_PRIVATE_MODEL_HOSTS", raising=False)
+
+    # 1. 官方域名解析为 Clash/Surge 常见的 198.18.x.x -> 自动信任放行
+    monkeypatch.setattr(
+        "core.agent.model_url_guard.socket.getaddrinfo",
+        lambda host, port=None, **_: [(2, 1, 6, "", ("198.18.2.185", port or 443))],
+    )
+    assert validate_model_base_url("https://api.deepseek.com/v1") == "https://api.deepseek.com/v1"
+    assert validate_model_base_url("https://dashscope.aliyuncs.com/compatible-mode/v1").endswith("/v1")
+    assert validate_model_base_url("https://api.openai.com/v1") == "https://api.openai.com/v1"
+
+    # 2. 未列入官方名单的任意未知/内网域名哪怕解析到 198.18.x.x 也必须坚决拦截
+    with pytest.raises(UnsafeModelUrlError):
+        validate_model_base_url("https://unlisted-service.internal/v1")
+
+    # 3. 官方域名若被恶意 DNS 劫持到内网 10.x / 192.168.x / 127.0.0.1，必须坚决拦截
+    monkeypatch.setattr(
+        "core.agent.model_url_guard.socket.getaddrinfo",
+        lambda host, port=None, **_: [(2, 1, 6, "", ("127.0.0.1", port or 443))],
+    )
+    with pytest.raises(UnsafeModelUrlError):
+        validate_model_base_url("https://api.deepseek.com/v1")
+
+    monkeypatch.setattr(
+        "core.agent.model_url_guard.socket.getaddrinfo",
+        lambda host, port=None, **_: [(2, 1, 6, "", ("10.0.0.1", port or 443))],
+    )
+    with pytest.raises(UnsafeModelUrlError):
+        validate_model_base_url("https://api.deepseek.com/v1")

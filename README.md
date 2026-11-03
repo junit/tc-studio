@@ -296,7 +296,7 @@ python3 app.py
 
 企业局域网中的 Ollama、vLLM 或 OpenAI 兼容模型默认仍会被出站 SSRF 守卫拦截。部署方明确批准后，可用逗号分隔的精确主机名、IP 或 CIDR 配置 `ALLOW_PRIVATE_MODEL_HOSTS`，例如 `ALLOW_PRIVATE_MODEL_HOSTS=10.20.0.15,gpu.internal,192.168.20.0/24`；域名解析到的所有地址都必须是私有地址，通配符和 `host:port` 不受支持。Ollama 以外的端口可另用 `LOCAL_MODEL_ALLOWED_PORTS` 配置。
 
-> 💡 **代理/TUN 模式避坑提示**：若本地开启了 Clash / Surge / Shadowrocket 等代理客户端的 TUN 增强模式（Fake-IP），公网模型域名（如 `api.deepseek.com`）可能会被宿主机解析为 `198.18.x.x` 保留网段而触发 SSRF 拦截。此时可在启动时配置环境变量显式放行，例如：`ALLOW_PRIVATE_MODEL_HOSTS="api.deepseek.com,dashscope.aliyuncs.com,api.openai.com" python3 app.py`。
+> 💡 **代理/TUN 模式免配置支持 (Out-of-the-Box)**：若本地开启了 Clash / Surge / Shadowrocket 等代理客户端的 TUN 增强模式（Fake-IP），公网域名可能会被操作系统映射为 `198.18.0.0/15` 保留网段。系统已内置主流官方大模型域名（DeepSeek、通义千问、OpenAI、Anthropic、Moonshot、Zhipu、SiliconFlow 等）在 Fake-IP 下的自动信任与放行，**无需配置任何环境变量，开箱即用**。`ALLOW_PRIVATE_MODEL_HOSTS` 仅用于企业局域网内的自建内网服务器。
 
 ---
 

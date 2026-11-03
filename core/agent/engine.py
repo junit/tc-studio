@@ -7,9 +7,9 @@ import json
 import logging
 import os
 import re
-import shutil
 import threading
 import time
+from collections import OrderedDict
 from collections.abc import Iterable
 from datetime import UTC, datetime
 from typing import Any, cast
@@ -25,6 +25,7 @@ from smolagents.models import (
 )
 
 from ..cloud_client import UniversalCloudClient
+from ..runtime_context import runtime_is_admin, runtime_user_id
 from .bot_manager import BotManager, bot_manager
 from .constants import (
     AUTHORIZED_IMPORTS,
@@ -48,6 +49,7 @@ from .tools import (
 # 增强 smolagents 代码块解析器：无缝兼容 DeepSeek 原生 DSML、标准 Markdown 与 XML parameter
 _original_parse_code_blobs = getattr(saa, "parse_code_blobs", None)
 
+
 def robust_parse_code_blobs(text: str, code_block_tags: tuple[str, str]) -> str:
     # 1. 尝试原厂解析
     if _original_parse_code_blobs:
@@ -57,14 +59,20 @@ def robust_parse_code_blobs(text: str, code_block_tags: tuple[str, str]) -> str:
             logger.debug("Primary code parser failed: %s", parse_error)
 
     # 2. 兼容 DeepSeek 原生 DSML 结构: <parameter name="code">...</parameter>
-    dsml_match = re.search(r'<parameter name=[\"\']code[\"\']>([\s\S]*?)</parameter>', text)
+    dsml_match = re.search(
+        r"<parameter name=[\"\']code[\"\']>([\s\S]*?)</parameter>", text
+    )
     if dsml_match:
         code = dsml_match.group(1).strip()
         if code:
             return code
 
     # 3. 兼容通用 XML/HTML 标签 <code>...</code>, <python>...</python>, <execute>...</execute>
-    tag_match = re.search(r'<(?:code|python|execute)>([\s\S]*?)</(?:code|python|execute)>', text, re.IGNORECASE)
+    tag_match = re.search(
+        r"<(?:code|python|execute)>([\s\S]*?)</(?:code|python|execute)>",
+        text,
+        re.IGNORECASE,
+    )
     if tag_match:
         code = tag_match.group(1).strip()
         if code:
@@ -75,10 +83,16 @@ def robust_parse_code_blobs(text: str, code_block_tags: tuple[str, str]) -> str:
         return _original_parse_code_blobs(text, code_block_tags)
     return text
 
+
 if _original_parse_code_blobs:
     saa.parse_code_blobs = robust_parse_code_blobs
 
 logger = logging.getLogger("tim.agent.engine")
+
+# Keep persistent Python objects bounded.  A sandbox state may contain large
+# dataframes or other user-created objects, so an unbounded per-user map would
+# retain memory until the bot is explicitly deleted.
+DEFAULT_SANDBOX_MAX_ENTRIES = 50
 
 
 def _install_sandbox_scope(agent: Any, scope: dict[str, Any]) -> None:
@@ -99,12 +113,20 @@ def _install_sandbox_scope(agent: Any, scope: dict[str, Any]) -> None:
         additional_functions = {}
         executor.additional_functions = additional_functions
 
+    forbidden_names = {"cloud_client", "tim_client", "get_usersig"}
     function_scope = {
-        name: value for name, value in scope.items() if inspect.isroutine(value)
+        name: value
+        for name, value in scope.items()
+        if name not in forbidden_names and inspect.isroutine(value)
     }
     state_scope = {
-        name: value for name, value in scope.items() if name not in function_scope
+        name: value
+        for name, value in scope.items()
+        if name not in function_scope and name not in forbidden_names
     }
+    for name in forbidden_names:
+        agent.state.pop(name, None)
+        additional_functions.pop(name, None)
     additional_functions.update(function_scope)
     agent.state.update(state_scope)
 
@@ -115,7 +137,7 @@ def render_chart(
     labels: list[Any],
     data: list[Any],
     series_name: str | None = None,
-    options: dict[str, Any] | None = None
+    options: dict[str, Any] | None = None,
 ) -> str:
     """
     生成就地渲染的 ECharts 交互式图表 Markdown 代码块。
@@ -125,14 +147,13 @@ def render_chart(
         "type": str(chart_type).lower(),
         "title": str(title),
         "labels": list(labels),
-        "data": list(data)
+        "data": list(data),
     }
     if series_name:
         chart_cfg["seriesName"] = str(series_name)
     if options and isinstance(options, dict):
         chart_cfg["options"] = options
     return f"\n```echarts\n{json.dumps(chart_cfg, ensure_ascii=False, indent=2)}\n```\n"
-
 
 
 def _confined_open(root_dir: str, file, mode="r", *args, **kwargs):
@@ -257,7 +278,7 @@ def extract_clean_thought(raw_text: str) -> str:
     # 3. 移除前导思考标记
     for prefix in ["thought:", "思考:", "思考：", "思维链:", "思维链："]:
         if thought.lower().startswith(prefix):
-            thought = thought[len(prefix):].strip()
+            thought = thought[len(prefix) :].strip()
             break
     return thought
 
@@ -284,7 +305,9 @@ def clean_final_answer(raw_answer: str) -> tuple[str, str]:
 
     # 3. 剥离 DeepSeek 原生 DSML / XML 工具调用泄露
     text = re.sub(r"<｜｜DSML｜｜\s*calls>[\s\S]*?(?:</invoke>|$)", "", text).strip()
-    text = re.sub(r"<parameter name=[\"\']code[\"\']>[\s\S]*?</parameter>", "", text).strip()
+    text = re.sub(
+        r"<parameter name=[\"\']code[\"\']>[\s\S]*?</parameter>", "", text
+    ).strip()
 
     # 4. 规范化 <code>...</code> 标签为 Markdown ```python 代码块
     def _code_repl(m):
@@ -293,7 +316,9 @@ def clean_final_answer(raw_answer: str) -> tuple[str, str]:
             return ""
         return f"\n```python\n{c}\n```\n"
 
-    text = re.sub(r"<code>\s*([\s\S]*?)\s*</code>", _code_repl, text, flags=re.IGNORECASE).strip()
+    text = re.sub(
+        r"<code>\s*([\s\S]*?)\s*</code>", _code_repl, text, flags=re.IGNORECASE
+    ).strip()
 
     return text.strip(), extracted_thought
 
@@ -309,22 +334,25 @@ def format_execution_observation(raw_obs: Any, step_num: int = 1) -> str:
 
     # 1. 清理 smolagents 冗余前缀
     if text.startswith("Print outputs:\n"):
-        text = text[len("Print outputs:\n"):].strip()
+        text = text[len("Print outputs:\n") :].strip()
     elif text.startswith("Print outputs:"):
-        text = text[len("Print outputs:"):].strip()
+        text = text[len("Print outputs:") :].strip()
 
     if not text or text == "None":
         return empty_notice
 
     # 2. 尝试解析为 JSON 或 Python 字典并美化输出
     formatted_data = None
-    if (text.startswith("{") and text.endswith("}")) or (text.startswith("[") and text.endswith("]")):
+    if (text.startswith("{") and text.endswith("}")) or (
+        text.startswith("[") and text.endswith("]")
+    ):
         try:
             parsed = json.loads(text)
             formatted_data = json.dumps(parsed, indent=2, ensure_ascii=False)
         except Exception:
             try:
                 import ast
+
                 parsed = ast.literal_eval(text)
                 if isinstance(parsed, (dict, list)):
                     formatted_data = json.dumps(parsed, indent=2, ensure_ascii=False)
@@ -342,19 +370,54 @@ def format_execution_observation(raw_obs: Any, step_num: int = 1) -> str:
     return f"```bash\n{text}\n```"
 
 
-
 class AgentEngine:
     def __init__(self, manager: BotManager | None = None):
         self.manager = manager or bot_manager
         self.cloud_client = UniversalCloudClient()
         self.tim_client = self.cloud_client.tim_client
         self._local = threading.local()
-        # 跨轮多会话 Python 沙箱环境变量存储 (按 bot_id 隔离)
-        self._bot_sandbox_states: dict[str, dict[str, Any]] = {}
+        # 跨轮多会话 Python 沙箱环境变量存储 (按 bot_id:user 隔离)。
+        # OrderedDict lets reads refresh recency and evicts the oldest state
+        # when the bounded cache reaches its limit.
+        self._bot_sandbox_states: OrderedDict[str, dict[str, Any]] = OrderedDict()
+        self._sandbox_max_entries = DEFAULT_SANDBOX_MAX_ENTRIES
+        self._sandbox_lock = threading.Lock()
 
-    def clear_sandbox(self, bot_id: str):
-        """清空指定 BOT 的跨轮沙箱变量缓存"""
-        self._bot_sandbox_states.pop(bot_id, None)
+    def _sandbox_key(self, bot_id: str, user_id: str | None = None) -> str:
+        return f"{bot_id}:{user_id or runtime_user_id.get()}"
+
+    def _remember_sandbox(self, key: str, value: dict[str, Any]) -> None:
+        with self._sandbox_lock:
+            # Re-inserting an existing key makes it the most recently used
+            # entry, so an active conversation is retained over an idle one.
+            self._bot_sandbox_states.pop(key, None)
+            self._bot_sandbox_states[key] = value
+            while len(self._bot_sandbox_states) > self._sandbox_max_entries:
+                self._bot_sandbox_states.popitem(last=False)
+
+    def _get_sandbox(self, key: str) -> dict[str, Any]:
+        with self._sandbox_lock:
+            state = self._bot_sandbox_states.get(key)
+            if state is not None:
+                self._bot_sandbox_states.move_to_end(key)
+            return dict(state) if state else {}
+
+    def clear_sandbox(self, bot_id: str, user_id: str | None = None):
+        """清空指定 BOT 与用户的跨轮沙箱变量缓存"""
+        with self._sandbox_lock:
+            self._bot_sandbox_states.pop(self._sandbox_key(bot_id, user_id), None)
+            self._bot_sandbox_states.pop(bot_id, None)  # legacy single-user key
+
+    def clear_bot_sandboxes(self, bot_id: str) -> None:
+        """删除 BOT 时清掉该 BOT 的全部用户沙箱，避免其他用户的状态残留。"""
+        prefix = f"{bot_id}:"
+        with self._sandbox_lock:
+            stale_keys = [
+                key for key in self._bot_sandbox_states
+                if key == bot_id or key.startswith(prefix)
+            ]
+            for key in stale_keys:
+                self._bot_sandbox_states.pop(key, None)
 
     def get_effective_llm_config(self, bot: BotConfig) -> LLMConfig:
         """获取 BOT 生效的 LLM 配置（BOT 级别覆盖 > 全局配置）"""
@@ -362,7 +425,13 @@ class AgentEngine:
         if bot.model_override:
             # 合并覆盖
             data = global_cfg.model_dump()
-            data.update({k: v for k, v in bot.model_override.items() if v is not None and v != ""})
+            data.update(
+                {
+                    k: v
+                    for k, v in bot.model_override.items()
+                    if v is not None and v != ""
+                }
+            )
             return LLMConfig(**data)
         return global_cfg
 
@@ -373,10 +442,26 @@ class AgentEngine:
 
         api_key = (llm_cfg.api_key or "").strip()
         base_url = (llm_cfg.base_url or "").strip() or provider_default.get("base_url")
-        model_name = (llm_cfg.model_name or "").strip() or provider_default.get("default_model", "deepseek-chat")
+        model_name = (llm_cfg.model_name or "").strip() or provider_default.get(
+            "default_model", "deepseek-chat"
+        )
+
+        # 出站前统一走共享 SSRF 守卫（含历史存量配置的兜底校验）
+        if base_url:
+            from core.agent.model_url_guard import (
+                UnsafeModelUrlError,
+                validate_model_base_url,
+            )
+
+            try:
+                base_url = validate_model_base_url(base_url)
+            except UnsafeModelUrlError as exc:
+                raise ValueError(f"模型 Base URL 被安全策略拒绝：{exc}") from exc
 
         # 如果没有配置 API Key 且是本地 ollama，填默认占位
-        if not api_key and (provider == "ollama" or (base_url and "localhost" in base_url)):
+        if not api_key and (
+            provider == "ollama" or (base_url and "localhost" in base_url)
+        ):
             api_key = "ollama"
 
         if not api_key:
@@ -389,25 +474,37 @@ class AgentEngine:
             base_url = base_url.rstrip("/")
             if provider == "ollama" and not base_url.endswith("/v1"):
                 base_url = f"{base_url}/v1"
-            elif provider == "qwen" and not base_url.endswith("/v1") and "aliyuncs.com" in base_url:
+            elif (
+                provider == "qwen"
+                and not base_url.endswith("/v1")
+                and "aliyuncs.com" in base_url
+            ):
                 base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 
         return RobustStreamingOpenAIServerModel(
             model_id=model_name,
             api_base=base_url,
             api_key=api_key,
-            temperature=llm_cfg.temperature
+            temperature=llm_cfg.temperature,
         )
 
-    def assemble_system_prompt(self, bot: BotConfig) -> str:
+    def assemble_system_prompt(
+        self,
+        bot: BotConfig,
+        user_id: str | None = None,
+        is_admin: bool | None = None,
+    ) -> str:
         """组装动态 System Prompt：基础人设 + 自我增强准则 + 长期记忆 + 技能清单"""
         prompt_parts = []
+        effective_user_id = user_id or runtime_user_id.get()
+        effective_is_admin = runtime_is_admin.get() if is_admin is None else is_admin
 
         # 1. 基础人设
         prompt_parts.append(f"# 角色设定\n{bot.base_prompt}\n")
 
         # 2. 腾讯云多业务架构与 API 调度原则（动态自适应：从 registry SSoT 自动提取，彻底拒绝硬编码）
         from ..registry import registry
+
         services_summary = registry.get_services_summary()
 
         prompt_parts.append(
@@ -422,7 +519,7 @@ class AgentEngine:
             "   - `gen_live_push_url(domain, stream_name, key=None)` / `gen_live_play_url(...)`：快捷生成带防盗链签名的多协议推拉流地址；\n"
             "   - `im_call(path, payload=None)` / `tim_call(path, payload=None)`：即时通信 IM REST 原生快捷调用；\n"
             "   - `search_apis(keyword, service='all')` / `get_doc(action_or_path)`：沙箱内即时查接口与文档结构；\n"
-            "   - `cloud_client` / `tim_client`：统一客户端与底层驱动实例。\n"
+            "   - 所有云调用必须经由 `cloud_call` / `{service}_call`，沙箱不会暴露底层客户端或签名凭据。\n"
             "3. 当需要执行批量操作（如批量禁言、循环撤回、多流巡检、违规推流熔断清理、拉取多页群成员并清洗过滤）时，请直接编写并执行 Python 脚本，使用 for 循环和条件判断高效完成。\n"
             "4. 编写 Python 脚本时，首行建议使用中文注释简短写出本步行动意图（例如 `# 1. 批量巡检活跃直播流推流状态` 或 `# 1. 获取群成员列表与禁言状态`），以便系统和用户直观追踪步骤进展。\n"
             "5. 输出打印规范（重要）：调用接口或完成数据统计后，请务必使用 `print(...)` 打印出接口返回的关键响应或核心数据结果，以便在前端卡片中直观展现 API 响应详情与运行日志。\n"
@@ -436,8 +533,8 @@ class AgentEngine:
             "   - 【Live API 3.0 应答规范】：云直播 API 3.0 应答标准结构为 `Response: { ... , RequestId: '...' }`，在脚本中解析时优先读取 `res.get('Response', res)`，并做好空键防御。\n\n"
             "## 📁 产出物与生成文件规范 (File Generation)\n"
             "若任务需要产出清洗后的数据、导出报表（Excel/CSV）、统计表格、生成的日志或图表数据：\n"
-            "1. 【推荐】直接调用内置辅助函数 `save_file(filename, data)`（原生支持 Pandas DataFrame、字典、列表、字节与文本），自动保存至智能体专属文件中心；\n"
-            "2. 【沙箱路径】若直接使用 Pandas/openpyxl 或文件写操作，请务必使用 `os.path.join(OUTPUT_DIR, filename)`，避免散落在项目根目录下；\n"
+            "1. 【推荐】直接调用内置辅助函数 `save_file(filename, data)`（支持字典、列表、字节与文本），自动保存至智能体专属文件中心；\n"
+            "2. 文件解析统一交给 `read_file`，Python 沙箱不提供第三方文件解析库或宿主机绝对路径访问；\n"
             f"3. 【会话下载链接规范】（重要）：在通过 `final_answer(...)` 输出最终回答汇报给用户时，只要本次任务生成了文件，必须在 Markdown 回答中为用户提供直接下载链接，格式规范如下：\n"
             f"   - `[📥 点击直接下载 文件名](/api/agent/bots/{bot.id}/files/文件名?download=true)`\n"
             "4. 系统会在会话界面自动为你生成的产出物渲染专属的一键下载卡片，并即时同步至右侧抽屉「产出物与文件中心」。\n"
@@ -445,10 +542,13 @@ class AgentEngine:
 
         # 3. 动态注入自增强的行为准则 (Prompt Self-Enhancement)
         if bot.learned_guidelines:
-            guidelines_text = "\n".join([
-                f"- **[准则 {idx+1}]**: {g.instruction}" + (f" （背景: {g.reason}）" if g.reason else "")
-                for idx, g in enumerate(bot.learned_guidelines)
-            ])
+            guidelines_text = "\n".join(
+                [
+                    f"- **[准则 {idx + 1}]**: {g.instruction}"
+                    + (f" （背景: {g.reason}）" if g.reason else "")
+                    for idx, g in enumerate(bot.learned_guidelines)
+                ]
+            )
             prompt_parts.append(
                 f"## 🛡️ 智能体自我强化的行为准则 (Self-Enhanced Guidelines)\n"
                 f"这些是你或用户在过去的实践中沉淀的专属业务规则，你必须严格优先遵守：\n{guidelines_text}\n"
@@ -459,11 +559,12 @@ class AgentEngine:
         if memories:
             max_injected = 15
             displayed_mem = memories[:max_injected]
-            mem_text = "\n".join([
-                f"- `{m.key}`: {m.content}"
-                for m in displayed_mem
-            ])
-            extra_hint = f"\n*(已注入最近 {max_injected} 条核心事实，其余更早记忆可自主调用 `recall_memory(keyword)` 进行定向召回)*" if len(memories) > max_injected else ""
+            mem_text = "\n".join([f"- `{m.key}`: {m.content}" for m in displayed_mem])
+            extra_hint = (
+                f"\n*(已注入最近 {max_injected} 条核心事实，其余更早记忆可自主调用 `recall_memory(keyword)` 进行定向召回)*"
+                if len(memories) > max_injected
+                else ""
+            )
             prompt_parts.append(
                 f"## 🧠 智能体长期事实记忆 (Long-Term Memories)\n"
                 f"已记住的关键业务事实与用户偏好：\n{mem_text}{extra_hint}\n"
@@ -472,10 +573,12 @@ class AgentEngine:
         # 5. 动态注入已保存技能 (Skills)
         skills = self.manager.list_skills(bot.id)
         if skills:
-            skills_text = "\n".join([
-                f"- `{s.name}`: {s.description} (入参: {json.dumps(s.input_schema, ensure_ascii=False)})"
-                for s in skills
-            ])
+            skills_text = "\n".join(
+                [
+                    f"- `{s.name}`: {s.description} (入参: {json.dumps(s.input_schema, ensure_ascii=False)})"
+                    for s in skills
+                ]
+            )
             prompt_parts.append(
                 f"## ⚡ 智能体已沉淀的专属技能库 (Available Skills)\n"
                 f"你可以直接通过 `run_skill(name, kwargs)` 运行这些技能，也可以在解决新场景后使用 `save_skill` 沉淀新技能：\n{skills_text}\n"
@@ -505,7 +608,16 @@ class AgentEngine:
             )
 
         # 8. 团队智能体协同网络与自然语言无感调度 (无需强制 @)
-        other_bots = [b for b in self.manager.list_bots() if b.get("id") != bot.id]
+        other_bots = [
+            b
+            for b in self.manager.list_bots(user_id=effective_user_id)
+            if b.get("id") != bot.id
+            and (
+                effective_is_admin
+                or b.get("visibility") == "public"
+                or b.get("owner_id") == effective_user_id
+            )
+        ]
         if other_bots:
             roster_lines = [
                 f"- {b.get('avatar', '🤖')} **【{b.get('name')}】** (ID: `{b.get('id')}`): {b.get('description') or '协助处理专业 IM 业务需求'}"
@@ -532,7 +644,7 @@ class AgentEngine:
             "1. 你具备全能的文件与文档处理能力，支持用户上传的 Word (DOCX)、Excel (XLSX/XLS)、CSV、TXT、JSON、代码、PDF、图像等多种格式附件。\n"
             "2. 当用户上传了附件时：\n"
             "   - 你可以使用内置工具 `read_file(file_path)` 读取文档、代码或文本内容；\n"
-            "   - 你可以直接在 Python 沙箱中编写脚本，使用 `pandas`、`openpyxl`、`docx`、`csv`、`PIL` 等主流官方库直接读取本地文件绝对路径，执行深度数据清洗、复杂统计分析、词频汇总或批处理；\n"
+            "   - 文件内容由服务端在 BOT 上传目录内解析并限制读取范围；如需进一步处理，请使用 `read_file` 获取内容后在内存中分析；\n"
             "   - 若附件涉及接口调用参数或业务实体数据，请将其与腾讯云多业务全量接口无缝串联自动化执行。\n"
         )
 
@@ -571,6 +683,7 @@ class AgentEngine:
 
         # 11. 企业知识库与私有运维手册规范
         from .rag_manager import rag_manager
+
         docs = rag_manager.list_documents(bot.id)
         enabled_docs = [d for d in docs if d.get("enabled", True)]
         if enabled_docs:
@@ -614,7 +727,7 @@ class AgentEngine:
         self.manager.append_history(
             target_bot_id,
             "user",
-            f"【来自智能体 @{caller_name} 的协同委派任务】: {task}"
+            f"【来自智能体 @{caller_name} 的协同委派任务】: {task}",
         )
 
         llm_cfg = self.get_effective_llm_config(target_bot)
@@ -622,16 +735,20 @@ class AgentEngine:
         new_chain = chain + [target_bot_id]
         delegated_approval_requester = approval_requester
         if approval_requester:
+
             def delegated_approval_request(request: dict):
                 enriched = dict(request)
-                enriched.update({
-                    "caller_bot_id": caller_bot_id,
-                    "caller_bot_name": caller_name,
-                    "target_bot_id": target_bot_id,
-                    "target_bot_name": target_bot.name,
-                    "delegation_chain": list(new_chain),
-                })
+                enriched.update(
+                    {
+                        "caller_bot_id": caller_bot_id,
+                        "caller_bot_name": caller_name,
+                        "target_bot_id": target_bot_id,
+                        "target_bot_name": target_bot.name,
+                        "delegation_chain": list(new_chain),
+                    }
+                )
                 return approval_requester(enriched)
+
             delegated_approval_requester = delegated_approval_request
 
         tools = build_bot_tools(
@@ -641,7 +758,7 @@ class AgentEngine:
             engine=self,
             call_chain=new_chain,
             approval_requester=delegated_approval_requester,
-            cloud_client=self.cloud_client
+            cloud_client=self.cloud_client,
         )
         system_prompt = self.assemble_system_prompt(target_bot)
 
@@ -658,12 +775,16 @@ class AgentEngine:
             model=model,
             additional_authorized_imports=AUTHORIZED_IMPORTS,
             max_print_outputs_length=DEFAULT_MAX_PRINT_OUTPUTS_LENGTH,
-            max_steps=DEFAULT_SUBTASK_MAX_STEPS
+            max_steps=DEFAULT_SUBTASK_MAX_STEPS,
         )
 
         # 注入目标智能体沙箱环境与产出物工具
-        target_uploads_dir = os.path.join(self.manager._bot_dir(target_bot_id), "uploads")
-        os.makedirs(target_uploads_dir, exist_ok=True)  # pi-lens-ignore: unchecked-throwing-call-python -- sandbox file capability
+        target_uploads_dir = os.path.join(
+            self.manager._runtime_dir(target_bot_id), "uploads"
+        )
+        os.makedirs(  # pi-lens-ignore: unchecked-throwing-call-python -- sandbox file capability
+            target_uploads_dir, exist_ok=True
+        )
 
         def subtask_save_file(filename: str, data: Any) -> dict[str, Any]:
             safe_name = os.path.basename(filename)
@@ -673,48 +794,67 @@ class AgentEngine:
             elif hasattr(data, "to_csv") and safe_name.endswith(".csv"):
                 data.to_csv(dest_path, index=False)
             elif isinstance(data, (bytes, bytearray)):
-                with open(dest_path, "wb") as f:  # pi-lens-ignore: unchecked-throwing-call-python -- sandbox file capability
+                with (
+                    open(dest_path, "wb") as f  # pi-lens-ignore: unchecked-throwing-call-python -- sandbox file capability
+                ):
                     f.write(data)
             elif isinstance(data, str):
-                with open(dest_path, "w", encoding="utf-8") as f:  # pi-lens-ignore: unchecked-throwing-call-python -- sandbox file capability
+                with (
+                    open(dest_path, "w", encoding="utf-8") as f  # pi-lens-ignore: unchecked-throwing-call-python -- sandbox file capability
+                ):
                     f.write(data)
             elif isinstance(data, (dict, list)):
-                with open(dest_path, "w", encoding="utf-8") as f:  # pi-lens-ignore: unchecked-throwing-call-python -- sandbox file capability
+                with (
+                    open(dest_path, "w", encoding="utf-8") as f  # pi-lens-ignore: unchecked-throwing-call-python -- sandbox file capability
+                ):
                     json.dump(data, f, ensure_ascii=False, indent=2)
             else:
-                with open(dest_path, "w", encoding="utf-8") as f:  # pi-lens-ignore: unchecked-throwing-call-python -- sandbox file capability
+                with (
+                    open(dest_path, "w", encoding="utf-8") as f  # pi-lens-ignore: unchecked-throwing-call-python -- sandbox file capability
+                ):
                     f.write(str(data))
             return {
                 "filename": safe_name,
                 "path": dest_path,
-                "url": f"/api/agent/bots/{target_bot_id}/files/{safe_name}"
+                "url": f"/api/agent/bots/{target_bot_id}/files/{safe_name}",
             }
 
         def subtask_bot_open(file, mode="r", *args, **kwargs):
             return _confined_open(target_uploads_dir, file, mode, *args, **kwargs)
 
-        subtask_cloud_call = next((t for t in tools if isinstance(t, CloudCallTool)), None) or CloudCallTool(
+        subtask_cloud_call = next(
+            (t for t in tools if isinstance(t, CloudCallTool)), None
+        ) or CloudCallTool(
             bot_manager=self.manager,
             tim_client=self.tim_client,
             approval_requester=delegated_approval_requester,
         )
-        subtask_search_tool = next((t for t in tools if isinstance(t, CloudSearchApisTool)), None) or CloudSearchApisTool()
-        subtask_doc_tool = next((t for t in tools if isinstance(t, CloudGetDocTool)), None) or CloudGetDocTool()
+        subtask_search_tool = (
+            next((t for t in tools if isinstance(t, CloudSearchApisTool)), None)
+            or CloudSearchApisTool()
+        )
+        subtask_doc_tool = (
+            next((t for t in tools if isinstance(t, CloudGetDocTool)), None)
+            or CloudGetDocTool()
+        )
 
-        _install_sandbox_scope(agent, {
-            "open": subtask_bot_open,
-            "render_chart": render_chart,
-            "save_file": subtask_save_file,
-            "OUTPUT_DIR": target_uploads_dir,
-            "WORKSPACE_DIR": target_uploads_dir,
-            **build_sandbox_scope(
-                caller_tool=subtask_cloud_call,
-                search_tool=subtask_search_tool,
-                doc_tool=subtask_doc_tool,
-                cloud_client=self.cloud_client,
-                tim_client=self.tim_client
-            )
-        })
+        _install_sandbox_scope(
+            agent,
+            {
+                "open": subtask_bot_open,
+                "render_chart": render_chart,
+                "save_file": subtask_save_file,
+                "OUTPUT_DIR": target_uploads_dir,
+                "WORKSPACE_DIR": target_uploads_dir,
+                **build_sandbox_scope(
+                    caller_tool=subtask_cloud_call,
+                    search_tool=subtask_search_tool,
+                    doc_tool=subtask_doc_tool,
+                    cloud_client=self.cloud_client,
+                    tim_client=self.tim_client,
+                ),
+            },
+        )
 
         resp = agent.run(task_prompt)
         final_answer = str(resp) if resp is not None else "任务已处理。"
@@ -725,7 +865,7 @@ class AgentEngine:
             target_bot_id,
             "assistant",
             cleaned_ans or "协同任务已执行完毕。",
-            metadata={"delegated_by": caller_bot_id}
+            metadata={"delegated_by": caller_bot_id},
         )
 
         return cleaned_ans or "协同任务已完成。"
@@ -737,17 +877,14 @@ class AgentEngine:
         attachments: list[dict[str, Any]] | None = None,
         skip_user_append: bool = False,
         stop_checker: Any | None = None,
-        approval_requester: Any | None = None
+        approval_requester: Any | None = None,
     ):
         """
         生成器：执行 CodeAgent 并按结构流式产生事件 (Thought, Code, Output, Message)
         """
         bot = self.manager.get_bot(bot_id)
         if not bot:
-            yield {
-                "event": "error",
-                "data": {"error": f"BOT '{bot_id}' 不存在"}
-            }
+            yield {"event": "error", "data": {"error": f"BOT '{bot_id}' 不存在"}}
             return
 
         # 1. 保存用户提问与附件元数据到历史 (如果是重新生成，则复用原有用户提问，跳过追加)
@@ -763,7 +900,9 @@ class AgentEngine:
                     else:
                         clean_attachments.append(att)
                 user_meta["attachments"] = clean_attachments
-            self.manager.append_history(bot_id, "user", user_message, metadata=user_meta)
+            self.manager.append_history(
+                bot_id, "user", user_message, metadata=user_meta
+            )
 
         # 2. 检查大模型配置
         llm_cfg = self.get_effective_llm_config(bot)
@@ -771,10 +910,7 @@ class AgentEngine:
             model = self.create_model(llm_cfg)
         except Exception as e:
             err_msg = str(e)
-            yield {
-                "event": "error",
-                "data": {"error": err_msg}
-            }
+            yield {"event": "error", "data": {"error": err_msg}}
             self.manager.append_history(bot_id, "assistant", f"[配置错误] {err_msg}")
             return
 
@@ -785,7 +921,7 @@ class AgentEngine:
             self.tim_client,
             engine=self,
             approval_requester=approval_requester,
-            cloud_client=self.cloud_client
+            cloud_client=self.cloud_client,
         )
         system_prompt = self.assemble_system_prompt(bot)
         stream_start_time = time.time()
@@ -798,8 +934,8 @@ class AgentEngine:
                 "model": llm_cfg.model_name,
                 "provider": llm_cfg.provider,
                 "timestamp": stream_start_time,
-                "attachments_count": len(attachments or [])
-            }
+                "attachments_count": len(attachments or []),
+            },
         }
 
         effective_max_steps = (
@@ -814,19 +950,24 @@ class AgentEngine:
             additional_authorized_imports=AUTHORIZED_IMPORTS,
             max_print_outputs_length=DEFAULT_MAX_PRINT_OUTPUTS_LENGTH,
             max_steps=effective_max_steps,
-            stream_outputs=True
+            stream_outputs=True,
         )
 
         # 挂载跨轮已留存的沙箱变量环境
-        saved_state = self._bot_sandbox_states.get(bot_id, {})
+        saved_state = self._get_sandbox(self._sandbox_key(bot_id))
         if saved_state:
             try:
                 agent.state.update(saved_state)
             except Exception as e:
-                logger.warning("Failed to restore sandbox state for %s: %s", bot_id, str(e))
+                logger.warning(
+                    "Failed to restore sandbox state for %s: %s", bot_id, str(e)
+                )
 
         # 定制 final_answer 兜底 Prompt 模板，严禁输出代码和内部调用标记
-        if hasattr(agent, "prompt_templates") and "final_answer" in agent.prompt_templates:
+        if (
+            hasattr(agent, "prompt_templates")
+            and "final_answer" in agent.prompt_templates
+        ):
             agent.prompt_templates["final_answer"]["pre_messages"] = (
                 "智能体在执行任务时达到了步数上限。请你作为资深架构师和业务助手，基于前面各步骤已收集到的所有数据、输出和日志（Observation），直接向用户给出最终的结构化 Markdown 业务汇报。\n"
                 "【严格禁令与输出格式规范】：\n"
@@ -840,36 +981,19 @@ class AgentEngine:
             )
 
         # 注入当前智能体专属产出物目录与资产中心工具
-        uploads_dir = os.path.join(self.manager._bot_dir(bot_id), "uploads")
-        os.makedirs(uploads_dir, exist_ok=True)  # pi-lens-ignore: unchecked-throwing-call-python -- sandbox file capability
+        uploads_dir = os.path.join(self.manager._runtime_dir(bot_id), "uploads")
+        os.makedirs(  # pi-lens-ignore: unchecked-throwing-call-python -- sandbox file capability
+            uploads_dir, exist_ok=True
+        )
 
         run_start_time = time.time()
-        initial_root_files = set(os.listdir("."))  # pi-lens-ignore: unchecked-throwing-call-python -- sandbox file capability
-        initial_uploads_files = set(os.listdir(uploads_dir)) if os.path.exists(uploads_dir) else set()  # pi-lens-ignore: unchecked-throwing-call-python -- sandbox file capability
+        initial_uploads_files = (
+            set(os.listdir(uploads_dir)) if os.path.exists(uploads_dir) else set()  # pi-lens-ignore: unchecked-throwing-call-python -- sandbox file capability
+        )
         tracked_output_files: list[dict[str, Any]] = []
 
         def sync_generated_artifacts():
-            """双向探测并归集执行期间生成的文件（包括根目录误写与 uploads 产生的文件）"""
-            try:
-                current_root_files = set(os.listdir("."))
-                new_root_files = current_root_files - initial_root_files
-                for fn in new_root_files:
-                    fp = os.path.join(".", fn)
-                    if not os.path.isfile(fp):
-                        continue
-                    if fn.startswith(".") or fn in (
-                        "app.py", "config.json", "requirements.txt", "README.md",
-                        "LICENSE", "config.example.json", "package.json", "pnpm-lock.yaml"
-                    ):
-                        continue
-                    cat, ftype = get_file_category_and_type(fn)
-                    if cat in ("table", "image", "document", "text") or ftype in ("json", "zip", "parquet", "xlsx", "xls", "csv"):
-                        dest_fp = os.path.join(uploads_dir, fn)
-                        shutil.move(fp, dest_fp)
-                        logger.info("Auto-rescued generated artifact from root to uploads: %s -> %s", fp, dest_fp)
-            except Exception as ex:
-                logger.warning("Error scanning root files in sync_generated_artifacts: %s", ex)
-
+            """归集当前用户 uploads 目录内本次运行产生的文件，不扫描共享工作目录。"""
             try:
                 if os.path.exists(uploads_dir):
                     for fn in os.listdir(uploads_dir):
@@ -879,26 +1003,35 @@ class AgentEngine:
                         stat = os.stat(fp)
                         mtime = stat.st_mtime
                         if (
-                            (fn not in initial_uploads_files or mtime >= (run_start_time - 2.0))
-                            and not any(f["name"] == fn or f.get("saved_name") == fn for f in tracked_output_files)
+                            fn not in initial_uploads_files
+                            or mtime >= (run_start_time - 2.0)
+                        ) and not any(
+                            f["name"] == fn or f.get("saved_name") == fn
+                            for f in tracked_output_files
                         ):
                             cat, ftype = get_file_category_and_type(fn)
                             orig_name = re.sub(r"^f_\d+_", "", fn)
-                            tracked_output_files.append({
-                                "id": f"att-{int(time.time()*1000)}-{len(tracked_output_files)}",
-                                "name": orig_name,
-                                "saved_name": fn,
-                                "size": stat.st_size,
-                                "size_formatted": format_file_size(stat.st_size),
-                                "category": cat,
-                                "type": ftype,
-                                "path": fp,
-                                "url": f"/api/agent/bots/{bot_id}/files/{fn}",
-                                "download_url": f"/api/agent/bots/{bot_id}/files/{fn}?download=true",
-                                "created_at": datetime.fromtimestamp(mtime, tz=UTC).isoformat()
-                            })
+                            tracked_output_files.append(
+                                {
+                                    "id": f"att-{int(time.time() * 1000)}-{len(tracked_output_files)}",
+                                    "name": orig_name,
+                                    "saved_name": fn,
+                                    "size": stat.st_size,
+                                    "size_formatted": format_file_size(stat.st_size),
+                                    "category": cat,
+                                    "type": ftype,
+                                    "path": fp,
+                                    "url": f"/api/agent/bots/{bot_id}/files/{fn}",
+                                    "download_url": f"/api/agent/bots/{bot_id}/files/{fn}?download=true",
+                                    "created_at": datetime.fromtimestamp(
+                                        mtime, tz=UTC
+                                    ).isoformat(),
+                                }
+                            )
             except Exception as ex:
-                logger.warning("Error scanning uploads in sync_generated_artifacts: %s", ex)
+                logger.warning(
+                    "Error scanning uploads in sync_generated_artifacts: %s", ex
+                )
 
         def save_file(filename: str, data: Any) -> dict[str, Any]:
             """保存文件至当前智能体专属资产中心，自动支持字符串、字节、JSON字典、Pandas DataFrame"""
@@ -909,16 +1042,24 @@ class AgentEngine:
             elif hasattr(data, "to_csv") and safe_name.endswith(".csv"):
                 data.to_csv(dest_path, index=False)
             elif isinstance(data, (bytes, bytearray)):
-                with open(dest_path, "wb") as f:  # pi-lens-ignore: unchecked-throwing-call-python -- sandbox file capability
+                with (
+                    open(dest_path, "wb") as f  # pi-lens-ignore: unchecked-throwing-call-python -- sandbox file capability
+                ):
                     f.write(data)
             elif isinstance(data, str):
-                with open(dest_path, "w", encoding="utf-8") as f:  # pi-lens-ignore: unchecked-throwing-call-python -- sandbox file capability
+                with (
+                    open(dest_path, "w", encoding="utf-8") as f  # pi-lens-ignore: unchecked-throwing-call-python -- sandbox file capability
+                ):
                     f.write(data)
             elif isinstance(data, (dict, list)):
-                with open(dest_path, "w", encoding="utf-8") as f:  # pi-lens-ignore: unchecked-throwing-call-python -- sandbox file capability
+                with (
+                    open(dest_path, "w", encoding="utf-8") as f  # pi-lens-ignore: unchecked-throwing-call-python -- sandbox file capability
+                ):
                     json.dump(data, f, ensure_ascii=False, indent=2)
             else:
-                with open(dest_path, "w", encoding="utf-8") as f:  # pi-lens-ignore: unchecked-throwing-call-python -- sandbox file capability
+                with (
+                    open(dest_path, "w", encoding="utf-8") as f  # pi-lens-ignore: unchecked-throwing-call-python -- sandbox file capability
+                ):
                     f.write(str(data))
 
             file_size = os.path.getsize(dest_path)
@@ -926,20 +1067,25 @@ class AgentEngine:
             download_url = f"/api/agent/bots/{bot_id}/files/{safe_name}?download=true"
             preview_url = f"/api/agent/bots/{bot_id}/files/{safe_name}"
 
-            if not any(f["name"] == safe_name or f.get("saved_name") == safe_name for f in tracked_output_files):
-                tracked_output_files.append({
-                    "id": f"att-{int(time.time()*1000)}-{len(tracked_output_files)}",
-                    "name": safe_name,
-                    "saved_name": safe_name,
-                    "size": file_size,
-                    "size_formatted": format_file_size(file_size),
-                    "category": cat,
-                    "type": ftype,
-                    "path": dest_path,
-                    "url": preview_url,
-                    "download_url": download_url,
-                    "created_at": datetime.now(UTC).isoformat()
-                })
+            if not any(
+                f["name"] == safe_name or f.get("saved_name") == safe_name
+                for f in tracked_output_files
+            ):
+                tracked_output_files.append(
+                    {
+                        "id": f"att-{int(time.time() * 1000)}-{len(tracked_output_files)}",
+                        "name": safe_name,
+                        "saved_name": safe_name,
+                        "size": file_size,
+                        "size_formatted": format_file_size(file_size),
+                        "category": cat,
+                        "type": ftype,
+                        "path": dest_path,
+                        "url": preview_url,
+                        "download_url": download_url,
+                        "created_at": datetime.now(UTC).isoformat(),
+                    }
+                )
 
             return {
                 "filename": safe_name,
@@ -947,31 +1093,46 @@ class AgentEngine:
                 "size": file_size,
                 "url": preview_url,
                 "download_url": download_url,
-                "message": f"文件「{safe_name}」已成功保存至资产中心！请在回答中附上下载链接：[📥 点击下载 {safe_name}]({download_url})"
+                "message": f"文件「{safe_name}」已成功保存至资产中心！请在回答中附上下载链接：[📥 点击下载 {safe_name}]({download_url})",
             }
 
         def bot_open(file, mode="r", *args, **kwargs):
             """智能沙箱 open：所有文件操作强制限定在 BOT 专属产出物目录"""
             return _confined_open(uploads_dir, file, mode, *args, **kwargs)
 
-        stream_cloud_call = next((t for t in tools if isinstance(t, CloudCallTool)), None) or CloudCallTool(approval_requester=approval_requester, bot_manager=self.manager, tim_client=self.tim_client)
-        stream_search_tool = next((t for t in tools if isinstance(t, CloudSearchApisTool)), None) or CloudSearchApisTool()
-        stream_doc_tool = next((t for t in tools if isinstance(t, CloudGetDocTool)), None) or CloudGetDocTool()
+        stream_cloud_call = next(
+            (t for t in tools if isinstance(t, CloudCallTool)), None
+        ) or CloudCallTool(
+            approval_requester=approval_requester,
+            bot_manager=self.manager,
+            tim_client=self.tim_client,
+        )
+        stream_search_tool = (
+            next((t for t in tools if isinstance(t, CloudSearchApisTool)), None)
+            or CloudSearchApisTool()
+        )
+        stream_doc_tool = (
+            next((t for t in tools if isinstance(t, CloudGetDocTool)), None)
+            or CloudGetDocTool()
+        )
 
-        _install_sandbox_scope(agent, {
-            "open": bot_open,
-            "render_chart": render_chart,
-            "save_file": save_file,
-            "OUTPUT_DIR": uploads_dir,
-            "WORKSPACE_DIR": uploads_dir,
-            **build_sandbox_scope(
-                caller_tool=stream_cloud_call,
-                search_tool=stream_search_tool,
-                doc_tool=stream_doc_tool,
-                cloud_client=self.cloud_client,
-                tim_client=self.tim_client
-            )
-        })
+        _install_sandbox_scope(
+            agent,
+            {
+                "open": bot_open,
+                "render_chart": render_chart,
+                "save_file": save_file,
+                "OUTPUT_DIR": uploads_dir,
+                "WORKSPACE_DIR": uploads_dir,
+                **build_sandbox_scope(
+                    caller_tool=stream_cloud_call,
+                    search_tool=stream_search_tool,
+                    doc_tool=stream_doc_tool,
+                    cloud_client=self.cloud_client,
+                    tim_client=self.tim_client,
+                ),
+            },
+        )
 
         # 初始化线程隔离的实时协同事件收集器
         self._local.active_stream_orchestrations = []
@@ -979,6 +1140,7 @@ class AgentEngine:
 
         # 4. 构建四层分级记忆与无限上下文 (Hierarchical Infinite Memory)
         from .memory import memory_manager
+
         effective_context_budget = (
             getattr(bot, "context_budget", None)
             or getattr(llm_cfg, "context_budget", None)
@@ -1002,7 +1164,7 @@ class AgentEngine:
             manager=self.manager,
             uploads_dir=uploads_dir,
             context_budget=effective_context_budget,
-            max_context_turns=effective_context_turns
+            max_context_turns=effective_context_turns,
         )
         task_prompt = hierarchical_ctx.task_prompt
 
@@ -1033,19 +1195,28 @@ class AgentEngine:
                             clean = delta.replace("<think>", "").replace("</think>", "")
                             if clean:
                                 thought_buffer += clean
-                                yield {"event": "thought_chunk", "data": {"delta": clean}}
+                                yield {
+                                    "event": "thought_chunk",
+                                    "data": {"delta": clean},
+                                }
                         elif "<think>" in delta:
                             in_think_tag = True
                             clean = delta.replace("<think>", "")
                             if clean:
                                 thought_buffer += clean
-                                yield {"event": "thought_chunk", "data": {"delta": clean}}
+                                yield {
+                                    "event": "thought_chunk",
+                                    "data": {"delta": clean},
+                                }
                         elif "</think>" in delta:
                             in_think_tag = False
                             clean = delta.replace("</think>", "")
                             if clean:
                                 thought_buffer += clean
-                                yield {"event": "thought_chunk", "data": {"delta": clean}}
+                                yield {
+                                    "event": "thought_chunk",
+                                    "data": {"delta": clean},
+                                }
                         elif in_think_tag:
                             thought_buffer += delta
                             yield {"event": "thought_chunk", "data": {"delta": delta}}
@@ -1059,7 +1230,10 @@ class AgentEngine:
                             # 只有在非代码块时才作为思考流推送，避免代码未解析前出现闪烁
                             if not is_in_code and not delta.strip().startswith("```"):
                                 thought_buffer += delta
-                                yield {"event": "thought_chunk", "data": {"delta": delta}}
+                                yield {
+                                    "event": "thought_chunk",
+                                    "data": {"delta": delta},
+                                }
 
                 # 2. 思考规划步 (PlanningStep)
                 elif isinstance(step, PlanningStep):
@@ -1067,10 +1241,7 @@ class AgentEngine:
                     if plan_text:
                         plan_md = f"#### 📋 任务规划与路径拆解\n\n{plan_text.strip()}"
                         accumulated_thoughts.append(plan_md)
-                        yield {
-                            "event": "thought",
-                            "data": {"content": plan_md}
-                        }
+                        yield {"event": "thought", "data": {"content": plan_md}}
 
                 # 3. 准备执行 Python 脚本 (ToolCall) -> 实时唤醒前端单卡并进入运行中动效
                 elif isinstance(step, ToolCall):
@@ -1085,13 +1256,10 @@ class AgentEngine:
                     code_item = {
                         "step": current_step,
                         "code": raw_code,
-                        "status": "running"
+                        "status": "running",
                     }
                     accumulated_code_blocks.append(code_item)
-                    yield {
-                        "event": "code_start",
-                        "data": code_item
-                    }
+                    yield {"event": "code_start", "data": code_item}
 
                 # 4. 代码执行返回结果 (ActionOutput)
                 elif isinstance(step, ActionOutput):
@@ -1103,16 +1271,16 @@ class AgentEngine:
                         log_item = {
                             "step": current_step,
                             "output": obs_md,
-                            "status": "success"
+                            "status": "success",
                         }
                         accumulated_execution_logs.append(log_item)
                         for c in accumulated_code_blocks:
-                            if c.get("step") == current_step and c.get("status") == "running":
+                            if (
+                                c.get("step") == current_step
+                                and c.get("status") == "running"
+                            ):
                                 c["status"] = "success"
-                        yield {
-                            "event": "execution_result",
-                            "data": log_item
-                        }
+                        yield {"event": "execution_result", "data": log_item}
 
                 # 5. 代码执行完成步 (ActionStep)
                 elif isinstance(step, ActionStep):
@@ -1125,27 +1293,29 @@ class AgentEngine:
                         if clean_thought:
                             thought_md = f"#### 💭 步骤 {step.step_number} 推理分析\n\n{clean_thought.strip()}"
                             accumulated_thoughts.append(thought_md)
-                            yield {
-                                "event": "thought",
-                                "data": {"content": thought_md}
-                            }
+                            yield {"event": "thought", "data": {"content": thought_md}}
 
                     # 若沙箱有额外 observations 输出，且尚未向前端派发
-                    if step.observations and not any(log["step"] == step.step_number for log in accumulated_execution_logs):
-                        obs_md = format_execution_observation(step.observations, step.step_number)
+                    if step.observations and not any(
+                        log["step"] == step.step_number
+                        for log in accumulated_execution_logs
+                    ):
+                        obs_md = format_execution_observation(
+                            step.observations, step.step_number
+                        )
                         log_item = {
                             "step": step.step_number,
                             "output": obs_md,
-                            "status": "success"
+                            "status": "success",
                         }
                         accumulated_execution_logs.append(log_item)
                         for c in accumulated_code_blocks:
-                            if c.get("step") == step.step_number and c.get("status") == "running":
+                            if (
+                                c.get("step") == step.step_number
+                                and c.get("status") == "running"
+                            ):
                                 c["status"] = "success"
-                        yield {
-                            "event": "execution_result",
-                            "data": log_item
-                        }
+                        yield {"event": "execution_result", "data": log_item}
 
                 # 6. 最终答案步 (FinalAnswerStep)
                 elif isinstance(step, FinalAnswerStep):
@@ -1165,20 +1335,14 @@ class AgentEngine:
                 while orch_queue:
                     orch_item = orch_queue.pop(0)
                     accumulated_orchestrations.append(orch_item)
-                    yield {
-                        "event": "orchestration",
-                        "data": orch_item
-                    }
+                    yield {"event": "orchestration", "data": orch_item}
 
             # 结算残余协同事件
             orch_queue = getattr(self._local, "active_stream_orchestrations", None)
             while orch_queue:
                 orch_item = orch_queue.pop(0)
                 accumulated_orchestrations.append(orch_item)
-                yield {
-                    "event": "orchestration",
-                    "data": orch_item
-                }
+                yield {"event": "orchestration", "data": orch_item}
 
             # 8. 判断是否触发了最大执行步数限制
             is_max_steps_reached = any(
@@ -1191,55 +1355,85 @@ class AgentEngine:
             if final_answer:
                 cleaned_ans, leftover_thought = clean_final_answer(final_answer)
                 if leftover_thought:
-                    leftover_md = f"#### 💭 综合校验与归纳\n\n{leftover_thought.strip()}"
+                    leftover_md = (
+                        f"#### 💭 综合校验与归纳\n\n{leftover_thought.strip()}"
+                    )
                     accumulated_thoughts.append(leftover_md)
-                    yield {
-                        "event": "thought",
-                        "data": {"content": leftover_md}
-                    }
+                    yield {"event": "thought", "data": {"content": leftover_md}}
                 final_answer = cleaned_ans or "任务已执行完毕。"
             else:
                 final_answer = "任务已执行完毕。"
 
             # 智能抢救：若达到步数上限且最终文本仍然包含未执行的代码块，尝试在沙箱中补执行
             if is_max_steps_reached and "```python" in final_answer:
-                code_matches = re.findall(r"```(?:python|py)?\s*\n([\s\S]*?)\n```", final_answer)
+                code_matches = re.findall(
+                    r"```(?:python|py)?\s*\n([\s\S]*?)\n```", final_answer
+                )
                 for unexecuted_code in code_matches:
                     unexecuted_code = unexecuted_code.strip()
-                    if unexecuted_code and not unexecuted_code.startswith("final_answer") and len(unexecuted_code) > 20:
+                    if (
+                        unexecuted_code
+                        and not unexecuted_code.startswith("final_answer")
+                        and len(unexecuted_code) > 20
+                    ):
                         try:
                             rescue_step = current_step
                             current_step += 1
-                            accumulated_code_blocks.append({
-                                "step": rescue_step,
-                                "code": unexecuted_code,
-                                "status": "running"
-                            })
+                            accumulated_code_blocks.append(
+                                {
+                                    "step": rescue_step,
+                                    "code": unexecuted_code,
+                                    "status": "running",
+                                }
+                            )
                             yield {
                                 "event": "code_start",
-                                "data": {"step": rescue_step, "code": unexecuted_code, "status": "running"}
+                                "data": {
+                                    "step": rescue_step,
+                                    "code": unexecuted_code,
+                                    "status": "running",
+                                },
                             }
                             rescue_res = agent.python_executor(unexecuted_code)
-                            rescue_logs = rescue_res.logs.strip() if rescue_res and rescue_res.logs else ""
-                            obs_md = format_execution_observation(rescue_logs, rescue_step)
-                            accumulated_execution_logs.append({
-                                "step": rescue_step,
-                                "output": obs_md,
-                                "status": "success"
-                            })
+                            rescue_logs = (
+                                rescue_res.logs.strip()
+                                if rescue_res and rescue_res.logs
+                                else ""
+                            )
+                            obs_md = format_execution_observation(
+                                rescue_logs, rescue_step
+                            )
+                            accumulated_execution_logs.append(
+                                {
+                                    "step": rescue_step,
+                                    "output": obs_md,
+                                    "status": "success",
+                                }
+                            )
                             for c in accumulated_code_blocks:
                                 if c.get("step") == rescue_step:
                                     c["status"] = "success"
                             yield {
                                 "event": "execution_result",
-                                "data": {"step": rescue_step, "output": obs_md, "status": "success"}
+                                "data": {
+                                    "step": rescue_step,
+                                    "output": obs_md,
+                                    "status": "success",
+                                },
                             }
                         except Exception as rex:
                             logger.warning("Rescue execution failed: %s", str(rex))
 
             # 步数上限友情提示
-            if is_max_steps_reached and "最大步数" not in final_answer and "步数上限" not in final_answer:
-                final_answer = final_answer + f"\n\n> ℹ️ **说明**：该轮任务已达单次执行步数上限（已执行 {len(accumulated_code_blocks)} 步并记录沙箱数据）。相关变量与结果已保存在当前会话环境中，您可以直接回复继续操作或导出数据！"
+            if (
+                is_max_steps_reached
+                and "最大步数" not in final_answer
+                and "步数上限" not in final_answer
+            ):
+                final_answer = (
+                    final_answer
+                    + f"\n\n> ℹ️ **说明**：该轮任务已达单次执行步数上限（已执行 {len(accumulated_code_blocks)} 步并记录沙箱数据）。相关变量与结果已保存在当前会话环境中，您可以直接回复继续操作或导出数据！"
+                )
 
             # 全流程产出物最终同步归集
             sync_generated_artifacts()
@@ -1250,14 +1444,22 @@ class AgentEngine:
                 for f in tracked_output_files:
                     fn = f["name"]
                     sn = f.get("saved_name", fn)
-                    if f"/files/{sn}" not in final_answer and f"/files/{fn}" not in final_answer:
+                    if (
+                        f"/files/{sn}" not in final_answer
+                        and f"/files/{fn}" not in final_answer
+                    ):
                         missing_download_links.append(f)
 
                 if missing_download_links:
                     download_md_lines = ["\n\n---\n### 📥 产出物文件直接下载\n"]
                     for mf in missing_download_links:
-                        dl_url = mf.get("download_url") or f"/api/agent/bots/{bot_id}/files/{mf['saved_name']}?download=true"
-                        download_md_lines.append(f"- [📥 **{mf['name']}** ({mf['size_formatted']})]({dl_url})\n")
+                        dl_url = (
+                            mf.get("download_url")
+                            or f"/api/agent/bots/{bot_id}/files/{mf['saved_name']}?download=true"
+                        )
+                        download_md_lines.append(
+                            f"- [📥 **{mf['name']}** ({mf['size_formatted']})]({dl_url})\n"
+                        )
                     final_answer = final_answer + "".join(download_md_lines)
 
             # 触发流式回答生命周期：通知前端折叠过程、聚焦正文，开启打字机效果
@@ -1278,17 +1480,11 @@ class AgentEngine:
 
             for i in range(0, total_len, chunk_size):
                 chunk_piece = final_answer[i : i + chunk_size]
-                yield {
-                    "event": "chunk",
-                    "data": {"delta": chunk_piece}
-                }
+                yield {"event": "chunk", "data": {"delta": chunk_piece}}
                 time.sleep(sleep_time)
 
             # 发送最终整理好的完整回答
-            yield {
-                "event": "message",
-                "data": {"content": final_answer}
-            }
+            yield {"event": "message", "data": {"content": final_answer}}
 
             # 存入历史（完整持久化结构化思维链、Python 代码、执行日志与工具调用）
             if thought_buffer and not accumulated_thoughts:
@@ -1299,7 +1495,9 @@ class AgentEngine:
                 if c.get("status") == "running":
                     c["status"] = "success"
 
-            full_thought_str = "\n\n---\n\n".join([t for t in accumulated_thoughts if t.strip()]).strip()
+            full_thought_str = "\n\n---\n\n".join(
+                [t for t in accumulated_thoughts if t.strip()]
+            ).strip()
 
             # 统计本次执行的性能与消耗指标
             stream_elapsed = round(time.time() - stream_start_time, 2)
@@ -1329,7 +1527,7 @@ class AgentEngine:
                 "output_tokens": output_tokens,
                 "total_tokens": total_tokens,
                 "code_executions": len(accumulated_code_blocks),
-                "model": llm_cfg.model_name
+                "model": llm_cfg.model_name,
             }
             # 检查若已被用户中止，跳过历史持久化与指标记录
             if stop_checker and stop_checker():
@@ -1353,31 +1551,44 @@ class AgentEngine:
                     "model": llm_cfg.model_name,
                     "metrics": metrics,
                     "attachments": tracked_output_files,
-                    "artifacts": tracked_output_files
-                }
+                    "artifacts": tracked_output_files,
+                },
             )
 
             # 保存沙箱环境供后续跨轮交互直接复用
-            if hasattr(agent, "python_executor") and hasattr(agent.python_executor, "state"):
+            if hasattr(agent, "python_executor") and hasattr(
+                agent.python_executor, "state"
+            ):
                 persistent_vars = {}
                 executor = cast(Any, agent.python_executor)
                 for k, v in executor.state.items():
-                    if k.startswith("_") or k in ("open", "render_chart", "save_file", "OUTPUT_DIR", "WORKSPACE_DIR", "cloud_client", "final_answer"):
+                    if k.startswith("_") or k in (
+                        "open",
+                        "render_chart",
+                        "save_file",
+                        "OUTPUT_DIR",
+                        "WORKSPACE_DIR",
+                        "cloud_client",
+                        "tim_client",
+                        "get_usersig",
+                        "final_answer",
+                    ):
                         continue
                     if callable(v) and not hasattr(v, "__code__"):
                         continue
                     persistent_vars[k] = v
-                self._bot_sandbox_states[bot_id] = persistent_vars
+                self._remember_sandbox(self._sandbox_key(bot_id), persistent_vars)
 
             # 触发四层分级记忆演化归档与增量滚动摘要更新
             try:
                 from .memory import memory_manager
+
                 memory_manager.on_turn_completed(
                     bot_id=bot_id,
-                    bot_dir=self.manager._bot_dir(bot_id),
+                    bot_dir=self.manager._runtime_dir(bot_id),
                     all_history=self.manager.get_history(bot_id, limit=500),
-                    saved_state=self._bot_sandbox_states.get(bot_id, {}),
-                    max_context_turns=effective_context_turns
+                    saved_state=self._get_sandbox(self._sandbox_key(bot_id)),
+                    max_context_turns=effective_context_turns,
                 )
             except Exception as mex:
                 logger.warning("Memory manager on_turn_completed error: %s", str(mex))
@@ -1385,23 +1596,22 @@ class AgentEngine:
             yield {
                 "event": "done",
                 "data": {
-                    "status": "max_steps_reached" if is_max_steps_reached else "success",
+                    "status": "max_steps_reached"
+                    if is_max_steps_reached
+                    else "success",
                     "code_blocks": len(accumulated_code_blocks),
                     "orchestrations": accumulated_orchestrations,
                     "metrics": metrics,
                     "timestamp": time.time(),
                     "attachments": tracked_output_files,
-                    "files": tracked_output_files
-                }
+                    "files": tracked_output_files,
+                },
             }
 
         except Exception as e:
             err_text = f"智能体执行遇到异常: {e!s}"
             logger.exception("Agent run error: %s", err_text)
-            yield {
-                "event": "error",
-                "data": {"error": err_text}
-            }
+            yield {"event": "error", "data": {"error": err_text}}
             self.manager.append_history(bot_id, "assistant", f"[异常] {err_text}")
         finally:
             self._local.active_stream_orchestrations = None

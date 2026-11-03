@@ -91,8 +91,11 @@ def recognize_image_text(file_path: str, max_chars: int = 3000) -> Optional[str]
     try:
         import pytesseract  # type: ignore[import-not-found]
         from PIL import Image
-        img = Image.open(file_path)
-        txt = pytesseract.image_to_string(img, lang="chi_sim+eng").strip()
+        # Keep the descriptor-backed image resource scoped to this OCR call.
+        # Pillow may defer closing the underlying file until image GC otherwise,
+        # which is particularly visible during high-volume fallback OCR.
+        with Image.open(file_path) as img:
+            txt = pytesseract.image_to_string(img, lang="chi_sim+eng").strip()
         if txt:
             return txt[:max_chars]
     except Exception:

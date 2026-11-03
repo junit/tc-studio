@@ -29,6 +29,13 @@ SPECS_CACHE_PATH = os.path.join(BASE_DIR, "core", "live_common_specs.json")
 DATA_TYPES_PATH = os.path.join(BASE_DIR, "core", "live_data_types.json")
 BEIJING_TZ = timezone(timedelta(hours=8))
 
+
+def _specs_cache_path(service: str) -> str:
+    safe_service = re.sub(r"[^a-zA-Z0-9_-]", "_", str(service or "live").lower())
+    if safe_service == "live":
+        return SPECS_CACHE_PATH
+    return os.path.join(BASE_DIR, "core", f"{safe_service}_common_specs.json")
+
 COMMON_DOC_CONFIGS = [
     {"id": 20458, "title": "请求结构", "category": "invocation", "key": "request_structure", "url": "https://cloud.tencent.com/document/api/267/20458"},
     {"id": 20459, "title": "公共参数", "category": "invocation", "key": "common_params", "url": "https://cloud.tencent.com/document/api/267/20459"},
@@ -407,23 +414,26 @@ class CommonSpecsManager:
 
     def __init__(self):
         self._lock = threading.Lock()
-        self._specs_cache: Optional[dict] = None
+        self._specs_cache: dict[str, dict] = {}
 
     def get_specs(self, service: str = "live", force_reload: bool = False) -> dict:
         """获取结构化公共规范；不在持锁状态下进入同步 I/O。"""
+        cache_path = _specs_cache_path(service)
         with self._lock:
-            if not force_reload and self._specs_cache is not None:
-                return self._specs_cache
+            if not force_reload and service in self._specs_cache:
+                return self._specs_cache[service]
 
-            if not force_reload and os.path.exists(SPECS_CACHE_PATH):
+            if not force_reload and os.path.exists(cache_path):
                 try:
-                    with open(SPECS_CACHE_PATH, "r", encoding="utf-8") as f:
+                    with open(cache_path, "r", encoding="utf-8") as f:
                         loaded = json.load(f)
                     if isinstance(loaded, dict):
-                        self._specs_cache = loaded
-                        return loaded
+                        loaded_service = str(loaded.get("service") or "live")
+                        self._specs_cache[loaded_service] = loaded
+                        if loaded_service == service:
+                            return loaded
                 except Exception as e:
-                    print(f"[WARN] Failed to load {SPECS_CACHE_PATH}: {e}")
+                    print(f"[WARN] Failed to load {cache_path}: {e}")
 
         # sync_all acquires the lock itself; never call it from the lock above.
         return self.sync_all(service=service)
@@ -489,11 +499,12 @@ class CommonSpecsManager:
                     print(f"[ERROR] Failed syncing common doc {doc_id} ({title}): {e}")
 
             # 保存解析后结构化数据至 live_common_specs.json
-            with open(SPECS_CACHE_PATH, "w", encoding="utf-8") as f:
+            cache_path = _specs_cache_path(service)
+            with open(cache_path, "w", encoding="utf-8") as f:
                 json.dump(specs, f, ensure_ascii=False, indent=2)
 
-            self._specs_cache = specs
-            print(f"[SUCCESS] Tencent Cloud API 3.0 Common Specs successfully synced to {SPECS_CACHE_PATH}!")
+            self._specs_cache[service] = specs
+            print(f"[SUCCESS] Tencent Cloud API 3.0 Common Specs successfully synced to {cache_path}!")
             return specs
 
     def lookup_error(self, code: str) -> Optional[dict]:

@@ -7,6 +7,7 @@ import importlib
 import json
 import os
 import pkgutil
+import threading
 from typing import Dict, List, Optional, Type
 
 from apis.base import BaseTimApi, Field
@@ -53,11 +54,15 @@ class ApiRegistry:
         self._apis: Dict[str, BaseTimApi] = {}
         self._ordered_apis: List[BaseTimApi] = []
         self._discovered = False
+        self._lock = threading.RLock()
 
     def discover(self):
-        if self._discovered:
-            return
+        with self._lock:
+            if self._discovered:
+                return
+            self._discover_unlocked()
 
+    def _discover_unlocked(self):
         # 1. 发现已有的自定义 python 类
         apis_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "apis"))
         custom_apis_by_id: Dict[str, BaseTimApi] = {}
@@ -194,30 +199,36 @@ class ApiRegistry:
         if not api_id:
             return None
         clean = str(api_id).strip()
-        found = self._apis.get(clean) or self._apis.get(clean.lower())
+        with self._lock:
+            apis = self._apis
+        found = apis.get(clean) or apis.get(clean.lower())
         if found:
             return found
         if clean.startswith("v4/"):
-            found = self._apis.get(clean[3:]) or self._apis.get(clean[3:].lower())
+            found = apis.get(clean[3:]) or apis.get(clean[3:].lower())
             if found:
                 return found
         else:
-            found = self._apis.get(f"v4/{clean}") or self._apis.get(f"v4/{clean}".lower())
+            found = apis.get(f"v4/{clean}") or apis.get(f"v4/{clean}".lower())
             if found:
                 return found
         return None
 
     def list_apis(self, service_type: Optional[str] = None) -> List[dict]:
         self.discover()
+        with self._lock:
+            ordered = list(self._ordered_apis)
         if service_type:
-            return [api.to_metadata() for api in self._ordered_apis if getattr(api, "service_type", "im") == service_type]
-        return [api.to_metadata() for api in self._ordered_apis]
+            return [api.to_metadata() for api in ordered if getattr(api, "service_type", "im") == service_type]
+        return [api.to_metadata() for api in ordered]
 
     def list_services(self) -> List[dict]:
         """统计并返回已注册的腾讯云产品服务列表（含 IM、云直播及任意未来扩展服务）"""
         self.discover()
+        with self._lock:
+            ordered = list(self._ordered_apis)
         service_counts = {}
-        for api in self._ordered_apis:
+        for api in ordered:
             st = getattr(api, "service_type", "im") or "im"
             service_counts[st] = service_counts.get(st, 0) + 1
 
@@ -281,10 +292,12 @@ class ApiRegistry:
         }
 
     def reload(self):
-        self._discovered = False
-        self._apis.clear()
-        self._ordered_apis.clear()
-        self.discover()
+        shadow = ApiRegistry()
+        shadow._discover_unlocked()
+        with self._lock:
+            self._apis = shadow._apis
+            self._ordered_apis = shadow._ordered_apis
+            self._discovered = True
 
 
 registry = ApiRegistry()

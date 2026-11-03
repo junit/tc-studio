@@ -23,6 +23,8 @@ import { Badge } from '@/components/ui/badge'
 import { Card, CardHeader, CardTitle, CardContent } from '@/components/ui/card'
 import { useHistoryStore, HistoryItem } from '@/stores/historyStore'
 import { useBatchStore } from '@/stores/batchStore'
+import { useApiStore } from '@/stores/apiStore'
+import { downloadWithAuth } from '@/lib/auth'
 
 interface HistoryPanelProps {
   onSwitchToBatch?: () => void
@@ -38,6 +40,7 @@ interface ExportDropdownProps {
 const ExportDropdown: React.FC<ExportDropdownProps> = ({ taskId, total, failed }) => {
   const [isOpen, setIsOpen] = useState(false)
   const dropdownRef = useRef<HTMLDivElement>(null)
+  const showToast = useApiStore((state) => state.showToast)
 
   useEffect(() => {
     const handleClickOutside = (e: MouseEvent) => {
@@ -70,7 +73,7 @@ const ExportDropdown: React.FC<ExportDropdownProps> = ({ taskId, total, failed }
           <button
             type="button"
             onClick={() => {
-              window.open(`/api/batch/${taskId}/export/csv`, '_blank')
+              downloadWithAuth(`/api/batch/${taskId}/export/csv`, `${taskId}.csv`).catch((error) => showToast({ type: 'error', message: error.message || '导出失败' }))
               setIsOpen(false)
             }}
             className="w-full text-left flex items-center justify-between px-2.5 py-1.5 rounded-lg text-xs hover:bg-slate-100 dark:hover:bg-slate-800 text-slate-700 dark:text-slate-200 cursor-pointer"
@@ -83,7 +86,7 @@ const ExportDropdown: React.FC<ExportDropdownProps> = ({ taskId, total, failed }
             <button
               type="button"
               onClick={() => {
-                window.open(`/api/batch/${taskId}/export/csv?only_failed=true`, '_blank')
+                downloadWithAuth(`/api/batch/${taskId}/export/csv?only_failed=true`, `${taskId}_failed.csv`).catch((error) => showToast({ type: 'error', message: error.message || '导出失败' }))
                 setIsOpen(false)
               }}
               className="w-full text-left flex items-center justify-between px-2.5 py-1.5 rounded-lg text-xs hover:bg-rose-50 dark:hover:bg-rose-950/40 text-rose-600 dark:text-rose-400 cursor-pointer font-medium"
@@ -114,6 +117,8 @@ export const HistoryPanel: React.FC<HistoryPanelProps> = ({
     clearSelected,
   } = useHistoryStore()
 
+  const showToast = useApiStore((state) => state.showToast)
+
   // 详情弹窗内的筛选状态
   const [filterStatus, setFilterStatus] = useState<'ALL' | 'FAILED' | 'SUCCESS'>('ALL')
   const [searchTerm, setSearchTerm] = useState<string>('')
@@ -124,8 +129,10 @@ export const HistoryPanel: React.FC<HistoryPanelProps> = ({
 
   // 导出 CSV（全量或仅失败）
   const handleExport = (taskId: string, onlyFailed = false) => {
-    const url = `/api/batch/${taskId}/export/csv${onlyFailed ? '?only_failed=true' : ''}`
-    window.open(url, '_blank')
+    downloadWithAuth(
+      `/api/batch/${taskId}/export/csv${onlyFailed ? '?only_failed=true' : ''}`,
+      `${taskId}${onlyFailed ? '_failed' : ''}.csv`
+    ).catch((error) => showToast({ type: 'error', message: error.message || '导出失败' }))
   }
 
   // 删除单条历史记录
@@ -155,7 +162,7 @@ export const HistoryPanel: React.FC<HistoryPanelProps> = ({
     }
 
     if (!taskToLoad.results || taskToLoad.results.length === 0) {
-      alert('该历史记录未包含有效的数据行')
+      showToast({ type: 'error', message: '该历史记录未包含有效的数据行' })
       return
     }
 

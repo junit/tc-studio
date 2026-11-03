@@ -18,9 +18,11 @@ from typing import Any, cast
 
 from smolagents import Tool
 
+from ..runtime_context import runtime_is_admin, runtime_is_operator, runtime_user_id
 from ..tim_client import TimClient
 from .bot_manager import BotManager
 from .constants import HIGH_RISK_API_KEYWORDS
+from .risk import api_identities, is_high_risk_api, resolve_api
 
 
 class CloudCallTool(Tool):
@@ -64,6 +66,8 @@ class CloudCallTool(Tool):
         self.cloud_client = cloud_client
 
     def forward(self, action_or_path: str, payload: Any, service: str | None = None) -> dict:
+        if not runtime_is_operator.get():
+            return {"ActionStatus": "CANCELLED", "ErrorCode": -997, "ErrorInfo": "当前用户缺少 operator 权限，禁止通过 Agent 调用云 API。"}
         target_name = (action_or_path or "").strip()
 
         raw_payload = payload
@@ -79,8 +83,14 @@ class CloudCallTool(Tool):
                     raw_payload = {}
         clean_payload: dict[str, Any] = raw_payload if isinstance(raw_payload, dict) else {}
 
+        try:
+            api_meta = resolve_api(target_name)
+        except Exception:
+            # A registry/catalog failure must not disable the fail-closed
+            # operator gate or turn into an unhandled agent exception.
+            api_meta = None
         high_risk_kws = self.bot_manager.get_high_risk_keywords() if self.bot_manager else HIGH_RISK_API_KEYWORDS
-        is_high_risk = any(k in target_name.lower() for k in high_risk_kws)
+        is_high_risk = is_high_risk_api(target_name, api_meta, high_risk_kws)
 
         if is_high_risk:
             if not self.approval_requester:
@@ -124,6 +134,9 @@ class CloudCallTool(Tool):
                 decision = self.approval_requester({
                     "approval_id": approval_id,
                     "api_path": target_name,
+                    "api_id": getattr(api_meta, "api_id", target_name),
+                    "canonical_action": getattr(api_meta, "command", target_name),
+                    "api_paths": sorted(api_identities(target_name, api_meta)),
                     "payload": clean_payload,
                     "warning": f"检测到不可逆破坏性操作：{target_name}",
                     "target_summary": summary_str,
@@ -148,9 +161,7 @@ class CloudCallTool(Tool):
 
         try:
             from ..cloud_client import UniversalCloudClient
-            from ..registry import registry
 
-            api_meta = registry.get_api(target_name)
             cloud_client = self.cloud_client or UniversalCloudClient()
 
             if api_meta:
@@ -356,7 +367,13 @@ class EnhancePromptTool(Tool):
         self.bot_id = bot_id
         self.bot_manager = bot_manager
 
+    def _can_edit_definition(self) -> bool:
+        bot = self.bot_manager.get_bot(self.bot_id)
+        return not bot or bot.visibility != "public" or runtime_is_admin.get()
+
     def forward(self, instruction: str, reason: str = "") -> str:
+        if not self._can_edit_definition():
+            return "❌ 公共 BOT 的行为准则仅允许管理员修改"
         guideline = self.bot_manager.add_learned_guideline(self.bot_id, instruction, reason)
         if guideline:
             return f"✅ 提示词已成功自我增强！新准则 ID: {guideline.id}，内容: {guideline.instruction}"
@@ -492,7 +509,13 @@ class SaveSkillTool(Tool):
         self.bot_id = bot_id
         self.bot_manager = bot_manager
 
+    def _can_edit_definition(self) -> bool:
+        bot = self.bot_manager.get_bot(self.bot_id)
+        return not bot or bot.visibility != "public" or runtime_is_admin.get()
+
     def forward(self, name: str, description: str, python_code: str, input_schema: dict | None = None) -> str:
+        if not self._can_edit_definition():
+            return "❌ 公共 BOT 的技能仅允许管理员修改"
         skill = self.bot_manager.save_skill(self.bot_id, name, description, python_code, input_schema)
         return f"⚡ 技能 [{skill.name}] 已成功保存到当前 BOT 的专属技能库！后续可通过 run_skill('{skill.name}') 直接调用。"
 
@@ -544,10 +567,9 @@ def build_sandbox_scope(
         "gen_live_play_url": generate_live_play_urls,
     }
 
-    if cloud_client is not None:
-        scope["cloud_client"] = cloud_client
-    if tim_client is not None:
-        scope["tim_client"] = tim_client
+    # Raw clients carry signing keys and UserSig generation.  They must never
+    # cross into model code; cloud calls stay behind CloudCallTool's policy
+    # boundary.  Keep the parameters for backward-compatible callers only.
 
     # 动态为所有已注册服务挂载快捷调用宏，如 live_call, im_call, trtc_call, vod_call 等
     registry.discover()
@@ -577,6 +599,7 @@ _SKILL_ALLOWED_IMPORTS = frozenset({
 })
 _SKILL_BLOCKED_NAMES = frozenset({
     "__import__",
+    "__builtins__",
     "breakpoint",
     "compile",
     "delattr",
@@ -606,24 +629,69 @@ _SKILL_BLOCKED_ATTRIBUTES = frozenset({
 _SKILL_TIMEOUT_SECONDS = 25.0
 _MISSING = object()
 
+_SAFE_MODULE_ATTRS = {
+    "csv": {"reader", "writer", "DictReader", "DictWriter", "QUOTE_ALL", "QUOTE_MINIMAL"},
+    "datetime": {"datetime", "date", "time", "timedelta", "timezone"},
+    "json": {"dumps", "loads", "dump", "load", "JSONDecodeError"},
+    "math": {"ceil", "floor", "sqrt", "pi", "fabs", "isfinite", "isnan"},
+    "random": {"randint", "randrange", "choice", "choices", "sample", "shuffle", "random", "uniform"},
+    "re": {"compile", "match", "search", "sub", "findall", "split", "escape", "IGNORECASE"},
+    "time": {"time", "sleep", "strftime", "localtime", "gmtime"},
+}
+
+
+class _SafeModuleProxy:
+    """Expose only a fixed set of non-module attributes from an allowed module."""
+
+    __slots__ = ("_module", "_allowed")
+
+    def __init__(self, module: Any, allowed: set[str]):
+        object.__setattr__(self, "_module", module)
+        object.__setattr__(self, "_allowed", frozenset(allowed))
+
+    def __getattr__(self, name: str) -> Any:
+        if name not in object.__getattribute__(self, "_allowed"):
+            raise AttributeError(f"技能禁止访问模块属性 '{name}'")
+        value = getattr(object.__getattribute__(self, "_module"), name)
+        if inspect.ismodule(value):
+            raise AttributeError("技能禁止访问模块对象")
+        return value
+
 
 def _validate_skill_ast(code: str) -> None:
     """Reject imports/reflection that cannot be safely exposed to a skill worker."""
     parsed_ast = ast.parse(code)
+    imported_modules: dict[str, str] = {}
+    for item in ast.walk(parsed_ast):
+        if isinstance(item, ast.Import):
+            for alias in item.names:
+                module = alias.name.split(".", 1)[0]
+                imported_modules[alias.asname or module] = module
     for node in ast.walk(parsed_ast):
         if isinstance(node, ast.Import):
             for alias in node.names:
                 module = alias.name.split(".", 1)[0]
-                if module not in _SKILL_ALLOWED_IMPORTS:
+                if module not in _SKILL_ALLOWED_IMPORTS or alias.name != module:
                     raise ValueError(f"技能代码禁止导入模块 '{alias.name}'")
         elif isinstance(node, ast.ImportFrom):
             module = (node.module or "").split(".", 1)[0]
             if module not in _SKILL_ALLOWED_IMPORTS:
                 raise ValueError(f"技能代码禁止从模块 '{node.module}' 导入")
-        elif isinstance(node, ast.Name) and node.id in _SKILL_BLOCKED_NAMES:
+            if any(alias.name.startswith("_") for alias in node.names):
+                raise ValueError(f"技能代码禁止从模块 '{node.module}' 导入内省属性")
+        elif isinstance(node, ast.Name) and (
+            node.id in _SKILL_BLOCKED_NAMES
+            or (node.id.startswith("_") and node.id != "__name__")
+        ):
             raise ValueError(f"技能代码禁止使用危险内置函数 '{node.id}'")
         elif isinstance(node, ast.Attribute):
-            if node.attr in _SKILL_BLOCKED_ATTRIBUTES or (node.attr.startswith("__") and node.attr != "__name__"):
+            if isinstance(node.value, ast.Name) and node.value.id in imported_modules:
+                module = imported_modules[node.value.id]
+                if node.attr not in _SAFE_MODULE_ATTRS.get(module, set()):
+                    raise ValueError(f"技能代码禁止访问模块属性 '{node.value.id}.{node.attr}'")
+            if node.attr in _SKILL_BLOCKED_ATTRIBUTES or (
+                node.attr.startswith("_") and node.attr != "__name__"
+            ):
                 raise ValueError(f"技能代码禁止访问内省属性 '{node.attr}'")
         elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in _SKILL_BLOCKED_NAMES:
             raise ValueError(f"技能代码禁止调用危险内置函数 '{node.func.id}'")
@@ -635,14 +703,35 @@ def _skill_safe_builtins() -> dict:
     return {
         name: value
         for name, value in builtins.__dict__.items()
-        if name not in _SKILL_BLOCKED_NAMES and name != "__import__"
+        if name not in _SKILL_BLOCKED_NAMES and name != "__import__" and not name.startswith("_")
     }
 
 
+def _safe_rpc_value(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, (list, tuple)):
+        return [_safe_rpc_value(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): _safe_rpc_value(item) for key, item in value.items()}
+    return str(value)
+
+
+def _rpc_send(conn, message: dict[str, Any]) -> None:
+    conn.send_bytes(json.dumps(_safe_rpc_value(message), ensure_ascii=False).encode("utf-8"))
+
+
+def _rpc_recv(conn) -> dict[str, Any]:
+    payload = json.loads(conn.recv_bytes(2 * 1024 * 1024).decode("utf-8"))
+    if not isinstance(payload, dict):
+        raise RuntimeError("技能 RPC 消息格式无效")
+    return payload
+
+
 def _skill_rpc_call(conn, name: str, args: tuple, kwargs: dict):
-    conn.send({"kind": "call", "name": name, "args": args, "kwargs": kwargs})
+    _rpc_send(conn, {"kind": "call", "name": name, "args": args, "kwargs": kwargs})
     while True:
-        response = conn.recv()
+        response = _rpc_recv(conn)
         if response.get("kind") != "response":
             continue
         if response.get("ok"):
@@ -668,10 +757,6 @@ class _SkillTimClientProxy:
 
     def invoke(self, service_name: str, command: str, payload: dict, timeout: int = 15):
         return _skill_rpc_call(self._conn, "tim_client.invoke", (service_name, command, payload, timeout), {})
-
-    def get_usersig(self):
-        return _skill_rpc_call(self._conn, "tim_client.get_usersig", (), {})
-
 
 _SkillTimClientProxy.__name__ = "TimClient"
 
@@ -754,7 +839,8 @@ def _skill_worker_entry(conn, code: str, args: dict, service_names: list):
             module = str(name).split(".", 1)[0]
             if module not in _SKILL_ALLOWED_IMPORTS:
                 raise ImportError(f"安全拦截：禁止导入模块 '{name}'")
-            return __import__(name, globals, locals, fromlist, level)
+            real = __import__(name, globals, locals, fromlist, level)
+            return _SafeModuleProxy(real, _SAFE_MODULE_ATTRS[module])
 
         safe_builtins = _skill_safe_builtins()
         safe_builtins["__import__"] = safe_import
@@ -787,10 +873,10 @@ def _skill_worker_entry(conn, code: str, args: dict, service_names: list):
                 result = asyncio.run(cast(Coroutine[Any, Any, Any], result))
         else:
             result = scope.get("result", "Skill executed successfully")
-        conn.send({"kind": "result", "ok": True, "value": result})
+        _rpc_send(conn, {"kind": "result", "ok": True, "value": result})
     except BaseException as exc:
         with suppress(Exception):
-            conn.send({"kind": "result", "ok": False, "error": f"{type(exc).__name__}: {exc}"})
+            _rpc_send(conn, {"kind": "result", "ok": False, "error": f"{type(exc).__name__}: {exc}"})
     finally:
         conn.close()
 
@@ -847,8 +933,6 @@ class RunSkillTool(Tool):
             service_name, command, payload, _timeout = args
             path = f"{service_name}/{command}" if service_name else command
             return caller_tool.forward(path, payload or {}, service="im")
-        if name == "tim_client.get_usersig":
-            return self.tim_client.get_usersig()
         if name.startswith("service:"):
             service = name.split(":", 1)[1]
             action_or_path = args[0] if args else kwargs.get("action_or_path", "")
@@ -900,13 +984,13 @@ class RunSkillTool(Tool):
         try:
             while time.monotonic() < deadline:
                 if parent_conn.poll(0.05):
-                    message = parent_conn.recv()
+                    message = _rpc_recv(parent_conn)
                     if message.get("kind") == "call":
                         try:
                             value = self._dispatch_skill_rpc(caller_tool, message)
-                            parent_conn.send({"kind": "response", "ok": True, "value": value})
+                            _rpc_send(parent_conn, {"kind": "response", "ok": True, "value": value})
                         except Exception as exc:
-                            parent_conn.send({"kind": "response", "ok": False, "error": str(exc)})
+                            _rpc_send(parent_conn, {"kind": "response", "ok": False, "error": str(exc)})
                         finally:
                             # Human approval time must not consume the skill deadline.
                             if approval_elapsed:
@@ -917,13 +1001,13 @@ class RunSkillTool(Tool):
                         break
                 if not process.is_alive():
                     while parent_conn.poll():
-                        message = parent_conn.recv()
+                        message = _rpc_recv(parent_conn)
                         if message.get("kind") == "result":
                             result_message = message
                     break
             else:
                 timed_out = True
-        except (EOFError, OSError) as exc:
+        except (EOFError, OSError, ValueError, json.JSONDecodeError) as exc:
             if result_message is None:
                 result_message = {"kind": "result", "ok": False, "error": str(exc)}
         finally:
@@ -947,6 +1031,8 @@ class RunSkillTool(Tool):
         return {"success": False, "error": f"执行技能失败: {result_message.get('error', '未知错误')}"}
 
     def forward(self, name: str, kwargs: Any | None = None) -> dict:
+        if not runtime_is_operator.get():
+            return {"success": False, "error": "当前用户缺少 operator 权限，禁止通过 Agent 运行技能"}
         skill = self.bot_manager.get_skill(self.bot_id, name)
         if not skill:
             return {"error": f"未找到技能: {name}"}
@@ -1051,9 +1137,9 @@ class CreateBotTool(Tool):
             avatar=target_avatar,
             description=target_desc,
             base_prompt=target_prompt,
-            suggested_prompts=target_suggested
+            suggested_prompts=target_suggested,
+            owner_id=None if runtime_user_id.get() == "local" else runtime_user_id.get(),
         )
-
         return {
             "success": True,
             "message": f"🎉 专属智能体【{new_bot.name}】创建成功！已成功入驻工作室，可随时在左侧切换或在对话中通过 @{new_bot.name} 进行协同调度。",
@@ -1078,7 +1164,11 @@ class ListAgentsTool(Tool):
         self.bot_manager = bot_manager
 
     def forward(self) -> list:
-        bots = self.bot_manager.list_bots()
+        user_id = runtime_user_id.get()
+        bots = [
+            bot for bot in self.bot_manager.list_bots(user_id=user_id)
+            if runtime_is_admin.get() or bot.get("visibility") == "public" or bot.get("owner_id") == user_id
+        ]
         return [
             {
                 "id": b["id"],
@@ -1141,12 +1231,17 @@ class CallAgentTool(Tool):
         if explicit_id:
             clean_name = re.sub(r"[\(（][a-zA-Z0-9_-]+[\)）]", "", clean_name).strip()
 
-        all_bots = self.bot_manager.list_bots()
+        all_bots = [
+            bot for bot in self.bot_manager.list_bots(user_id=runtime_user_id.get())
+            if runtime_is_admin.get() or bot.get("visibility") == "public" or bot.get("owner_id") == runtime_user_id.get()
+        ]
         target_bot = None
 
         # 1. 显式 ID 匹配
         if explicit_id:
-            target_bot = self.bot_manager.get_bot(explicit_id)
+            cand = self.bot_manager.get_bot(explicit_id)
+            if cand and (runtime_is_admin.get() or cand.visibility == "public" or cand.owner_id == runtime_user_id.get()):
+                target_bot = cand
 
         # 2. 精确 ID 或名称匹配
         if not target_bot:
@@ -1217,7 +1312,8 @@ class CallAgentTool(Tool):
                 "status": "success",
                 "result_preview": preview,
                 "elapsed_seconds": elapsed,
-                "timestamp": time.strftime("%H:%M:%S")
+                "timestamp": time.strftime("%H:%M:%S"),
+                "owner_id": runtime_user_id.get()
             }
             if hasattr(self.engine, "record_orchestration"):
                 self.engine.record_orchestration(record)
@@ -1239,7 +1335,8 @@ class CallAgentTool(Tool):
                 "status": "error",
                 "result_preview": f"异常: {err_msg}",
                 "elapsed_seconds": elapsed,
-                "timestamp": time.strftime("%H:%M:%S")
+                "timestamp": time.strftime("%H:%M:%S"),
+                "owner_id": runtime_user_id.get()
             }
             if hasattr(self.engine, "record_orchestration"):
                 self.engine.record_orchestration(record)
@@ -1249,11 +1346,11 @@ class CallAgentTool(Tool):
 
 class ReadFileTool(Tool):
     name = "read_file"
-    description = "读取本地文本文件、代码文件、文档（DOCX/PDF/TXT/CSV/JSON/LOG）或已上传附件的文本内容。支持传入文件绝对路径或上传文件名。"
+    description = "读取当前 BOT 产出物目录中的文本、代码、文档（DOCX/PDF/TXT/CSV/JSON/LOG）或已上传附件。只接受该目录内的文件名或绝对路径。"
     inputs = {
         "file_path": {
             "type": "string",
-            "description": "文件绝对路径或上传文件名"
+            "description": "当前 BOT 产出物目录内的文件名或绝对路径"
         },
         "max_chars": {
             "type": "integer",
@@ -1268,28 +1365,44 @@ class ReadFileTool(Tool):
         self.bot_id = bot_id
         self.bot_manager = bot_manager
 
+    @staticmethod
+    def _is_inside_root(root: str, candidate: str) -> bool:
+        try:
+            return os.path.commonpath([root, candidate]) == root
+        except ValueError:
+            return False
+
+    def _resolve_readable_path(self, file_path: str) -> str | None:
+        """只解析当前 BOT uploads 目录内的普通文件，拒绝宿主机路径与目录遍历。"""
+        if not self.bot_id or not self.bot_manager:
+            return None
+        uploads_dir = os.path.realpath(self.bot_manager._uploads_dir(self.bot_id))
+        raw = file_path.strip()
+        if os.path.isabs(raw):
+            candidate = os.path.realpath(raw)
+            if self._is_inside_root(uploads_dir, candidate) and os.path.isfile(candidate):
+                return candidate
+        basename = os.path.basename(raw)
+        if not basename or basename in {".", ".."}:
+            return None
+        direct = os.path.realpath(os.path.join(uploads_dir, basename))
+        if self._is_inside_root(uploads_dir, direct) and os.path.isfile(direct):
+            return direct
+        try:
+            names = os.listdir(uploads_dir)
+        except OSError:
+            return None
+        for filename in names:
+            if filename == basename or filename.endswith(f"_{basename}"):
+                candidate = os.path.realpath(os.path.join(uploads_dir, filename))
+                if self._is_inside_root(uploads_dir, candidate) and os.path.isfile(candidate):
+                    return candidate
+        return None
+
     def forward(self, file_path: str, max_chars: int | None = 4000) -> str:
         limit = max_chars or 4000
-        path = file_path.strip()
-        # 若是相对路径或仅文件名，优先在当前 BOT 的 uploads 目录寻找
-        if not os.path.isabs(path) and self.bot_id and self.bot_manager:
-            bot_dir = self.bot_manager._bot_dir(self.bot_id)
-            uploads_dir = os.path.join(bot_dir, "uploads")
-            candidate = os.path.join(uploads_dir, os.path.basename(path))
-            if os.path.exists(candidate):
-                path = candidate
-            elif os.path.exists(uploads_dir):
-                try:
-                    upload_names = os.listdir(uploads_dir)
-                except OSError:
-                    upload_names = []
-                for fn in upload_names:
-
-                    if fn.endswith(path) or path in fn:
-                        path = os.path.join(uploads_dir, fn)
-                        break
-
-        if not os.path.exists(path):
+        path = self._resolve_readable_path(file_path)
+        if not path:
             return f"❌ 文件不存在: '{file_path}'"
 
         from .file_parser import (

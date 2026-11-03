@@ -133,6 +133,8 @@ class BaseTimApi:
                     if isinstance(val, str) and val.strip():
                         with suppress(ValueError, TypeError):
                             val = int(val) if val.strip().lstrip("-").isdigit() else float(val)
+                    if isinstance(val, float) and not math.isfinite(val):
+                        raise ValueError(f"字段 {f.name} 必须是有限数值")
                 elif f_type in ("boolean", "bool"):
                     if isinstance(val, str):
                         val = val.lower() in ("true", "1", "yes")

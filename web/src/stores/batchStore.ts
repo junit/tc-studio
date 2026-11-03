@@ -1,4 +1,5 @@
 import { create } from 'zustand'
+import { authHeaders } from '../lib/auth'
 
 export interface LogItem {
   id: string
@@ -58,11 +59,13 @@ interface BatchState {
   presets: BatchPreset[]
   activePresetId: string | null
   guidance: BatchGuidance | null
+  highRiskConfirmed: boolean
   failedItems: any[]
 
   setApiId: (id: string) => void
   setDelaySec: (sec: number) => void
   setDryRun: (dry: boolean) => void
+  setHighRiskConfirmed: (confirmed: boolean) => void
   toggleDryRun: () => void
   setItems: (items: any[], fileName: string) => void
   clearItems: () => void
@@ -80,7 +83,13 @@ interface BatchState {
   stopBatch: () => Promise<void>
 }
 
-let eventSource: EventSource | null = null
+let eventSource: { close: () => void } | null = null
+let reconnectTimer: ReturnType<typeof setTimeout> | null = null
+// 每个 taskId 已处理过的事件键：后端重连时会重放全部历史事件，
+// 以此避免失败项与日志被重复追加
+const processedEventKeys = new Map<string, Set<string>>()
+// 重试仅用于瞬时网络/服务端错误；认证、权限、任务不存在等终态不再重试
+const SSE_NON_RETRYABLE_STATUS = new Set([401, 403, 404])
 
 export const useBatchStore = create<BatchState>((set, get) => ({
   apiId: 'c2c_msg_withdraw',
@@ -102,14 +111,16 @@ export const useBatchStore = create<BatchState>((set, get) => ({
   presets: [],
   activePresetId: null,
   guidance: null,
+  highRiskConfirmed: false,
   failedItems: [],
 
   setApiId: (id: string) => {
-    set({ apiId: id, activePresetId: null })
+    set({ apiId: id, activePresetId: null, highRiskConfirmed: false })
     get().fetchGuidance(id)
   },
   setDelaySec: (sec: number) => set({ delaySec: sec }),
-  setDryRun: (dry: boolean) => set({ isDryRun: dry }),
+  setDryRun: (dry: boolean) => set({ isDryRun: dry, highRiskConfirmed: false }),
+  setHighRiskConfirmed: (confirmed: boolean) => set({ highRiskConfirmed: confirmed }),
   toggleDryRun: () => set((state) => ({ isDryRun: !state.isDryRun })),
   setItems: (items: any[], fileName: string) =>
     set({
@@ -216,8 +227,13 @@ export const useBatchStore = create<BatchState>((set, get) => ({
   },
 
   startBatch: async () => {
-    const { items, apiId, delaySec, isDryRun } = get()
+    const { items, apiId, delaySec, isDryRun, guidance, highRiskConfirmed } = get()
     if (items.length === 0) return
+    const isHighRisk = !isDryRun && guidance?.risk_level === 'HIGH_RISK'
+    if (isHighRisk && !highRiskConfirmed) {
+      alert('该接口属于高危操作，请先勾选确认框并核对目标范围。')
+      return
+    }
 
     set({
       isRunning: true,
@@ -239,6 +255,8 @@ export const useBatchStore = create<BatchState>((set, get) => ({
           items,
           delay_sec: delaySec,
           dry_run: isDryRun,
+          confirm_high_risk: isHighRisk && highRiskConfirmed,
+          approved_high_risk_paths: isHighRisk && highRiskConfirmed ? [apiId] : [],
         }),
       })
       const json = await res.json()
@@ -256,89 +274,93 @@ export const useBatchStore = create<BatchState>((set, get) => ({
   },
 
   connectSSE: (taskId: string) => {
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer)
+      reconnectTimer = null
+    }
     if (eventSource) eventSource.close()
-    const source = new EventSource(`/api/batch/${taskId}/events`)
+    const controller = new AbortController()
+    const source = { close: () => {
+      controller.abort()
+      if (reconnectTimer) {
+        clearTimeout(reconnectTimer)
+        reconnectTimer = null
+      }
+    } }
     eventSource = source
-    let reconnectLogged = false
+    let buffer = ''
+    let terminal = false
     const isCurrentSource = () => eventSource === source && get().activeTaskId === taskId
-
-    source.onmessage = (e) => {
-      if (!isCurrentSource() || !e.data || e.data.startsWith(':')) return
-      let evt: { type: string; data: any }
+    const handleEvent = (block: string) => {
+      const line = block.split(/\r?\n/).find((item) => item.startsWith('data:'))
+      if (!isCurrentSource() || !line) return
+      const seen = processedEventKeys.get(taskId) ?? new Set<string>()
+      processedEventKeys.set(taskId, seen)
       try {
-        evt = JSON.parse(e.data)
-      } catch (error) {
-        console.warn('Invalid batch SSE payload', error)
-        return
-      }
-      const { type, data } = evt
-
-      if (type === 'start') {
-        get().addLog('INFO', `批次 [${data.task_id}] 正式开始执行...`)
-      } else if (type === 'progress') {
-        set({
-          progress: {
-            current: data.current,
-            total: data.total,
-            percent: data.percent,
-            success: data.success,
-            failed: data.failed,
-          },
-        })
-        if (!data.is_ok && data.item) {
-          const rawRow = { ...data.item }
-          delete rawRow._status
-          delete rawRow._err_code
-          delete rawRow._err_info
-          delete rawRow._cost_ms
-          set((state) => ({ failedItems: [...state.failedItems, rawRow] }))
-        }
-        const tag = data.is_ok ? 'SUCCESS' : 'FAILED'
-        const target =
-          data.item.to_account || data.item.To_Account || data.item.GroupId || ''
-        const key =
-          data.item.msg_key || data.item.MsgKey || data.item.MsgSeq || ''
-        const msg = `[${data.current}/${data.total}] Target: ${target} | Key/Seq: ${key} | Code: ${data.err_code} ${
-          data.err_info ? '(' + data.err_info + ')' : ''
-        }`
-        get().addLog(tag, msg, data.cost_ms)
-      } else if (type === 'complete') {
-        set({ isRunning: false })
-        get().addLog(
-          'INFO',
-          `🎉 批处理完成！耗时: ${data.duration_sec}s | 成功: ${data.success} | 失败: ${data.failed}`
-        )
-        if (eventSource === source) {
+        const { type, data } = JSON.parse(line.slice(5).trim())
+        if (type === 'start') {
+          if (!seen.has('start')) {
+            seen.add('start')
+            get().addLog('INFO', `批次 [${data.task_id}] 正式开始执行...`)
+          }
+        } else if (type === 'progress') {
+          set({ progress: { current: data.current, total: data.total, percent: data.percent, success: data.success, failed: data.failed } })
+          const eventKey = `progress:${data.current}:${data.is_ok ? 1 : 0}`
+          if (!seen.has(eventKey)) {
+            seen.add(eventKey)
+            if (!data.is_ok && data.item) set((state) => ({ failedItems: [...state.failedItems, { ...data.item, _status: undefined, _err_code: undefined, _err_info: undefined, _cost_ms: undefined }] }))
+            const target = data.item.to_account || data.item.To_Account || data.item.GroupId || ''
+            get().addLog(data.is_ok ? 'SUCCESS' : 'FAILED', `[${data.current}/${data.total}] Target: ${target} | Code: ${data.err_code}`, data.cost_ms)
+          }
+        } else if (type === 'complete' || type === 'error') {
+          terminal = true
+          set({ isRunning: false })
+          get().addLog(type === 'complete' ? 'INFO' : 'FAILED', type === 'complete' ? `🎉 批量完成！成功: ${data.success} | 失败: ${data.failed}` : `任务错误: ${data.message}`)
           source.close()
           eventSource = null
+          processedEventKeys.delete(taskId)
         }
-      } else if (type === 'error') {
-        set({ isRunning: false })
-        get().addLog('FAILED', `任务错误: ${data.message}`)
-        if (eventSource === source) {
-          source.close()
-          eventSource = null
+      } catch (error) { console.warn('Invalid batch SSE payload', error) }
+    }
+    fetch(`/api/batch/${taskId}/events`, { headers: authHeaders(), signal: controller.signal })
+      .then(async (response) => {
+        if (!response.ok || !response.body) {
+          if (SSE_NON_RETRYABLE_STATUS.has(response.status)) {
+            set({ isRunning: false })
+            get().addLog('FAILED', `SSE 连接失败 (${response.status})，已停止自动重试`)
+            source.close()
+            eventSource = null
+            processedEventKeys.delete(taskId)
+            return
+          }
+          throw new Error(`SSE 连接失败 (${response.status})`)
         }
-      }
-    }
-
-    source.onerror = () => {
-      if (!isCurrentSource()) {
-        source.close()
-        return
-      }
-      // EventSource automatically retries transient disconnects. Keep the task running
-      // until the browser reports CLOSED or the server sends an explicit terminal event.
-      if (source.readyState === EventSource.CLOSED) {
-        set({ isRunning: false })
-        get().addLog('FAILED', 'SSE 连接已关闭，批处理仍可能在后台运行')
-        source.close()
-        eventSource = null
-      } else if (!reconnectLogged) {
-        reconnectLogged = true
-        get().addLog('WARN', 'SSE 连接暂时中断，正在自动重连...')
-      }
-    }
+        const reader = response.body.getReader()
+        const decoder = new TextDecoder()
+        while (isCurrentSource()) {
+          const { value, done } = await reader.read()
+          if (done) {
+            if (!terminal && isCurrentSource()) {
+              reconnectTimer = setTimeout(() => {
+                reconnectTimer = null
+                if (get().activeTaskId === taskId && get().isRunning) get().connectSSE(taskId)
+              }, 2000)
+            }
+            break
+          }
+          buffer += decoder.decode(value, { stream: true })
+          const blocks = buffer.split(/\r?\n\r?\n/)
+          buffer = blocks.pop() || ''
+          blocks.forEach(handleEvent)
+        }
+      })
+      .catch((error: any) => {
+        if (error?.name === 'AbortError' || !isCurrentSource() || terminal) return
+        reconnectTimer = setTimeout(() => {
+          reconnectTimer = null
+          if (get().activeTaskId === taskId && get().isRunning) get().connectSSE(taskId)
+        }, 2000)
+      })
   },
 
   pauseBatch: async () => {
@@ -372,6 +394,7 @@ export const useBatchStore = create<BatchState>((set, get) => ({
         eventSource.close()
         eventSource = null
       }
+      processedEventKeys.delete(activeTaskId)
       get().addLog('WARN', '批量任务已被用户强制终止')
     } catch (error: any) {
       get().addLog('FAILED', `终止任务失败: ${error.message}`)

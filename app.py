@@ -6,18 +6,27 @@ import csv
 import io
 import json
 import os
+import queue
+import re
 import zipfile
 from typing import Any
 
 import openpyxl
-from fastapi import FastAPI, File, HTTPException, Query, UploadFile
+from fastapi import Depends, FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 
 from apis.agent import router as agent_router
+from core.auth import (
+    AuthenticationMiddleware,
+    CurrentUser,
+    current_user,
+    require_admin,
+    require_operator,
+)
 from core.cloud_client import UniversalCloudClient
 from core.common_specs_syncer import common_specs_manager
 from core.config import (
@@ -33,6 +42,7 @@ from core.live_util import (
     generate_live_push_url,
 )
 from core.registry import registry
+from core.agent.risk import is_high_risk_api, matching_confirmation_paths
 from core.task_runner import (
     clear_history,
     delete_history_item,
@@ -52,6 +62,7 @@ ALLOWED_ORIGINS = [
 ]
 
 app = FastAPI(title="TC Studio (Nova) - Tencent Cloud Multi-Service Architecture Studio", version="2.0.0")
+app.add_middleware(AuthenticationMiddleware)
 
 app.add_middleware(
     CORSMiddleware,
@@ -63,6 +74,27 @@ app.add_middleware(
 )
 
 app.include_router(agent_router)
+
+
+def require_batch_task(task_id: str, user: CurrentUser = Depends(current_user)):
+    task = task_runner.get_task(task_id)
+    history_match = None
+    if task is None:
+        history_match = next((item for item in load_history() if item.get("task_id") == task_id), None)
+        if history_match is None:
+            raise HTTPException(status_code=404, detail="Task not found")
+
+    owner_id = task.owner_id if task is not None else (history_match or {}).get("owner_id")
+    if user.is_admin:
+        return task or history_match
+    if not user.is_operator or not owner_id or owner_id != user.subject:
+        raise HTTPException(status_code=403, detail="无权访问该批处理任务")
+    return task or history_match
+
+
+@app.get("/api/auth/me")
+def get_auth_me(user: CurrentUser = Depends(current_user)):
+    return {"subject": user.subject, "roles": sorted(user.roles), "is_admin": user.is_admin, "is_operator": user.is_operator}
 
 
 # ---------------- 静态资源路由 ----------------
@@ -133,12 +165,12 @@ class TestConnRequest(BaseModel):
 
 
 @app.get("/api/environments")
-def api_get_environments():
+def api_get_environments(_user=Depends(require_operator)):
     return {"status": "success", "data": get_environments_payload(mask=True)}
 
 
 @app.post("/api/environments/switch")
-def api_switch_environment(req: SwitchEnvRequest):
+def api_switch_environment(req: SwitchEnvRequest, _user=Depends(require_admin)):
     try:
         data = switch_environment(req.env_id)
         return {"status": "success", "data": data}
@@ -147,7 +179,7 @@ def api_switch_environment(req: SwitchEnvRequest):
 
 
 @app.post("/api/environments/save")
-def api_save_environment(req: EnvironmentItem):
+def api_save_environment(req: EnvironmentItem, _user=Depends(require_admin)):
     try:
         data = save_environment(req.dict())
         saved_env = data.get("saved_env") or {}
@@ -157,7 +189,7 @@ def api_save_environment(req: EnvironmentItem):
 
 
 @app.delete("/api/environments/{env_id}")
-def api_delete_environment(env_id: str):
+def api_delete_environment(env_id: str, _user=Depends(require_admin)):
     try:
         data = delete_environment(env_id)
         return {"status": "success", "data": data}
@@ -174,7 +206,7 @@ class ConfigUpdate(BaseModel):
 
 
 @app.get("/api/config")
-def get_config():
+def get_config(_user=Depends(require_admin)):
     cfg = load_config()
     env_payload = get_environments_payload(mask=True)
     active_env = env_payload.get("active_env") or {}
@@ -190,7 +222,7 @@ def get_config():
 
 
 @app.post("/api/config")
-def update_config(body: ConfigUpdate):
+def update_config(body: ConfigUpdate, _user=Depends(require_admin)):
     cfg = load_config()
     active_env_id = cfg.get("active_env_id", "env_default")
     env_data = {
@@ -206,7 +238,7 @@ def update_config(body: ConfigUpdate):
 
 
 @app.post("/api/config/test")
-def test_connectivity(req: TestConnRequest | None = None):
+def test_connectivity(req: TestConnRequest | None = None, _user=Depends(require_admin)):
     cfg = load_config()
     env_id = req.env_id if req else None
     if env_id:
@@ -260,7 +292,7 @@ class LiveSignUrlRequest(BaseModel):
     type: str | None = "both"  # "push", "play", "both"
 
 
-@app.post("/api/live/sign-url")
+@app.post("/api/live/sign-url", dependencies=[Depends(require_operator)])
 def api_generate_live_url(req: LiveSignUrlRequest):
     """生成腾讯云直播推流与播放防盗链鉴权地址 (txSecret & txTime)"""
     cfg = load_config()
@@ -295,23 +327,66 @@ def api_generate_live_url(req: LiveSignUrlRequest):
     }
 
 
+_USERSIG_PATTERN = re.compile(r'([?&]usersig=)[^&"\s]+')
+_TC3_AUTHORIZATION_PATTERN = re.compile(r'(-H\s*"Authorization:\s*)[^"]*(")')
+_REDACTED = "<redacted>"
+
+
+def _redact_preview_credentials(preview_data: dict[str, Any]) -> dict[str, Any]:
+    """非管理员 dry-run 输出中抹去可复用的签名凭证（UserSig / TC3 Authorization）。"""
+    redacted = dict(preview_data)
+    preview_url = str(redacted.get("preview_url") or "")
+    if preview_url:
+        redacted["preview_url"] = _USERSIG_PATTERN.sub(rf"\g<1>{_REDACTED}", preview_url)
+    curl_command = str(redacted.get("curl_command") or "")
+    if curl_command:
+        curl_command = _USERSIG_PATTERN.sub(rf"\g<1>{_REDACTED}", curl_command)
+        curl_command = _TC3_AUTHORIZATION_PATTERN.sub(rf"\g<1>{_REDACTED}\g<2>", curl_command)
+        redacted["curl_command"] = curl_command
+    headers = redacted.get("headers")
+    if isinstance(headers, dict) and "Authorization" in headers:
+        redacted["headers"] = {**headers, "Authorization": _REDACTED}
+    return redacted
+
+
 class ApiInvokeRequest(BaseModel):
     payload: dict[str, Any]
     dry_run: bool | None = False
+    confirm_high_risk: bool = False
+    approved_high_risk_paths: list[str] = Field(default_factory=list)
 
 
 @app.post("/api/apis/{api_id}/invoke")
-def invoke_single_api(api_id: str, req: ApiInvokeRequest):
+def invoke_single_api(api_id: str, req: ApiInvokeRequest, user: CurrentUser = Depends(require_operator)):
     api_meta = registry.get_api(api_id)
     if not api_meta:
         raise HTTPException(status_code=404, detail=f"API {api_id} 未注册")
 
     client = UniversalCloudClient()
-    payload = api_meta.build_payload(req.payload)
+    try:
+        payload = api_meta.build_payload(req.payload)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=f"入参不合法: {exc}") from exc
+
+    if not req.dry_run and is_high_risk_api(api_id, api_meta):
+        approved = {
+            str(path).strip().lower()
+            for path in req.approved_high_risk_paths
+            if str(path).strip()
+        }
+        if not req.confirm_high_risk or not (approved & matching_confirmation_paths(api_id, api_meta)):
+            raise HTTPException(
+                status_code=428,
+                detail="高危接口需要显式二次确认：confirm_high_risk=true 且 approved_high_risk_paths 包含该接口的 canonical ID 或 command",
+            )
+
+    preview_data = client.generate_preview(api_meta, payload)
+    credentials_redacted = not user.is_admin
+    if credentials_redacted:
+        preview_data = _redact_preview_credentials(preview_data)
 
     # 预览模式：执行入参校验与请求报文结构生成，不发网络请求
     if req.dry_run:
-        preview_data = client.generate_preview(api_meta, payload)
         return {
             "status": "success",
             "dry_run": True,
@@ -323,12 +398,17 @@ def invoke_single_api(api_id: str, req: ApiInvokeRequest):
             "preview_url": preview_data.get("preview_url", ""),
             "curl_command": preview_data.get("curl_command", ""),
             "headers": preview_data.get("headers", {}),
+            "credentials_redacted": credentials_redacted,
             "response": {
                 "ActionStatus": "OK",
                 "ErrorCode": 0,
                 "ErrorInfo": "",
                 "_dry_run": True,
-                "_message": "【预览模式】未向腾讯云发起真实网络请求。请求入参校验通过，报文结构与签名凭据已成功生成。"
+                "_message": (
+                    "【预览模式】未向腾讯云发起真实网络请求。请求入参校验通过，报文结构与签名凭据已成功生成。"
+                    if not credentials_redacted
+                    else "【预览模式】未向腾讯云发起真实网络请求。入参校验通过；签名凭证已脱敏，完整签名预览需管理员权限。"
+                ),
             },
             "cost_ms": 1
         }
@@ -342,6 +422,10 @@ def invoke_single_api(api_id: str, req: ApiInvokeRequest):
         "service_type": getattr(api_meta, "service_type", "im"),
         "command": api_meta.command,
         "sent_payload": payload,
+        "preview_url": preview_data.get("preview_url", ""),
+        "curl_command": preview_data.get("curl_command", ""),
+        "headers": preview_data.get("headers", {}),
+        "credentials_redacted": credentials_redacted,
         "response": resp,
         "cost_ms": resp.get("_cost_ms", 0)
     }
@@ -364,13 +448,13 @@ def get_docs_summary(service: str | None = Query(None)):
     return {"status": "success", "data": summary}
 
 
-@app.get("/api/docs/sync/status")
+@app.get("/api/docs/sync/status", dependencies=[Depends(require_operator)])
 def get_docs_sync_status():
     status = doc_sync_manager.get_status()
     return {"status": "success", "data": status}
 
 
-@app.post("/api/docs/sync/batch")
+@app.post("/api/docs/sync/batch", dependencies=[Depends(require_operator)])
 def start_batch_docs_sync(req: BatchSyncRequest = BatchSyncRequest()):
     all_apis = registry.list_apis()
     if req.api_ids:
@@ -385,13 +469,13 @@ def start_batch_docs_sync(req: BatchSyncRequest = BatchSyncRequest()):
     return {"status": "success", "data": res}
 
 
-@app.post("/api/docs/sync/cancel")
+@app.post("/api/docs/sync/cancel", dependencies=[Depends(require_operator)])
 def cancel_batch_docs_sync():
     res = doc_sync_manager.cancel_batch_sync()
     return {"status": "success", "data": res}
 
 
-@app.post("/api/docs/tree/sync")
+@app.post("/api/docs/tree/sync", dependencies=[Depends(require_operator)])
 def sync_official_tree():
     try:
         res = sync_catalog_from_live_tree()
@@ -400,7 +484,7 @@ def sync_official_tree():
         raise HTTPException(status_code=500, detail=f"同步官方目录树失败: {exc!s}") from exc
 
 
-@app.post("/api/live/catalog/sync")
+@app.post("/api/live/catalog/sync", dependencies=[Depends(require_operator)])
 def sync_official_live_catalog():
     """动态同步腾讯云官方直播 (CSS) 260+ 全量 API"""
     try:
@@ -440,7 +524,7 @@ def get_api_doc(api_id: str):
     return {"status": "success", "data": doc}
 
 
-@app.post("/api/docs/sync/{api_id}")
+@app.post("/api/docs/sync/{api_id}", dependencies=[Depends(require_operator)])
 def sync_single_api_doc(api_id: str, mode: str = Query("auto")):
     api = registry.get_api(api_id)
     if not api:
@@ -486,7 +570,7 @@ def lookup_common_error(code: str = Query(..., description="错误码，如 Fail
     return {"status": "success", "data": err}
 
 
-@app.post("/api/common-specs/sync")
+@app.post("/api/common-specs/sync", dependencies=[Depends(require_operator)])
 def sync_common_specs(service: str = Query("live")):
     try:
         specs = common_specs_manager.sync_all(service=service)
@@ -527,6 +611,19 @@ def _validate_xlsx_archive(content: bytes) -> None:
     except (OSError, zipfile.BadZipFile) as exc:
         raise ValueError("Excel 压缩包结构无效") from exc
 
+def _spreadsheet_cell(value: Any) -> Any:
+    """保留 Excel 已识别的数字和布尔值；其余类型仍按字符串传递。"""
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value) if value.is_integer() else value
+    return str(value)
+
+
 def _parse_batch_upload(filename: str, content: bytes) -> tuple[list[dict], str | None]:
     rows: list[dict] = []
     if filename.endswith(".xls"):
@@ -535,24 +632,27 @@ def _parse_batch_upload(filename: str, content: bytes) -> tuple[list[dict], str 
         try:
             _validate_xlsx_archive(content)
             wb = openpyxl.load_workbook(io.BytesIO(content), read_only=True)
-            sheet = wb.active
-            if sheet is None:
-                return [], "Excel 工作表为空"
-            row_iter = sheet.iter_rows(values_only=True)
-            header_row = next(row_iter, None)
-            if not header_row:
-                return [], "Excel 文件为空"
-            header = [str(c or "").strip() for c in header_row[:MAX_SPREADSHEET_COLUMNS]]
-            for row_index, row in enumerate(row_iter, start=1):
-                if row_index > MAX_SPREADSHEET_ROWS:
-                    return [], "Excel 行数超过限制"
-                if any(row):
-                    rows.append({
-                        header[index]: str(value) if value is not None else ""
-                        for index, value in enumerate(row[:MAX_SPREADSHEET_COLUMNS])
-                        if index < len(header) and header[index]
-                    })
-        except (OSError, ValueError, zipfile.BadZipFile) as exc:
+            try:
+                sheet = wb.active
+                if sheet is None:
+                    return [], "Excel 工作表为空"
+                row_iter = sheet.iter_rows(values_only=True)
+                header_row = next(row_iter, None)
+                if not header_row:
+                    return [], "Excel 文件为空"
+                header = [str(c or "").strip() for c in header_row[:MAX_SPREADSHEET_COLUMNS]]
+                for row_index, row in enumerate(row_iter, start=1):
+                    if row_index > MAX_SPREADSHEET_ROWS:
+                        return [], "Excel 行数超过限制"
+                    if any(row):
+                        rows.append({
+                            header[index]: _spreadsheet_cell(value)
+                            for index, value in enumerate(row[:MAX_SPREADSHEET_COLUMNS])
+                            if index < len(header) and header[index]
+                        })
+            finally:
+                wb.close()
+        except (OSError, ValueError, zipfile.BadZipFile, KeyError) as exc:
             return [], str(exc)
     elif filename.endswith(".csv"):
         text = content.decode("utf-8-sig", errors="ignore")
@@ -570,6 +670,8 @@ def _parse_batch_upload(filename: str, content: bytes) -> tuple[list[dict], str 
             return [], "JSON 必须为对象数组格式"
         if len(data) > MAX_SPREADSHEET_ROWS:
             return [], "JSON 行数超过限制"
+        if not all(isinstance(row, dict) for row in data):
+            return [], "JSON 必须为对象数组，每个元素必须为 JSON 对象"
         rows = data
     else:
         return [], "仅支持 .xlsx, .csv, .json 格式文件"
@@ -577,7 +679,7 @@ def _parse_batch_upload(filename: str, content: bytes) -> tuple[list[dict], str 
 
 
 # ---------------- 批处理任务 ----------------
-@app.post("/api/batch/upload")
+@app.post("/api/batch/upload", dependencies=[Depends(require_operator)])
 async def upload_batch_file(file: UploadFile = File(...)):
     raw_filename = file.filename or ""
     filename = raw_filename.lower()
@@ -646,15 +748,42 @@ class CreateBatchRequest(BaseModel):
     items: list[dict]
     delay_sec: float | None = 0.05
     dry_run: bool | None = False
+    confirm_high_risk: bool = False
+    approved_high_risk_paths: list[str] = Field(default_factory=list)
 
 
-@app.post("/api/batch/create")
-def create_batch_task(req: CreateBatchRequest):
+@app.post("/api/batch/create", dependencies=[Depends(require_operator)])
+def create_batch_task(req: CreateBatchRequest, user: CurrentUser = Depends(current_user)):
     if not req.items:
         raise HTTPException(status_code=400, detail="任务列表不能为空")
     delay_sec = req.delay_sec if req.delay_sec is not None else 0.05
+    api_meta = registry.get_api(req.api_id)
+    if not api_meta:
+        raise HTTPException(status_code=404, detail=f"API {req.api_id} 未注册")
+    if not req.dry_run and is_high_risk_api(req.api_id, api_meta):
+        approved = {
+            str(path).strip().lower()
+            for path in req.approved_high_risk_paths
+            if str(path).strip()
+        }
+        if not req.confirm_high_risk or not (approved & matching_confirmation_paths(req.api_id, api_meta)):
+            raise HTTPException(
+                status_code=428,
+                detail="批量高危接口需要显式二次确认：confirm_high_risk=true 且 approved_high_risk_paths 包含该接口的 canonical ID 或 command",
+            )
+    from core.batch_presets import get_api_batch_guidance
+    min_delay = float(get_api_batch_guidance(req.api_id).get("min_delay") or 0.0)
+    if delay_sec < min_delay:
+        raise HTTPException(status_code=422, detail=f"该接口最小执行间隔为 {min_delay:g} 秒")
     try:
-        task = task_runner.create_task(req.api_id, req.items, delay_sec=delay_sec, dry_run=bool(req.dry_run))
+        task = task_runner.create_task(
+            req.api_id,
+            req.items,
+            delay_sec=delay_sec,
+            dry_run=bool(req.dry_run),
+            owner_id=user.subject,
+            allow_high_risk=bool(req.confirm_high_risk and not req.dry_run),
+        )
         if not task_runner.start_task(task.task_id):
             raise HTTPException(status_code=409, detail="批处理任务已启动或已终止")
     except ValueError as exc:
@@ -668,7 +797,7 @@ def create_batch_task(req: CreateBatchRequest):
     }
 
 
-@app.get("/api/batch/{task_id}/events")
+@app.get("/api/batch/{task_id}/events", dependencies=[Depends(require_batch_task)])
 def stream_batch_events(task_id: str):
     task = task_runner.get_task(task_id)
     if not task:
@@ -685,20 +814,31 @@ def stream_batch_events(task_id: str):
                 if evt.get("type") in ("complete", "error"):
                     has_finished = True
                     break
-            if has_finished or task.status in ("COMPLETED", "CANCELLED", "FAILED"):
+            if has_finished:
                 return
 
-            # 2. 持续等待新事件
+            # 2. 持续等待新事件。终态不能截断队列里尚未发出的事件。
+            terminal_status = {"COMPLETED", "CANCELLED", "FAILED"}
+            terminal_events = {"complete", "error"}
             while True:
                 try:
                     evt = sub_queue.get(timeout=1.0)
+                except queue.Empty:
+                    if task.status not in terminal_status:
+                        yield ": keep-alive\n\n"
+                        continue
+                    while True:
+                        try:
+                            evt = sub_queue.get_nowait()
+                        except queue.Empty:
+                            return
+                        yield f"data: {json.dumps(evt, ensure_ascii=False)}\n\n"
+                        if evt.get("type") in terminal_events:
+                            return
+                else:
                     yield f"data: {json.dumps(evt, ensure_ascii=False)}\n\n"
-                    if evt.get("type") in ("complete", "error") or task.status in ("COMPLETED", "CANCELLED", "FAILED"):
+                    if evt.get("type") in terminal_events:
                         break
-                except Exception:
-                    if task.status in ("COMPLETED", "CANCELLED", "FAILED"):
-                        break
-                    yield ": keep-alive\n\n"
         finally:
             task.unregister_subscriber(sub_queue)
 
@@ -713,7 +853,7 @@ def stream_batch_events(task_id: str):
     )
 
 
-@app.post("/api/batch/{task_id}/pause")
+@app.post("/api/batch/{task_id}/pause", dependencies=[Depends(require_batch_task)])
 def pause_task(task_id: str):
     task = task_runner.get_task(task_id)
     if not task:
@@ -722,7 +862,7 @@ def pause_task(task_id: str):
     return {"status": "success", "task_status": task.status}
 
 
-@app.post("/api/batch/{task_id}/resume")
+@app.post("/api/batch/{task_id}/resume", dependencies=[Depends(require_batch_task)])
 def resume_task(task_id: str):
     task = task_runner.get_task(task_id)
     if not task:
@@ -731,7 +871,7 @@ def resume_task(task_id: str):
     return {"status": "success", "task_status": task.status}
 
 
-@app.post("/api/batch/{task_id}/stop")
+@app.post("/api/batch/{task_id}/stop", dependencies=[Depends(require_batch_task)])
 def stop_task(task_id: str):
     task = task_runner.get_task(task_id)
     if not task:
@@ -740,7 +880,7 @@ def stop_task(task_id: str):
     return {"status": "success", "task_status": task.status}
 
 
-@app.get("/api/batch/{task_id}/export/csv")
+@app.get("/api/batch/{task_id}/export/csv", dependencies=[Depends(require_batch_task)])
 def export_csv(task_id: str, only_failed: bool = False):
     task = task_runner.get_task(task_id)
     if not task or not task.results:
@@ -757,12 +897,26 @@ def export_csv(task_id: str, only_failed: bool = False):
     if only_failed:
         results = [r for r in results if r.get("_status") != "OK" or r.get("_err_code") != 0]
 
+    def safe_csv_cell(value: Any) -> Any:
+        """Prevent spreadsheet formula evaluation for user-controlled values."""
+        if isinstance(value, str) and value[:1] in {"=", "+", "-", "@"}:
+            return "'" + value
+        return value
+
     output = io.StringIO()
     if results:
-        fieldnames = list(dict.fromkeys(k for r in results for k in r))
+        original_fields = list(dict.fromkeys(k for r in results for k in r))
+        field_map = [(field, safe_csv_cell(str(field))) for field in original_fields]
+        fieldnames = [safe for _, safe in field_map]
         writer = csv.DictWriter(output, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
-        writer.writerows(results)
+        writer.writerows(
+            {
+                safe_field: safe_csv_cell(row.get(original_field, ""))
+                for original_field, safe_field in field_map
+            }
+            for row in results
+        )
 
     output.seek(0)
     filename_suffix = "failed_items" if only_failed else "results"
@@ -774,11 +928,13 @@ def export_csv(task_id: str, only_failed: bool = False):
 
 
 # ---------------- 历史归档 ----------------
-@app.get("/api/history")
-def get_history_list():
-    history = load_history()
-    # 如果 history 为空但存在 withdraw_results.json，自动生成一条初始历史记录
-    if not history:
+@app.get("/api/history", dependencies=[Depends(require_operator)])
+def get_history_list(user: CurrentUser = Depends(current_user)):
+    all_history = load_history()
+    history = all_history if user.is_admin else [item for item in all_history if item.get("owner_id") == user.subject]
+    # 仅在全局历史确实为空且当前用户为管理员时，初始化一次兼容旧版演示记录。
+    # 不能根据普通用户过滤后的空视图初始化，否则不同用户会反复抢占 init_208。
+    if not all_history and user.is_admin:
         prev_res_path = os.path.join(BASE_DIR, "withdraw_results.json")
         if os.path.exists(prev_res_path):
             try:
@@ -786,6 +942,7 @@ def get_history_list():
                     data = json.load(f)
                     init_record = {
                         "task_id": "init_208",
+                        "owner_id": None,
                         "api_id": "c2c_msg_withdraw",
                         "api_name": "撤回单聊消息 (历史归档)",
                         "total": len(data),
@@ -812,7 +969,7 @@ def get_history_list():
     return {"status": "success", "data": summary_list}
 
 
-@app.get("/api/history/{task_id}")
+@app.get("/api/history/{task_id}", dependencies=[Depends(require_batch_task)])
 def get_history_detail(task_id: str):
     history = load_history()
     match = next((h for h in history if h.get("task_id") == task_id), None)
@@ -821,7 +978,7 @@ def get_history_detail(task_id: str):
     return {"status": "success", "data": match}
 
 
-@app.delete("/api/history/{task_id}")
+@app.delete("/api/history/{task_id}", dependencies=[Depends(require_batch_task)])
 def delete_single_history(task_id: str):
     success = delete_history_item(task_id)
     if not success:
@@ -829,7 +986,7 @@ def delete_single_history(task_id: str):
     return {"status": "success", "message": f"Task {task_id} deleted"}
 
 
-@app.delete("/api/history")
+@app.delete("/api/history", dependencies=[Depends(require_admin)])
 def delete_all_history():
     clear_history()
     return {"status": "success", "message": "All history records cleared"}

@@ -7,37 +7,69 @@ from __future__ import annotations
 import json
 import os
 import queue
+import random
+import re
 import threading
 import time
 import uuid
 from collections.abc import Callable
+from contextlib import suppress
 from typing import Any
 
 from .cloud_client import UniversalCloudClient
 from .config import load_config
 from .registry import registry
+from .agent.risk import is_high_risk_api
 
 STORAGE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "storage"))
 HISTORY_PATH = os.path.join(STORAGE_DIR, "history.json")
 _history_lock = threading.Lock()
 MAX_CACHED_TASKS = 50
 MAX_EVENTS_PER_TASK = 2000
+# Rate limiting is transient: retry a single item three times after its
+# initial request, with bounded exponential backoff and jitter.
+MAX_RATE_LIMIT_RETRIES = 3
+RATE_LIMIT_BACKOFF_BASE_SEC = 0.2
+RATE_LIMIT_BACKOFF_JITTER_SEC = 0.1
+RATE_LIMIT_ERROR_CODES = frozenset({"90001", "429", "requestlimitexceeded"})
+
+
+def _is_rate_limited_response(response: Any) -> bool:
+    """Return whether a normalized Tencent response represents rate limiting.
+
+    IM uses numeric ``ErrorCode: 90001`` while HTTP-level throttling is
+    normalized by the clients to ``ErrorCode: 429``.  Keep the message check
+    as a compatibility fallback for clients that preserve only HTTP text.
+    """
+    if not isinstance(response, dict):
+        return False
+    code = response.get("ErrorCode")
+    if str(code).strip().lower() in RATE_LIMIT_ERROR_CODES:
+        return True
+    info = str(response.get("ErrorInfo", ""))
+    return bool(re.search(r"(?:^|\b)HTTP\s*429(?:\b|$)", info, re.IGNORECASE))
 
 
 def _atomic_dump_json(filepath: str, data: Any, indent: int = 2) -> None:
     """原子化写入 JSON 文件，避免多线程并发导致历史文件截断损坏"""
-    os.makedirs(os.path.dirname(filepath), exist_ok=True)
+    try:
+        os.makedirs(os.path.dirname(filepath), exist_ok=True)
+        with suppress(OSError):
+            os.chmod(os.path.dirname(filepath), 0o700)
+    except OSError as exc:
+        raise RuntimeError(f"无法创建历史目录: {filepath}") from exc
     tmp_path = f"{filepath}.{os.getpid()}.{threading.get_ident()}.{int(time.time() * 1000)}.tmp"
     try:
-        with open(tmp_path, "w", encoding="utf-8") as f:
+        fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=indent)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp_path, 0o600)
         os.replace(tmp_path, filepath)
     except Exception:
-        if os.path.exists(tmp_path):
-            try:
-                os.remove(tmp_path)
-            except Exception:
-                pass
+        with suppress(OSError):
+            os.remove(tmp_path)
         raise
 
 
@@ -46,7 +78,7 @@ def load_history() -> list[dict]:
     with _history_lock:
         if os.path.exists(HISTORY_PATH):
             try:
-                with open(HISTORY_PATH, "r", encoding="utf-8") as f:
+                with open(HISTORY_PATH, encoding="utf-8") as f:
                     return json.load(f)
             except Exception as e:
                 print(f"[WARN] Failed to load history: {e}")
@@ -55,11 +87,14 @@ def load_history() -> list[dict]:
 
 def save_history_item(batch_record: dict):
     with _history_lock:
-        os.makedirs(STORAGE_DIR, exist_ok=True)
+        try:
+            os.makedirs(STORAGE_DIR, exist_ok=True)
+        except OSError as exc:
+            raise RuntimeError(f"无法创建批处理存储目录: {STORAGE_DIR}") from exc
         history = []
         if os.path.exists(HISTORY_PATH):
             try:
-                with open(HISTORY_PATH, "r", encoding="utf-8") as f:
+                with open(HISTORY_PATH, encoding="utf-8") as f:
                     history = json.load(f)
             except Exception:
                 history = []
@@ -74,7 +109,7 @@ def delete_history_item(task_id: str) -> bool:
         if not os.path.exists(HISTORY_PATH):
             return False
         try:
-            with open(HISTORY_PATH, "r", encoding="utf-8") as f:
+            with open(HISTORY_PATH, encoding="utf-8") as f:
                 history = json.load(f)
         except Exception:
             return False
@@ -92,7 +127,7 @@ def clear_history() -> bool:
 
 
 class BatchTask:
-    def __init__(self, task_id: str, api_id: str, items: list[dict], delay_sec: float = 0.05, dry_run: bool = False, config_snapshot: dict | None = None):
+    def __init__(self, task_id: str, api_id: str, items: list[dict], delay_sec: float = 0.05, dry_run: bool = False, config_snapshot: dict | None = None, owner_id: str | None = None):
 
         self.task_id = task_id
         self.api_id = api_id
@@ -100,6 +135,7 @@ class BatchTask:
         self.delay_sec = delay_sec
         self.dry_run = dry_run
         self.config_snapshot = config_snapshot
+        self.owner_id = owner_id
         self.total = len(items)
         self.current = 0
         self.success = 0
@@ -140,15 +176,11 @@ class BatchTask:
                 del self.events[:-MAX_EVENTS_PER_TASK]
             subs = list(self._subscribers)
         # 兼容老版单队列
-        try:
+        with suppress(queue.Full):
             self.event_queue.put_nowait(evt)
-        except Exception:
-            pass
         for sub in subs:
-            try:
+            with suppress(queue.Full):
                 sub.put_nowait(evt)
-            except Exception:
-                pass
 
     def stop(self):
         callback = None
@@ -183,7 +215,43 @@ class TaskRunner:
         self.tasks: dict[str, BatchTask] = {}
         self._lock = threading.Lock()
 
-    def create_task(self, api_id: str, items: list[dict], delay_sec: float | None = None, dry_run: bool = False) -> BatchTask:
+    @staticmethod
+    def _invoke_with_rate_limit_retry(client: UniversalCloudClient, api_meta: Any, payload: dict, stop_event: threading.Event | None = None) -> dict:
+        """Invoke one item, retrying transient Tencent rate-limit responses.
+
+        ``MAX_RATE_LIMIT_RETRIES`` counts retries after the initial request.
+        A task cancellation interrupts the backoff wait, while the last
+        response is still returned so the item is accounted for exactly once.
+        """
+        response = client.invoke_api(api_meta, payload)
+        for retry_index in range(MAX_RATE_LIMIT_RETRIES):
+            if not _is_rate_limited_response(response):
+                break
+            delay = (
+                RATE_LIMIT_BACKOFF_BASE_SEC * (2 ** retry_index)
+                + random.uniform(0, RATE_LIMIT_BACKOFF_JITTER_SEC)
+            )
+            if stop_event is not None:
+                if stop_event.wait(delay):
+                    break
+            else:
+                time.sleep(delay)
+            response = client.invoke_api(api_meta, payload)
+        return response
+
+    def create_task(
+        self,
+        api_id: str,
+        items: list[dict],
+        delay_sec: float | None = None,
+        dry_run: bool = False,
+        owner_id: str | None = None,
+        allow_high_risk: bool = False,
+    ) -> BatchTask:
+
+        api_meta = registry.get_api(api_id)
+        if not dry_run and api_meta and is_high_risk_api(api_id, api_meta) and not allow_high_risk:
+            raise ValueError("高危批处理接口必须经过显式确认")
 
         cfg = load_config()
         if delay_sec is None:
@@ -191,7 +259,7 @@ class TaskRunner:
         task_id = str(uuid.uuid4())[:8]
         # 快照当前激活配置，确保任务执行期间不受全局环境切换影响，彻底做到凭证隔离
         config_snapshot = dict(cfg)
-        task = BatchTask(task_id, api_id, items, delay_sec=float(delay_sec), dry_run=dry_run, config_snapshot=config_snapshot)
+        task = BatchTask(task_id, api_id, items, delay_sec=float(delay_sec), dry_run=dry_run, config_snapshot=config_snapshot, owner_id=owner_id)
 
         task._finalize_callback = lambda task=task: self._finalize_task(task, None, "任务在启动前被取消")
         with self._lock:
@@ -242,6 +310,7 @@ class TaskRunner:
             summary = {
                 "task_id": task.task_id,
                 "api_id": task.api_id,
+                "owner_id": task.owner_id,
                 "api_name": api_meta.name if api_meta else task.api_id,
                 "service_type": getattr(api_meta, "service_type", "im") if api_meta else "im",
                 "total": task.total,
@@ -307,7 +376,12 @@ class TaskRunner:
                         err_info = "【预览演练】参数结构构建成功 (未发起真实网络请求)"
                         cost_ms = 0
                     else:
-                        resp = client.invoke_api(api_meta, payload)
+                        resp = self._invoke_with_rate_limit_retry(
+                            client,
+                            api_meta,
+                            payload,
+                            stop_event=task._stop_event,
+                        )
                         action_status = resp.get("ActionStatus", "FAIL")
                         err_code = resp.get("ErrorCode", -1)
                         err_info = resp.get("ErrorInfo", "")

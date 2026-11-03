@@ -328,6 +328,14 @@ def get_api_batch_guidance(api_id: str) -> Dict[str, Any]:
     try:
         from .registry import registry
         api_obj = registry.get_api(api_id)
+        if api_obj:
+            from .agent.risk import is_high_risk_api
+            if is_high_risk_api(api_id, api_obj):
+                risk_level = "HIGH_RISK"
+                min_delay = max(min_delay, 1.0)
+                recommended_delay = max(recommended_delay, 1.0)
+                if not tip:
+                    tip = "⚠️ 该接口会删除、撤回、禁用或修改云端资源，批量执行前必须核对目标范围并显式确认。"
         if api_obj and api_obj.doc_id:
             doc_path = os.path.join(DOCS_DIR, f"{api_obj.doc_id}.json")
             if os.path.exists(doc_path):

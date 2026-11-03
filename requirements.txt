@@ -4,7 +4,12 @@ uvicorn[standard]>=0.28.0
 pydantic>=2.0.0
 python-multipart>=0.0.9
 requests>=2.31.0
+PyJWT[crypto]>=2.8.0
 openpyxl>=3.1.0
+pandas>=2.2.0
+python-docx>=1.1.0
+pypdf>=5.0.0
+Pillow>=10.0.0
 
 # 自动化测试依赖
 pytest>=8.0.0

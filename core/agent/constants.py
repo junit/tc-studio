@@ -12,14 +12,8 @@ AUTHORIZED_IMPORTS: List[str] = [
     "math",
     "datetime",
     "re",
-    "urllib",
     "random",
-    "pandas",
-    "openpyxl",
-    "docx",
     "csv",
-    "PIL",
-    "pypdf",
 ]
 
 # 沙箱执行输出与步骤限制

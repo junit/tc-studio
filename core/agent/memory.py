@@ -275,6 +275,7 @@ class HierarchicalMemoryManager:
                 "updated_at": datetime.now().isoformat()
             }
             tmp_path = self._summary_file_path(bot_dir) + ".tmp"
+            os.makedirs(bot_dir, exist_ok=True)
             with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(save_payload, f, ensure_ascii=False, indent=2)
             os.replace(tmp_path, self._summary_file_path(bot_dir))
@@ -367,7 +368,7 @@ class HierarchicalMemoryManager:
         完整组装四层分级记忆与无限上下文提示词 (Prompt Assembly Pipeline)
         支持动态用户/模型上下文预算 (Context Budgeting)
         """
-        bot_dir = manager._bot_dir(bot_id)
+        bot_dir = manager._runtime_dir(bot_id)
         prompt_sections: list[str] = []
 
         effective_working_turns = (
@@ -496,11 +497,9 @@ class HierarchicalMemoryManager:
                 att_name = att.get("name", "未命名文件")
                 att_type = att.get("type", "file")
                 size_str = att.get("size_formatted") or format_file_size(att.get("size", 0))
-                att_path = att.get("path", "")
                 att_preview = att.get("preview") or att.get("summary") or "已解析结构"
                 att_lines.append(
                     f"- 📎 附件 {idx}: `{att_name}` ({att_type}, 大小: {size_str})\n"
-                    f"  本地绝对文件路径: `{att_path}`\n"
                     f"  内容预览与数据结构:\n{att_preview}"
                 )
 
@@ -509,8 +508,8 @@ class HierarchicalMemoryManager:
                 f"【用户随消息上传了以下文件附件】:\n"
                 f"{chr(10).join(att_lines)}\n\n"
                 f"【附件处理操作提示】:\n"
-                f"1. 你可以使用 `read_file(file_path)` 工具直接读取文档/代码/表格摘要；\n"
-                f"2. 你可以直接在 Python 沙箱中编写脚本，读取上述本地文件绝对路径进行数据分析、统计、转换与过滤；\n"
+                f"1. 你可以使用 `read_file(file_path)` 工具读取附件名对应的已上传文件；\n"
+                f"2. 文件解析与访问由服务端限制在当前 BOT 的上传目录内，禁止使用绝对路径或自行打开宿主机文件；\n"
                 f"3. 若涉及腾讯云 IM 业务（如导入账号名单、批量群禁言、白名单对账等），可结合 `tim_call` 进行自动化批量执行并汇报结果。"
             )
         else:

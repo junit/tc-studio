@@ -12,9 +12,11 @@ import asyncio
 import json
 import threading
 import time
+import uuid
 from typing import Any, Dict, List, Optional
 
 from .constants import MAX_CACHED_RUNS, RUN_TTL_SECONDS
+from ..runtime_context import runtime_is_admin, runtime_is_operator, runtime_user_id
 
 MAX_EVENTS_PER_RUN = 2000
 
@@ -49,13 +51,19 @@ class AgentRun:
         user_message: str,
         client_msg_id: Optional[str] = None,
         attachments: Optional[List[Dict[str, Any]]] = None,
-        skip_user_append: bool = False
+        skip_user_append: bool = False,
+        user_id: str = "local",
+        is_admin: bool = True,
+        is_operator: bool = True
     ):
         self.run_id = run_id
         self.bot_id = bot_id
         self.user_message = user_message
         self.attachments = attachments or []
         self.skip_user_append = skip_user_append
+        self.user_id = user_id
+        self.is_admin = is_admin
+        self.is_operator = is_operator
         now_ts = int(time.time() * 1000)
         self.user_msg_id = f"usr-{now_ts}"
         self.assistant_msg_id = client_msg_id or f"ast-{now_ts}"
@@ -271,8 +279,10 @@ class AgentRunManager:
         self.run_ttl_seconds = run_ttl_seconds
         self._lock = threading.Lock()
 
+    def _run_key(self, bot_id: str, user_id: str | None = None) -> str:
+        return f"{bot_id}:{user_id or runtime_user_id.get()}"
+
     def _evict_stale_runs_unlocked(self):
-        """淘汰过期或超出缓存上限的历史已完成任务，防止内存泄漏"""
         now = time.time()
         active_run_ids = set(self.active_bot_runs.values())
 
@@ -299,9 +309,9 @@ class AgentRunManager:
             for rid, _ in finished_runs[:excess_count]:
                 self.runs.pop(rid, None)
 
-    def get_active_run(self, bot_id: str) -> Optional[AgentRun]:
+    def get_active_run(self, bot_id: str, user_id: str | None = None) -> Optional[AgentRun]:
         with self._lock:
-            run_id = self.active_bot_runs.get(bot_id)
+            run_id = self.active_bot_runs.get(self._run_key(bot_id, user_id))
             if not run_id:
                 return None
             run = self.runs.get(run_id)
@@ -309,15 +319,15 @@ class AgentRunManager:
                 return run
             return None
 
-    def list_active_runs(self) -> Dict[str, Dict[str, Any]]:
+    def list_active_runs(self, user_id: str | None = None) -> Dict[str, Dict[str, Any]]:
         """获取所有当前正在运行中的智能体任务快照简述"""
         result = {}
         with self._lock:
-            for bot_id, run_id in list(self.active_bot_runs.items()):
+            for _run_key, run_id in list(self.active_bot_runs.items()):
                 run = self.runs.get(run_id)
-                if run and run.status == "running":
+                if run and run.status == "running" and (user_id is None or run.user_id == user_id):
                     elapsed = (run.end_time or time.time()) - run.start_time
-                    result[bot_id] = {
+                    result[run.bot_id] = {
                         "run_id": run.run_id,
                         "bot_id": run.bot_id,
                         "status": run.status,
@@ -329,21 +339,21 @@ class AgentRunManager:
                     }
         return result
 
-    def resolve_approval(self, bot_id: str, approval_id: str, decision: str) -> bool:
+    def resolve_approval(self, bot_id: str, approval_id: str, decision: str, user_id: str | None = None) -> bool:
         """为指定智能体当前的挂起操作提交决策"""
-        run = self.get_active_run(bot_id)
+        run = self.get_active_run(bot_id, user_id)
         if run:
             return run.resolve_approval(approval_id, decision)
         return False
 
-    def stop_run(self, bot_id: str) -> bool:
+    def stop_run(self, bot_id: str, user_id: str | None = None) -> bool:
         """停止指定智能体的当前任务"""
-        run = self.get_active_run(bot_id)
+        run = self.get_active_run(bot_id, user_id)
         if run:
             run.request_stop()
             with self._lock:
-                if self.active_bot_runs.get(bot_id) == run.run_id:
-                    self.active_bot_runs.pop(bot_id, None)
+                if self.active_bot_runs.get(self._run_key(bot_id, user_id)) == run.run_id:
+                    self.active_bot_runs.pop(self._run_key(bot_id, user_id), None)
             return True
         return False
 
@@ -355,30 +365,35 @@ class AgentRunManager:
         bot_manager,
         client_msg_id: Optional[str] = None,
         attachments: Optional[List[Dict[str, Any]]] = None,
-        skip_user_append: bool = False
+        skip_user_append: bool = False,
+        user_id: str = "local",
+        is_admin: bool = True,
+        is_operator: bool = True
     ) -> AgentRun:
         """启动新的后台执行任务（若已有运行中的任务先中止旧任务）"""
         with self._lock:
             self._evict_stale_runs_unlocked()
-            old_run_id = self.active_bot_runs.get(bot_id)
+            old_run_id = self.active_bot_runs.get(self._run_key(bot_id, user_id))
             if old_run_id and old_run_id in self.runs:
                 old_run = self.runs[old_run_id]
                 if old_run.status == "running":
                     old_run.request_stop()
 
-            run_id = f"run_{bot_id}_{int(time.time() * 1000)}"
+            run_id = f"run_{bot_id}_{uuid.uuid4().hex}"
             run = AgentRun(
                 run_id,
                 bot_id,
                 user_message,
                 client_msg_id=client_msg_id,
                 attachments=attachments,
-                skip_user_append=skip_user_append
+                skip_user_append=skip_user_append,
+                user_id=user_id,
+                is_admin=is_admin,
+                is_operator=is_operator,
             )
             self.runs[run_id] = run
-            self.active_bot_runs[bot_id] = run_id
+            self.active_bot_runs[self._run_key(bot_id, user_id)] = run_id
 
-        # 启动后台独立工作线程
         worker = threading.Thread(
             target=self._execute_run_worker,
             args=(run, engine, bot_manager),
@@ -390,21 +405,21 @@ class AgentRunManager:
 
     def _execute_run_worker(self, run: AgentRun, engine, bot_manager):
         """后台独立工作线程：执行 agent_engine 并持续分发事件"""
+        token = runtime_user_id.set(run.user_id)
+        admin_token = runtime_is_admin.set(run.is_admin)
+        operator_token = runtime_is_operator.set(run.is_operator)
         try:
             stream_gen = engine.run_agent_stream(
-                run.bot_id,
-                run.user_message,
-                attachments=run.attachments,
+                run.bot_id, run.user_message, attachments=run.attachments,
                 skip_user_append=run.skip_user_append,
                 stop_checker=lambda: run.is_stopped,
-                approval_requester=run.request_approval
+                approval_requester=run.request_approval,
             )
             for event_obj in stream_gen:
                 if run.is_stopped:
                     break
                 evt_name = event_obj.get("event", "message")
-                data = event_obj.get("data", {})
-                run.dispatch_event(evt_name, data)
+                run.dispatch_event(evt_name, event_obj.get("data", {}))
                 if evt_name in ("done", "error"):
                     break
         except Exception as e:
@@ -412,13 +427,17 @@ class AgentRunManager:
                 run.dispatch_event("error", {"error": str(e)})
                 run.dispatch_event("done", {"status": "error"})
         finally:
+            runtime_is_admin.reset(admin_token)
+            runtime_is_operator.reset(operator_token)
+            runtime_user_id.reset(token)
             if run.status == "running":
                 run.status = "done"
                 run.stream_status = "done"
                 run.dispatch_event("done", {"status": "done"})
             with self._lock:
-                if self.active_bot_runs.get(run.bot_id) == run.run_id:
-                    self.active_bot_runs.pop(run.bot_id, None)
+                run_key = self._run_key(run.bot_id, run.user_id)
+                if self.active_bot_runs.get(run_key) == run.run_id:
+                    self.active_bot_runs.pop(run_key, None)
                 self._evict_stale_runs_unlocked()
 
 

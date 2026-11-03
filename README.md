@@ -7,7 +7,7 @@
 *A modern, multi-cloud developer & DevOps visual studio with Evolving CodeAgents for Tencent Cloud IM, Live (CSS) & API 3.0 Services.*
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Python: 3.8+](https://img.shields.io/badge/Python-3.8%2B-brightgreen.svg)](https://www.python.org/)
+[![Python: 3.11+](https://img.shields.io/badge/Python-3.11%2B-brightgreen.svg)](https://www.python.org/)
 [![FastAPI: 0.110+](https://img.shields.io/badge/FastAPI-0.110%2B-009688.svg)](https://fastapi.tiangolo.com/)
 [![React: 19](https://img.shields.io/badge/React-19-61DAFB.svg)](https://react.dev/)
 [![TailwindCSS: v4](https://img.shields.io/badge/TailwindCSS-v4-38B2AC.svg)](https://tailwindcss.com/)
@@ -35,7 +35,7 @@
 
 TC Studio 彻底告别零散脚本与繁琐鉴权，提供开箱即用的浏览器端 IDE 级管理体验：
 
-- ⚡ **开箱即用，免配 Node 环境**：前端打包产物深度预编译内置至 `static/` 目录，**仅需 Python 3.8+ 即可一键启动**，无需安装 Node.js、pnpm 或配置前端反向代理。
+- ⚡ **开箱即用，免配 Node 环境**：前端打包产物深度预编译内置至 `static/` 目录，**仅需 Python 3.11+ 即可一键启动**，无需安装 Node.js、pnpm 或配置前端反向代理。
 - 🌐 **多业务无缝聚合与即插即用**：原生融合**即时通信 IM（166 项 REST API）**与**云直播 CSS（261 项 API 3.0）**，底层采用单点真实源（SSoT）微内核设计，支持即插即用任意扩展 TRTC、VOD、COS 等更多业务。
 - 🛡️ **安全隔离与人机协同门禁 (Consent Gate)**：完全私有化本地运行，凭据与密钥不外发第三方；针对解散群组、强制断流、禁推封禁等高危破坏性操作内置**人机协同审批拦截**。
 - 🤖 **进化型 CodeAgent 架构**：基于代码即动作（Code-as-Action）理念，智能体直接编写并沙箱执行 Python 脚本跨业务调度 427+ 项接口，具备动态提示词装配、准则自我进化、技能自主沉淀、企业知识库挂载与多 Agent 拓扑协同。
@@ -217,7 +217,7 @@ TC Studio 的智能体并非传统打字聊天的对话机器人，而是**以�
 
 ### 运行环境准备
 - **操作系统**：macOS / Linux / Windows
-- **Python 版本**：Python 3.8 或更高版本
+- **Python 版本**：Python 3.11 或更高版本
 
 ### 1. 安装后端依赖
 
@@ -294,6 +294,8 @@ python3 app.py
 - **通义千问 / OpenAI / vLLM / 兼容服务**：
   - 填入对应 Base URL、API Key 与 Model Name 即可，支持点击动态探测下拉列表一键匹配。
 
+企业局域网中的 Ollama、vLLM 或 OpenAI 兼容模型默认仍会被出站 SSRF 守卫拦截。部署方明确批准后，可用逗号分隔的精确主机名、IP 或 CIDR 配置 `ALLOW_PRIVATE_MODEL_HOSTS`，例如 `ALLOW_PRIVATE_MODEL_HOSTS=10.20.0.15,gpu.internal,192.168.20.0/24`；域名解析到的所有地址都必须是私有地址，通配符和 `host:port` 不受支持。Ollama 以外的端口可另用 `LOCAL_MODEL_ALLOWED_PORTS` 配置。
+
 ---
 
 ## 🔌 扩展接入腾讯云其它 API 3.0 业务 (TRTC / VOD 等)
@@ -327,6 +329,35 @@ pnpm run build
 ```bash
 pytest
 ```
+
+---
+
+## 🔐 可插拔认证（本地 / OIDC / Keycloak / Authentik）
+
+认证默认关闭，仅限本地开发模式（`APP_ENV=development`、`dev` 或 `local`）使用；任何其他环境（包括拼写错误的环境名，如 `prodcution`）在未启用认证时将直接拒绝 API 请求（除非显式设置 `ALLOW_INSECURE_LOCAL_AUTH=true`）。内网或公网部署必须启用 OIDC；Keycloak、Authentik 及企业 OIDC 均可使用同一接口。
+
+```bash
+export AUTH_ENABLED=true
+export AUTH_PROVIDER=oidc
+export OIDC_ISSUER_URL=https://sso.example.com/realms/ops
+export OIDC_AUDIENCE=tim-studio
+export OIDC_CLIENT_ID=tim-studio
+# 可选：不填则使用 Keycloak 默认 JWKS 地址
+export OIDC_JWKS_URL=https://sso.example.com/realms/ops/protocol/openid-connect/certs
+python3 app.py
+```
+
+前端可将短期 OIDC access token 写入 `sessionStorage` 的 `tim_access_token`；普通 `fetch` 和批处理流式请求会自动附加 Bearer Token，且仅限同源 `/api/` 请求。仅在 `pnpm dev` 的 Vite 开发构建中，可通过未提交的 `.env.development.local` 设置 `VITE_OIDC_DEV_ACCESS_TOKEN` 作为临时联调凭据；生产构建会忽略该变量，绝不要把生产令牌写入 `VITE_*` 配置、源码或 `localStorage`。
+
+管理员角色可通过 OIDC claims 的 `roles`、`groups`、`realm_access.roles` 或 `resource_access[OIDC_CLIENT_ID].roles` 提供。配置、LLM 配置和安全策略接口要求 `admin`/`administrator`；技能运行和云操作要求 `admin`/`operator`/`editor`。本地模式自动使用本地管理员身份，仅适用于可信单用户部署。
+
+启用 OIDC 后，当前前端负责携带已有 access token，但不内置 OAuth Authorization Code 登录/回调页面。生产环境应配合 Keycloak/Authentik 登录页、oauth2-proxy、企业 SSO 网关或后续专用前端登录流程。没有这些组件时，直接打开页面会得到 401，这是预期的 fail-closed 行为。
+
+认证启用后，旧版本创建且 `owner_id` 为空的私有 BOT 不会自动归属到任何用户；管理员应通过 `POST /api/agent/bots/{bot_id}/ownership` 显式转移到正确的 OIDC subject，避免错误自动认领造成越权。
+
+当前云 API、批处理和 Agent 操作默认使用服务端激活环境中的全局腾讯云凭据。`operator` 角色控制“谁可以发起操作”，不提供租户级云账号、费用或配额隔离。需要严格的租户成本/配额边界时，必须为租户配置独立凭据或云 RAM 子账号，并增加配额、审计和计费归属。
+
+> 认证只解决“用户是谁”；Bot、文件、历史和知识库的 owner/member 资源授权仍需在业务层继续实现。公网部署还必须使用 HTTPS、反向代理、速率限制和出站网络控制。
 
 ---
 

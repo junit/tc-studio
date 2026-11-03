@@ -516,13 +516,8 @@ class DocSyncManager:
             if saved:
                 # 补充 api_id 若缺失
                 saved["api_id"] = api_id
-                # 若旧缓存中的 request_examples 含有输出 (如 "Response":)，自动重新解析刷新缓存
-                if any('"Response":' in ex.get("content", "") or "'Response':" in ex.get("content", "") for ex in saved.get("request_examples", [])):
-                    try:
-                        saved = self.sync_single(doc_id, api_id=api_id, doc_url=saved.get("doc_url", doc_url), mode="auto")
-
-                    except Exception:
-                        pass
+                # GET 只读本地缓存。刷新官方文档必须由显式 POST
+                # /api/docs/sync/{api_id} 触发，避免读取文档时产生外部网络副作用。
                 return saved
 
         # 本地未同步时提供友好骨架

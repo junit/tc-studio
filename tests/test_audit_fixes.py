@@ -86,8 +86,8 @@ def test_agent_sandbox_scope_survives_executor_send_tools(tmp_path):
 
 
 
-def test_agent_sandbox_scope_preserves_callable_client_methods():
-    """可调用的客户端实例必须保留为对象，不能被 safer_func 降级。"""
+def test_agent_sandbox_scope_hides_credential_bearing_clients():
+    """模型作用域不得暴露带密钥的客户端对象，但统一调用仍可注入。"""
     from types import SimpleNamespace
 
     from smolagents.local_python_executor import LocalPythonExecutor
@@ -97,13 +97,13 @@ def test_agent_sandbox_scope_preserves_callable_client_methods():
     client = TimClient(config={"sdkappid": 1, "secret_key": "secret", "admin_user": "admin"})
     executor = LocalPythonExecutor(additional_authorized_imports=[])
     agent = SimpleNamespace(python_executor=executor, state={})
-    _install_sandbox_scope(agent, {"tim_client": client})
+    _install_sandbox_scope(agent, {"tim_client": client, "cloud_call": lambda *_args: {"ok": True}})
     executor.send_variables(agent.state)
     executor.send_tools({})
 
-    assert agent.state["tim_client"] is client
+    assert "tim_client" not in agent.state
     assert "tim_client" not in (executor.static_tools or {})
-    assert executor("tim_client.get_usersig()").output
+    assert "cloud_call" in (executor.static_tools or {})
 
 
 def test_run_skill_ast_security_gate(tmp_path):
@@ -231,6 +231,16 @@ def test_run_skill_worker_blocks_host_capabilities(tmp_path):
         "reflection": "def execute():\n    return getattr(object, '__subclasses__')()",
     }
     for name, code in blocked_skills.items():
+        mgr.save_skill(bot.id, name, name, code)
+        result = runner.forward(name)
+        assert result["success"] is False
+        assert "安全拦截" in result["error"]
+
+    # Module internals and builtins loader must be rejected before execution.
+    for name, code in {
+        "random_module_escape": "import random\ndef execute():\n    return random._os.system('id')",
+        "builtins_loader_escape": "def execute():\n    return __builtins__['__loader__'].load_module('os')",
+    }.items():
         mgr.save_skill(bot.id, name, name, code)
         result = runner.forward(name)
         assert result["success"] is False

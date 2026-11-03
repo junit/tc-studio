@@ -16,7 +16,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 from fastapi.testclient import TestClient
 
 from app import app
-from core.agent.bot_manager import BotManager
+from core.agent.bot_manager import BotManager, bot_manager
 from core.agent.tools import RunSkillTool, build_bot_tools
 from core.tim_client import TimClient
 
@@ -642,7 +642,7 @@ def test_upload_file_and_read_tool(temp_bot_manager):
     assert b"user_id" in dl_resp.content
 
     # 3. 测试 ReadFileTool 工具
-    read_tool = ReadFileTool("default_assistant", temp_bot_manager)
+    read_tool = ReadFileTool("default_assistant", bot_manager)
     tool_out = read_tool.forward(file_info["path"])
     assert "CSV" in tool_out or "user_id" in tool_out
 
@@ -1541,13 +1541,10 @@ def test_bot_file_rescue_and_listing(temp_bot_manager):
         f.write("col1,col2\n1,2\n")
 
     try:
-        # 调用 list_bot_files 触发自动救援与归集
-        files_after_rescue = temp_bot_manager.list_bot_files("default_assistant")
-        assert not os.path.exists(root_stray_file)  # 根目录文件已被移动
-        assert any(f["name"] == root_stray_file for f in files_after_rescue)
-        csv_file = next(f for f in files_after_rescue if f["name"] == root_stray_file)
-        assert csv_file["category"] == "table"
-        assert csv_file["type"] == "csv"
+        # 根目录文件不再被任何用户的文件面板自动抢占或移动
+        files_after_listing = temp_bot_manager.list_bot_files("default_assistant")
+        assert os.path.exists(root_stray_file)
+        assert not any(f["name"] == root_stray_file for f in files_after_listing)
     finally:
         # 清理残余
         if os.path.exists(root_stray_file):

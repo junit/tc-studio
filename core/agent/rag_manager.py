@@ -14,6 +14,10 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from .file_parser import format_file_size
 
+MAX_RAG_TEXT_CHARS = 2_000_000
+MAX_RAG_CHUNKS = 5_000
+MAX_RAG_PDF_PAGES = 500
+
 
 def tokenize(text: str) -> List[str]:
     """
@@ -52,8 +56,11 @@ class RagManager:
 
     def _get_kb_dir(self, bot_id: str) -> str:
         kb_dir = os.path.join(self.data_root, bot_id, "knowledge")
-        os.makedirs(kb_dir, exist_ok=True)
-        os.makedirs(os.path.join(kb_dir, "files"), exist_ok=True)
+        os.makedirs(kb_dir, mode=0o700, exist_ok=True)
+        os.chmod(kb_dir, 0o700)
+        files_dir = os.path.join(kb_dir, "files")
+        os.makedirs(files_dir, mode=0o700, exist_ok=True)
+        os.chmod(files_dir, 0o700)
         return kb_dir
 
     def _get_docs_path(self, bot_id: str) -> str:
@@ -76,8 +83,10 @@ class RagManager:
         with self._lock:
             temp_path = f"{file_path}.{os.getpid()}.{threading.get_ident()}.{int(time.time() * 1000)}.tmp"
             try:
-                with open(temp_path, "w", encoding="utf-8") as f:
+                fd = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
                     json.dump(data, f, ensure_ascii=False, indent=2)
+                os.chmod(temp_path, 0o600)
                 os.replace(temp_path, file_path)
             except Exception:
                 if os.path.exists(temp_path):
@@ -150,6 +159,8 @@ class RagManager:
             import pypdf
             pdf_file = io.BytesIO(content)
             reader = pypdf.PdfReader(pdf_file)
+            if len(reader.pages) > MAX_RAG_PDF_PAGES:
+                raise ValueError(f"PDF 页数超过 {MAX_RAG_PDF_PAGES} 页限制")
             pages = []
             for idx, page in enumerate(reader.pages):
                 text = page.extract_text() or ""
@@ -242,13 +253,20 @@ class RagManager:
             stored_name = f"{doc_id}_{safe_filename}"
             stored_path = os.path.join(kb_dir, "files", stored_name)
 
-            # 1. 保存物理文件
-            with open(stored_path, "wb") as f:
-                f.write(content)
-
-            # 2. 提取文本并切片
+            # 1. 提取文本并切片 before persisting anything, so malformed or
+            # oversized documents cannot leave half-built index state behind.
             text = self.extract_text_from_bytes(safe_filename, content)
+            if len(text) > MAX_RAG_TEXT_CHARS:
+                raise ValueError(f"知识库文本超过 {MAX_RAG_TEXT_CHARS:,} 字符限制")
             raw_chunks = self.chunk_text(text, safe_filename)
+            if len(raw_chunks) > MAX_RAG_CHUNKS:
+                raise ValueError(f"知识库切片超过 {MAX_RAG_CHUNKS:,} 块限制")
+
+            # 2. 保存物理文件
+            fd = os.open(stored_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "wb") as f:
+                f.write(content)
+            os.chmod(stored_path, 0o600)
 
             chunks_data = []
             for idx, rc in enumerate(raw_chunks):

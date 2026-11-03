@@ -18,16 +18,19 @@ from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse, urlunparse
 
 import requests
-from fastapi import APIRouter, File, HTTPException, Query, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 
 from core.agent.bot_manager import bot_manager
+from core.auth import CurrentUser, current_user, require_admin, require_operator
 from core.agent.constants import SUPPORTED_PROVIDERS, BOT_PRESET_TEMPLATES, HIGH_RISK_API_KEYWORDS
+from core.agent.risk import matching_confirmation_paths, resolve_api
 from core.agent.engine import agent_engine
 from core.agent.file_parser import parse_file_summary, format_file_size
 from core.agent.models import BotConfig, LLMConfig
+from core.agent import model_url_guard
 from core.agent.rag_manager import rag_manager
 from core.agent.run_manager import AgentRun, MAX_EVENTS_PER_RUN, agent_run_manager
 from core.tim_client import TimClient
@@ -35,6 +38,31 @@ from core.tim_client import TimClient
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/agent", tags=["AI 智能体"])
+
+
+def require_bot_access(bot_id: str, user: CurrentUser = Depends(current_user)) -> CurrentUser:
+    bot = bot_manager.get_bot(bot_id)
+    if not bot:
+        raise HTTPException(status_code=404, detail="BOT 不存在")
+    if user.is_admin:
+        return user
+    if bot.visibility == "public":
+        return user
+    if bot.owner_id and bot.owner_id == user.subject:
+        return user
+    raise HTTPException(status_code=403, detail="无权访问该 BOT")
+
+def require_bot_definition_editor(bot_id: str, user: CurrentUser = Depends(current_user)) -> CurrentUser:
+    bot = bot_manager.get_bot(bot_id)
+    if not bot:
+        raise HTTPException(status_code=404, detail="BOT 不存在")
+    if user.is_admin:
+        return user
+    if bot.visibility == "public":
+        raise HTTPException(status_code=403, detail="公共 BOT 定义仅管理员可修改")
+    if bot.owner_id == user.subject:
+        return user
+    raise HTTPException(status_code=403, detail="无权修改该 BOT")
 
 MAX_AGENT_UPLOAD_BYTES = 50 * 1024 * 1024
 MAX_KNOWLEDGE_UPLOAD_BYTES = 20 * 1024 * 1024
@@ -63,12 +91,20 @@ class FetchModelsPayload(BaseModel):
 class CreateBotPayload(BaseModel):
     name: str = Field(..., description="智能体名称")
     goal: Optional[str] = Field(default="", description="职责与业务目标（希望智能体做什么）")
-    id: Optional[str] = Field(default=None, description="唯一标识 (可选，留空由 AI 自动生成)")
+    id: Optional[str] = Field(
+        default=None,
+        pattern=r"^[A-Za-z0-9_-]{1,64}$",
+        description="唯一标识 (可选，留空由 AI 自动生成)",
+    )
     avatar: Optional[str] = Field(default=None, description="头像 Emoji (可选，留空由 AI 自动匹配)")
     description: Optional[str] = Field(default=None, description="功能描述 (可选，留空由 AI 自动生成)")
     base_prompt: Optional[str] = Field(default=None, description="基础人设提示词 (可选，留空由 AI 自动生成)")
     suggested_prompts: Optional[List[str]] = Field(default=None, description="个性化推荐快捷指令")
     model_override: Optional[Dict[str, Any]] = Field(default=None, description="专属模型配置")
+
+
+class TransferBotOwnershipPayload(BaseModel):
+    owner_id: str = Field(..., min_length=1, description="目标 OIDC subject")
 
 
 class GeneratePreviewPayload(BaseModel):
@@ -154,7 +190,7 @@ class ApprovalDecisionPayload(BaseModel):
 # LLM 全局模型配置与预设
 # -------------------------------------------------------------
 @router.get("/config")
-def get_llm_config():
+def get_llm_config(_user=Depends(require_admin)):
     """获取大模型配置（API Key 脱敏）与支持的供应商列表 (SSoT)"""
     return {
         "config": bot_manager.get_masked_llm_config(),
@@ -186,7 +222,7 @@ class HighRiskKeywordsPayload(BaseModel):
 
 
 @router.post("/security/high-risk-keywords")
-def update_high_risk_keywords(payload: HighRiskKeywordsPayload):
+def update_high_risk_keywords(payload: HighRiskKeywordsPayload, _user=Depends(require_admin)):
     """更新高危破坏性接口拦截关键词"""
     updated = bot_manager.set_high_risk_keywords(payload.keywords)
     return {
@@ -196,7 +232,7 @@ def update_high_risk_keywords(payload: HighRiskKeywordsPayload):
 
 
 @router.post("/config")
-def save_llm_config(payload: LLMConfigPayload):
+def save_llm_config(payload: LLMConfigPayload, _user=Depends(require_admin)):
     """保存大模型连接配置"""
     existing = bot_manager.get_llm_config()
     # 若前端传空 key 且原本已有 key，保留原 key 避免被误清空
@@ -219,7 +255,7 @@ def save_llm_config(payload: LLMConfigPayload):
 
 
 @router.post("/config/test")
-def test_llm_connection():
+def test_llm_connection(_user=Depends(require_admin)):
     """测试当前大模型连通性"""
     cfg = bot_manager.get_llm_config()
     try:
@@ -231,76 +267,42 @@ def test_llm_connection():
         return {"success": False, "error": f"连接失败: {str(e)}"}
 
 
-LOCAL_MODEL_ALLOWED_PORTS = {11434, 8080}
-
-
-def _local_model_allowed_ports() -> set[int]:
-    """Read an explicit local-model port allowlist without weakening defaults."""
-    raw_ports = os.environ.get("LOCAL_MODEL_ALLOWED_PORTS", "")
-    if not raw_ports.strip():
-        return set(LOCAL_MODEL_ALLOWED_PORTS)
-    ports: set[int] = set()
-    for raw_port in raw_ports.split(","):
-        try:
-            port = int(raw_port.strip())
-        except ValueError:
-            continue
-        if 1 <= port <= 65535:
-            ports.add(port)
-    return ports or set(LOCAL_MODEL_ALLOWED_PORTS)
-
-
 def _validate_model_base_url(base_url: str) -> str:
-    """Allow public model endpoints and Ollama's local port, reject SSRF targets."""
-    parsed = urlparse(base_url)
-    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
-        raise HTTPException(status_code=422, detail="Base URL 必须是有效的 http(s) 地址")
-    if parsed.username or parsed.password:
-        raise HTTPException(status_code=422, detail="Base URL 不得包含账号密码")
-
-    host = parsed.hostname.lower().rstrip(".")
-    port = parsed.port
-    local_hosts = {"localhost", "127.0.0.1", "::1"}
-    if host in local_hosts:
-        # Ollama defaults to 11434. Normalize omitted ports and permit an
-        # intentionally configured custom local port.
-        if port is None:
-            netloc = parsed.hostname
-            if ":" in netloc and not netloc.startswith("["):
-                netloc = f"[{netloc}]"
-            return urlunparse(parsed._replace(netloc=f"{netloc}:11434")).rstrip("/")
-        if port not in _local_model_allowed_ports():
-            allowed_ports = ", ".join(str(item) for item in sorted(_local_model_allowed_ports()))
-            raise HTTPException(
-                status_code=422,
-                detail=f"本地模型端口不在允许列表，仅支持：{allowed_ports}；可通过 LOCAL_MODEL_ALLOWED_PORTS 配置",
-            )
-        return base_url.rstrip("/")
-
+    """允许公网模型端点与 Ollama 本地白名单端口，拒绝 SSRF 目标（委托共享守卫）。"""
     try:
-        addresses = {
-            ipaddress.ip_address(info[4][0])
-            for info in socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
-        }
-    except (OSError, ValueError) as exc:
-        raise HTTPException(status_code=422, detail="Base URL 域名无法安全解析") from exc
+        return model_url_guard.validate_model_base_url(base_url)
+    except model_url_guard.UnsafeModelUrlError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
-    if not addresses or any(
-        address.is_private
-        or address.is_loopback
-        or address.is_link_local
-        or address.is_reserved
-        or address.is_multicast
-        or address.is_unspecified
-        for address in addresses
-    ):
-        raise HTTPException(status_code=422, detail="禁止访问内网、环回、链路本地或保留地址")
-    return base_url.rstrip("/")
+
+def _is_local_model_base_url(base_url: str) -> bool:
+    return model_url_guard.is_local_model_base_url(base_url)
+
+
+def _is_official_model_base_url(provider: str, base_url: str) -> bool:
+    return model_url_guard.is_official_model_base_url(provider, base_url)
+
+
+def _validate_model_override_for_persistence(model_override: Optional[Dict[str, Any]], user: CurrentUser) -> Optional[Dict[str, Any]]:
+    """BOT 持久化前校验自定义模型地址：URL 安全 + 非管理员必须自带 API Key。"""
+    if not model_override:
+        return model_override
+    base_url = str(model_override.get("base_url") or "").strip()
+    if not base_url:
+        return model_override
+    _validate_model_base_url(base_url)
+    provider = str(model_override.get("provider") or bot_manager.get_llm_config().provider or "").lower()
+    trusted_target = _is_local_model_base_url(base_url) or _is_official_model_base_url(provider, base_url)
+    if not user.is_admin and not trusted_target:
+        api_key = str(model_override.get("api_key") or "").strip()
+        if not api_key or "..." in api_key:
+            raise HTTPException(status_code=403, detail="普通用户使用自定义模型地址时必须在 BOT 模型配置中提供自己的 API Key")
+    return model_override
 
 
 @router.post("/models")
 @router.get("/models")
-def fetch_available_models(payload: Optional[FetchModelsPayload] = None):
+def fetch_available_models(payload: Optional[FetchModelsPayload] = None, user: CurrentUser = Depends(current_user)):
     """
     通过目标提供商的 OpenAI 兼容 /models 接口或 Ollama /api/tags 动态获取可用模型标识列表。
     若远程探测失败或未配置 Key，则智能返回常见高频预设模型作为候选，保留完全自定义能力。
@@ -331,6 +333,16 @@ def fetch_available_models(payload: Optional[FetchModelsPayload] = None):
         "custom": []
     }
 
+    is_official_target = not base_url or _is_official_model_base_url(provider, base_url)
+    is_official_or_local = is_official_target or _is_local_model_base_url(base_url)
+    if not user.is_admin and base_url and not is_official_or_local and not req_key:
+        return {
+            "success": True,
+            "models": PROVIDER_PRESETS.get(provider, []),
+            "source": "preset",
+            "message": "普通用户探测自定义地址必须提供自己的 API Key，已返回推荐模型列表",
+        }
+
     if not base_url:
         presets = PROVIDER_PRESETS.get(provider, [])
         return {
@@ -340,7 +352,7 @@ def fetch_available_models(payload: Optional[FetchModelsPayload] = None):
             "message": "Base URL 为空，返回该提供商默认推荐模型列表"
         }
 
-    norm_base = _validate_model_base_url(base_url)
+    norm_base = base_url.rstrip("/") if is_official_target else _validate_model_base_url(base_url)
     candidates = []
     if provider == "ollama" or "11434" in norm_base:
         candidates.append(f"{norm_base}/api/tags")
@@ -422,9 +434,12 @@ def fetch_available_models(payload: Optional[FetchModelsPayload] = None):
 # 智能体实例管理
 # -------------------------------------------------------------
 @router.get("/bots")
-def list_bots():
-    """获取所有智能体实例列表"""
-    return {"bots": bot_manager.list_bots()}
+def list_bots(user: CurrentUser = Depends(current_user)):
+    """获取当前用户可见的智能体实例列表"""
+    bots = bot_manager.list_bots(user_id=user.subject)
+    if not user.is_admin:
+        bots = [bot for bot in bots if bot.get("visibility") == "public" or bot.get("owner_id") == user.subject]
+    return {"bots": bots}
 
 
 @router.post("/bots/generate-preview")
@@ -435,7 +450,7 @@ def generate_bot_preview(payload: GeneratePreviewPayload):
 
 
 @router.post("/bots")
-def create_bot(payload: CreateBotPayload):
+def create_bot(payload: CreateBotPayload, user: CurrentUser = Depends(current_user)):
     """新建智能体（支持仅填名称与目标，AI 自动生成人设、ID 与个性化推荐指令）"""
     target_id = payload.id
     target_avatar = payload.avatar
@@ -457,10 +472,15 @@ def create_bot(payload: CreateBotPayload):
         if not target_suggested_prompts:
             target_suggested_prompts = profile.get("suggested_prompts", [])
 
+    if not target_id or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", str(target_id)):
+        raise HTTPException(status_code=422, detail="BOT ID 只能包含字母、数字、下划线和连字符，长度为 1-64")
+
     # 避免 ID 重名冲突
     if bot_manager.get_bot(target_id):
         target_id = f"{target_id}_{int(time.time()) % 1000}"
 
+    # 持久化前强制校验自定义模型地址（SSRF 守卫 + 非管理员自带 Key）
+    _validate_model_override_for_persistence(payload.model_override, user)
     bot = bot_manager.create_bot(
         bot_id=target_id,
         name=payload.name,
@@ -468,7 +488,8 @@ def create_bot(payload: CreateBotPayload):
         description=target_desc or "",
         base_prompt=target_prompt,
         suggested_prompts=target_suggested_prompts,
-        model_override=payload.model_override
+        model_override=payload.model_override,
+        owner_id=None if user.claims.get("mode") == "disabled" else user.subject,
     )
     return {"success": True, "bot": _format_bot_response(bot)}
 
@@ -490,8 +511,8 @@ def _format_bot_response(bot):
         effective_budget = getattr(bot, "context_budget", None) or getattr(llm_cfg, "context_budget", None) or 32000
         effective_turns = getattr(bot, "max_context_turns", None) or getattr(llm_cfg, "max_context_turns", None) or 25
         history = bot_manager.get_history(bot.id, limit=500)
-        saved_state = agent_engine._bot_sandbox_states.get(bot.id, {})
-        uploads_dir = os.path.join(bot_manager._bot_dir(bot.id), "uploads")
+        saved_state = agent_engine._get_sandbox(agent_engine._sandbox_key(bot.id))
+        uploads_dir = bot_manager._uploads_dir(bot.id)
 
         ctx = memory_manager.build_hierarchical_context(
             bot_id=bot.id,
@@ -532,7 +553,7 @@ def _format_bot_response(bot):
     return data
 
 
-@router.get("/bots/{bot_id}")
+@router.get("/bots/{bot_id}", dependencies=[Depends(require_bot_access)])
 def get_bot(bot_id: str):
     """获取智能体详情与全量资产统计"""
     bot = bot_manager.get_bot(bot_id)
@@ -541,7 +562,7 @@ def get_bot(bot_id: str):
     return {"bot": _format_bot_response(bot)}
 
 
-@router.post("/bots/{bot_id}/suggested-prompts")
+@router.post("/bots/{bot_id}/suggested-prompts", dependencies=[Depends(require_bot_access)])
 def refresh_bot_suggested_prompts(bot_id: str):
     """根据智能体人设，通过大模型动态重新生成推荐指令（换一换）"""
     bot = bot_manager.get_bot(bot_id)
@@ -551,8 +572,19 @@ def refresh_bot_suggested_prompts(bot_id: str):
     return {"success": True, "suggested_prompts": prompts}
 
 
-@router.put("/bots/{bot_id}")
-def update_bot(bot_id: str, payload: UpdateBotPayload):
+@router.post("/bots/{bot_id}/ownership", dependencies=[Depends(require_admin)])
+def transfer_bot_ownership(bot_id: str, payload: TransferBotOwnershipPayload):
+    """管理员显式认领/转移历史 ownerless 私有 Bot；不根据请求者自动猜测归属。"""
+    bot = bot_manager.get_bot(bot_id)
+    if not bot:
+        raise HTTPException(status_code=404, detail="BOT 不存在")
+    if bot.visibility == "public":
+        raise HTTPException(status_code=400, detail="公共 BOT 无需设置 owner")
+    bot.owner_id = payload.owner_id.strip()
+    bot_manager.save_bot(bot)
+    return {"success": True, "bot": _format_bot_response(bot)}
+@router.put("/bots/{bot_id}", dependencies=[Depends(require_bot_definition_editor)])
+def update_bot(bot_id: str, payload: UpdateBotPayload, user: CurrentUser = Depends(current_user)):
     """更新智能体设定"""
     bot = bot_manager.get_bot(bot_id)
     if not bot:
@@ -578,12 +610,13 @@ def update_bot(bot_id: str, payload: UpdateBotPayload):
     if payload.base_prompt is not None:
         bot.base_prompt = payload.base_prompt
     if payload.model_override is not None:
+        _validate_model_override_for_persistence(payload.model_override, user)
         bot.model_override = payload.model_override
     bot_manager.save_bot(bot)
     return {"success": True, "bot": _format_bot_response(bot)}
 
 
-@router.delete("/bots/{bot_id}")
+@router.delete("/bots/{bot_id}", dependencies=[Depends(require_bot_definition_editor)])
 def delete_bot(bot_id: str):
     """删除智能体并彻底清理相关数据与运行任务"""
     if bot_id == "default_assistant":
@@ -598,27 +631,28 @@ def delete_bot(bot_id: str):
 # -------------------------------------------------------------
 # 会话与 SSE 流式对话
 # -------------------------------------------------------------
-@router.get("/bots/{bot_id}/history")
+@router.get("/bots/{bot_id}/history", dependencies=[Depends(require_bot_access)])
 def get_bot_history(
     bot_id: str,
     limit: int = Query(default=50, ge=1, le=500),
-    before_id: Optional[str] = Query(default=None)
+    before_id: Optional[str] = Query(default=None),
+    user: CurrentUser = Depends(current_user)
 ):
     """获取会话历史（支持根据 before_id 向上分页加载更早历史会话）"""
-    return bot_manager.get_history_paged(bot_id, limit=limit, before_id=before_id)
+    return bot_manager.get_history_paged(bot_id, limit=limit, before_id=before_id, user_id=user.subject)
 
 
-@router.delete("/bots/{bot_id}/history")
-def clear_bot_history(bot_id: str, delete_files: bool = Query(default=True)):
+@router.delete("/bots/{bot_id}/history", dependencies=[Depends(require_bot_access)])
+def clear_bot_history(bot_id: str, delete_files: bool = Query(default=True), user: CurrentUser = Depends(current_user)):
     """清空会话历史并同步清理物理磁盘上的上传附件"""
-    bot_manager.clear_history(bot_id, delete_files=delete_files)
+    bot_manager.clear_history(bot_id, delete_files=delete_files, user_id=user.subject)
     return {"success": True}
 
 
-@router.post("/bots/{bot_id}/files/cleanup")
-def cleanup_bot_files(bot_id: str):
+@router.post("/bots/{bot_id}/files/cleanup", dependencies=[Depends(require_bot_access)])
+def cleanup_bot_files(bot_id: str, user: CurrentUser = Depends(current_user)):
     """主动扫描并清理未在历史消息中引用的孤儿文件"""
-    deleted = bot_manager.cleanup_unreferenced_files(bot_id)
+    deleted = bot_manager.cleanup_unreferenced_files(bot_id, user_id=user.subject)
     return {"success": True, "cleaned_count": deleted}
 
 
@@ -640,19 +674,35 @@ def _stream_run_sse(run: AgentRun):
                 return
 
             # 2. 持续等待新事件产生并流式传输
+            terminal_events = {"done", "error", "stopped"}
+            terminal_status = {"done", "error", "stopped"}
+
+            def render_event(event_obj: dict) -> tuple[str, str]:
+                evt_name = event_obj.get("event", "message")
+                data_str = json.dumps(event_obj.get("data", {}), ensure_ascii=False)
+                return evt_name, f"event: {evt_name}\ndata: {data_str}\n\n"
+
             while True:
                 try:
                     event_obj = await asyncio.wait_for(queue.get(), timeout=1.0)
-                    evt_name = event_obj.get("event", "message")
-                    data_str = json.dumps(event_obj.get("data", {}), ensure_ascii=False)
-                    yield f"event: {evt_name}\ndata: {data_str}\n\n"
-                    if evt_name in ("done", "error") or run.status in ("done", "error", "stopped"):
-                        break
                 except TimeoutError:
-                    if run.status in ("done", "error", "stopped"):
+                    if run.status not in terminal_status:
+                        yield ": ping\n\n"
+                        continue
+                    while True:
+                        try:
+                            event_obj = queue.get_nowait()
+                        except asyncio.QueueEmpty:
+                            return
+                        evt_name, payload = render_event(event_obj)
+                        yield payload
+                        if evt_name in terminal_events:
+                            return
+                else:
+                    evt_name, payload = render_event(event_obj)
+                    yield payload
+                    if evt_name in terminal_events:
                         break
-                    # 心跳保活
-                    yield f": ping\n\n"
         finally:
             run.unregister_subscriber(sub)
 
@@ -668,12 +718,12 @@ def _stream_run_sse(run: AgentRun):
 
 
 @router.get("/active-runs")
-def list_all_active_runs():
-    """批量查询所有智能体当前活跃运行状态（供前端多智能体列表状态指示使用）"""
-    return {"active_runs": agent_run_manager.list_active_runs()}
+def list_all_active_runs(user: CurrentUser = Depends(current_user)):
+    """查询当前用户活跃运行状态，管理员也只返回自己的运行状态。"""
+    return {"active_runs": agent_run_manager.list_active_runs(user.subject)}
 
 
-@router.post("/bots/{bot_id}/upload")
+@router.post("/bots/{bot_id}/upload", dependencies=[Depends(require_bot_access)])
 async def upload_bot_file(
     bot_id: str,
     file: UploadFile = File(...)
@@ -687,7 +737,8 @@ async def upload_bot_file(
     if not bot:
         raise HTTPException(status_code=404, detail="BOT 不存在")
 
-    bot_dir = bot_manager._bot_dir(bot_id)
+    bot_manager.ensure_legacy_state(bot_id)
+    bot_dir = bot_manager._runtime_dir(bot_id)
     uploads_dir = os.path.join(bot_dir, "uploads")
     try:
         os.makedirs(uploads_dir, exist_ok=True)
@@ -744,17 +795,30 @@ async def upload_bot_file(
     }
 
 
-@router.api_route("/files/{bot_id}/{filename}", methods=["GET", "HEAD"])
-@router.api_route("/bots/{bot_id}/files/{filename}", methods=["GET", "HEAD"])
+@router.api_route("/files/{bot_id}/{filename}", methods=["GET", "HEAD"], dependencies=[Depends(require_bot_access)])
+@router.api_route("/bots/{bot_id}/files/{filename}", methods=["GET", "HEAD"], dependencies=[Depends(require_bot_access)])
 def get_bot_file(bot_id: str, filename: str, download: bool = Query(default=False)):
     """在线预览或下载智能体已上传的文件或生成的文件（支持原文件名或前缀哈希名双向匹配）"""
-    bot_dir = bot_manager._bot_dir(bot_id)
+    bot_manager.ensure_legacy_state(bot_id)
+    bot_dir = bot_manager._runtime_dir(bot_id)
     uploads_dir = os.path.join(bot_dir, "uploads")
     safe_filename = os.path.basename(filename)
-    file_path = os.path.abspath(os.path.join(uploads_dir, safe_filename))
+    uploads_root = os.path.realpath(uploads_dir)
+
+    def confined_file_path(name: str) -> str | None:
+        """Resolve an upload member without allowing traversal or symlinks out."""
+        candidate = os.path.realpath(os.path.join(uploads_root, os.path.basename(str(name))))
+        try:
+            if os.path.commonpath([uploads_root, candidate]) != uploads_root:
+                return None
+        except ValueError:
+            return None
+        return candidate if os.path.isfile(candidate) else None
+
+    file_path = confined_file_path(safe_filename)
 
     # 1. 尝试直接路径匹配
-    if not (file_path.startswith(os.path.abspath(bot_dir)) and os.path.exists(file_path) and os.path.isfile(file_path)):
+    if file_path is None:
         candidate = None
         # 2. 优先从 history.json 中检索关联关系（避免同名不同批次文件混淆）
         hist_path = os.path.join(bot_dir, "history.json")
@@ -768,8 +832,8 @@ def get_bot_file(bot_id: str, filename: str, download: bool = Query(default=Fals
                             sn = att.get("saved_name", "")
                             # 匹配 url 后缀或者原始文件名
                             if (u.endswith(f"/{safe_filename}") or att.get("name") == safe_filename) and sn:
-                                sp = os.path.join(uploads_dir, sn)
-                                if os.path.isfile(sp):
+                                sp = confined_file_path(sn)
+                                if sp:
                                     candidate = sp
                                     break
                         if candidate:
@@ -787,46 +851,55 @@ def get_bot_file(bot_id: str, filename: str, download: bool = Query(default=Fals
             for fn in directory_entries:
 
                 if fn == safe_filename or fn.endswith(f"_{safe_filename}"):
-                    p = os.path.join(uploads_dir, fn)
-                    if os.path.isfile(p):
+                    p = confined_file_path(fn)
+                    if p:
                         matches.append((p, os.path.getmtime(p)))
             if matches:
                 matches.sort(key=lambda x: x[1], reverse=True)
                 candidate = matches[0][0]
 
-        if candidate and os.path.exists(candidate):
+        if candidate:
             file_path = candidate
         else:
             raise HTTPException(status_code=404, detail="文件不存在或已被移除")
 
     mime_type, _ = mimetypes.guess_type(file_path)
     # 图片、PDF、纯文本等格式支持浏览器直接预览
+    active_mime = mime_type in {
+        "text/html",
+        "application/xhtml+xml",
+        "image/svg+xml",
+        "application/javascript",
+    }
     is_previewable = bool(
         mime_type and (
             mime_type.startswith("image/")
-            or mime_type in ("application/pdf", "text/plain", "text/markdown", "text/html", "application/json")
+            or mime_type in ("application/pdf", "text/plain", "text/markdown", "application/json")
         )
     )
-    disposition = "attachment" if download else ("inline" if is_previewable else "attachment")
+    disposition = "attachment" if download or active_mime else ("inline" if is_previewable else "attachment")
+    media_type = "application/octet-stream" if active_mime else (mime_type or "application/octet-stream")
 
-    return FileResponse(
+    response = FileResponse(
         file_path,
-        media_type=mime_type or "application/octet-stream",
+        media_type=media_type,
         content_disposition_type=disposition,
         filename=safe_filename
     )
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    return response
 
 
-@router.get("/bots/{bot_id}/files")
-def list_bot_files(bot_id: str):
+@router.get("/bots/{bot_id}/files", dependencies=[Depends(require_bot_access)])
+def list_bot_files(bot_id: str, user: CurrentUser = Depends(current_user)):
     """产出物与文件管理中心：获取智能体所有上传与生成的文件清单"""
-    return {"files": bot_manager.list_bot_files(bot_id)}
+    return {"files": bot_manager.list_bot_files(bot_id, user_id=user.subject)}
 
 
-@router.delete("/bots/{bot_id}/files/{filename}")
-def delete_bot_file(bot_id: str, filename: str):
+@router.delete("/bots/{bot_id}/files/{filename}", dependencies=[Depends(require_bot_access)])
+def delete_bot_file(bot_id: str, filename: str, user: CurrentUser = Depends(current_user)):
     """删除智能体文件中心里的单个文件"""
-    ok = bot_manager.delete_bot_file(bot_id, filename)
+    ok = bot_manager.delete_bot_file(bot_id, filename, user_id=user.subject)
     if not ok:
         raise HTTPException(status_code=404, detail="文件不存在或删除失败")
     return {"success": True}
@@ -843,7 +916,7 @@ def _unique_archive_name(clean_name: str, used_names: set[str]) -> str:
     return arc_name
 
 
-@router.get("/bots/{bot_id}/files-export")
+@router.get("/bots/{bot_id}/files-export", dependencies=[Depends(require_bot_access)])
 def export_all_bot_files(bot_id: str):
     """一键打包下载智能体所有产出物与文件（ZIP 压缩流）"""
     import io
@@ -852,7 +925,8 @@ def export_all_bot_files(bot_id: str):
     if not bot:
         raise HTTPException(status_code=404, detail="BOT 不存在")
 
-    bot_dir = bot_manager._bot_dir(bot_id)
+    bot_manager.ensure_legacy_state(bot_id)
+    bot_dir = bot_manager._runtime_dir(bot_id)
     uploads_dir = os.path.join(bot_dir, "uploads")
     try:
         upload_names = os.listdir(uploads_dir) if os.path.exists(uploads_dir) else []
@@ -884,17 +958,17 @@ def export_all_bot_files(bot_id: str):
     )
 
 
-@router.get("/bots/{bot_id}/active-run")
-def get_bot_active_run(bot_id: str):
+@router.get("/bots/{bot_id}/active-run", dependencies=[Depends(require_bot_access)])
+def get_bot_active_run(bot_id: str, user: CurrentUser = Depends(current_user)):
     """查询指定智能体当前是否有正在进行的会话任务（用于页面刷新状态恢复）"""
-    run = agent_run_manager.get_active_run(bot_id)
+    run = agent_run_manager.get_active_run(bot_id, user.subject)
     if not run:
         return {"has_active_run": False, "run": None}
     return {"has_active_run": True, "run": run.to_dict()}
 
 
-@router.post("/bots/{bot_id}/chat")
-async def chat_with_bot_stream(bot_id: str, payload: ChatPayload):
+@router.post("/bots/{bot_id}/chat", dependencies=[Depends(require_bot_access)])
+async def chat_with_bot_stream(bot_id: str, payload: ChatPayload, user: CurrentUser = Depends(current_user)):
     """
     与指定 BOT 进行流式对话 (后台解耦执行，支持断线恢复与刷新重连)
     """
@@ -903,20 +977,30 @@ async def chat_with_bot_stream(bot_id: str, payload: ChatPayload):
         raise HTTPException(status_code=404, detail="BOT 不存在")
 
     # 启动/复用后台执行任务
-    raw_attachments = [a.model_dump() for a in payload.attachments] if payload.attachments else None
+    raw_attachments = []
+    for attachment in payload.attachments or []:
+        item = attachment.model_dump()
+        # The client-provided absolute path is untrusted.  ReadFileTool resolves
+        # the basename inside the server-owned uploads directory.
+        item["path"] = ""
+        raw_attachments.append(item)
+    raw_attachments = raw_attachments or None
     run = agent_run_manager.start_run(
         bot_id=bot_id,
         user_message=payload.message,
         engine=agent_engine,
         bot_manager=bot_manager,
         client_msg_id=payload.client_msg_id,
-        attachments=raw_attachments
+        attachments=raw_attachments,
+        user_id=user.subject,
+        is_admin=user.is_admin,
+        is_operator=user.is_operator,
     )
     return _stream_run_sse(run)
 
 
-@router.post("/bots/{bot_id}/regenerate")
-async def regenerate_bot_stream(bot_id: str):
+@router.post("/bots/{bot_id}/regenerate", dependencies=[Depends(require_bot_access)])
+async def regenerate_bot_stream(bot_id: str, user: CurrentUser = Depends(current_user)):
     """
     重新生成最后一条助手回复：
     弹出上一次助手回答，复用上一条用户 Prompt 及附件重新发起推理执行流
@@ -925,12 +1009,12 @@ async def regenerate_bot_stream(bot_id: str):
     if not bot:
         raise HTTPException(status_code=404, detail="BOT 不存在")
 
-    last_user = bot_manager.get_last_user_message(bot_id)
+    last_user = bot_manager.get_last_user_message(bot_id, user_id=user.subject)
     if not last_user:
         raise HTTPException(status_code=400, detail="当前暂无用户历史消息，无法重新生成")
 
     # 弹出上一次的助手回答
-    bot_manager.pop_last_assistant_message(bot_id)
+    bot_manager.pop_last_assistant_message(bot_id, user_id=user.subject)
 
     attachments = last_user.get("metadata", {}).get("attachments")
     run = agent_run_manager.start_run(
@@ -939,46 +1023,49 @@ async def regenerate_bot_stream(bot_id: str):
         engine=agent_engine,
         bot_manager=bot_manager,
         attachments=attachments,
-        skip_user_append=True
+        skip_user_append=True,
+        user_id=user.subject,
+        is_admin=user.is_admin,
+        is_operator=user.is_operator,
     )
     return _stream_run_sse(run)
 
 
-@router.post("/bots/{bot_id}/truncate-history")
-def truncate_bot_history(bot_id: str, payload: TruncateHistoryPayload):
+@router.post("/bots/{bot_id}/truncate-history", dependencies=[Depends(require_bot_access)])
+def truncate_bot_history(bot_id: str, payload: TruncateHistoryPayload, user: CurrentUser = Depends(current_user)):
     """截断会话历史至指定消息 ID（保留该消息及之前内容，用于编辑重发前的回滚）"""
-    ok = bot_manager.truncate_history(bot_id, payload.message_id)
+    ok = bot_manager.truncate_history(bot_id, payload.message_id, user_id=user.subject)
     if not ok:
         raise HTTPException(status_code=404, detail="未找到指定的消息 ID")
     return {"success": True}
 
 
-@router.get("/bots/{bot_id}/chat/stream")
-async def resume_chat_stream(bot_id: str):
+@router.get("/bots/{bot_id}/chat/stream", dependencies=[Depends(require_bot_access)])
+async def resume_chat_stream(bot_id: str, user: CurrentUser = Depends(current_user)):
     """断线恢复流：重连当前正在进行中的会话流"""
-    run = agent_run_manager.get_active_run(bot_id)
+    run = agent_run_manager.get_active_run(bot_id, user.subject)
     if not run:
         raise HTTPException(status_code=404, detail="当前无进行中的会话任务")
     return _stream_run_sse(run)
 
 
-@router.post("/bots/{bot_id}/stop")
-def stop_bot_chat(bot_id: str):
+@router.post("/bots/{bot_id}/stop", dependencies=[Depends(require_bot_access)])
+def stop_bot_chat(bot_id: str, user: CurrentUser = Depends(current_user)):
     """中断当前正在执行的会话任务"""
-    stopped = agent_run_manager.stop_run(bot_id)
+    stopped = agent_run_manager.stop_run(bot_id, user.subject)
     return {"success": stopped}
 
 
-@router.post("/bots/{bot_id}/approvals/{approval_id}")
-def resolve_bot_approval(bot_id: str, approval_id: str, payload: ApprovalDecisionPayload):
+@router.post("/bots/{bot_id}/approvals/{approval_id}", dependencies=[Depends(require_bot_access), Depends(require_operator)])
+def resolve_bot_approval(bot_id: str, approval_id: str, payload: ApprovalDecisionPayload, user: CurrentUser = Depends(require_operator)):
     """为指定智能体高危破坏性操作提交人机协同授权决策 (approve 或 reject)"""
-    ok = agent_run_manager.resolve_approval(bot_id, approval_id, payload.decision)
+    ok = agent_run_manager.resolve_approval(bot_id, approval_id, payload.decision, user.subject)
     if not ok:
         raise HTTPException(status_code=404, detail="未找到对应的待审批高危操作或已超时关闭")
     return {"success": True, "approval_id": approval_id, "decision": payload.decision}
 
 
-@router.get("/bots/{bot_id}/export")
+@router.get("/bots/{bot_id}/export", dependencies=[Depends(require_bot_access)])
 def export_bot_chat(
     bot_id: str,
     format: str = Query(default="markdown"),
@@ -1313,20 +1400,20 @@ def export_bot_chat(
 # -------------------------------------------------------------
 # 长期记忆管理 (Memory)
 # -------------------------------------------------------------
-@router.get("/bots/{bot_id}/memory")
+@router.get("/bots/{bot_id}/memory", dependencies=[Depends(require_bot_access)])
 def list_bot_memories(bot_id: str):
     """获取指定 BOT 的长期记忆"""
     return {"memories": [m.model_dump() for m in bot_manager.list_memories(bot_id)]}
 
 
-@router.post("/bots/{bot_id}/memory")
+@router.post("/bots/{bot_id}/memory", dependencies=[Depends(require_bot_access)])
 def add_or_update_memory(bot_id: str, payload: MemoryPayload):
     """保存或更新长期记忆"""
     item = bot_manager.save_memory(bot_id, payload.key, payload.content)
     return {"success": True, "memory": item.model_dump()}
 
 
-@router.delete("/bots/{bot_id}/memory/{key}")
+@router.delete("/bots/{bot_id}/memory/{key}", dependencies=[Depends(require_bot_access)])
 def delete_memory(bot_id: str, key: str):
     """删除长期记忆"""
     ok = bot_manager.delete_memory(bot_id, key)
@@ -1336,7 +1423,7 @@ def delete_memory(bot_id: str, key: str):
 # -------------------------------------------------------------
 # 提示词自我增强管理 (Prompt Self-Enhancement)
 # -------------------------------------------------------------
-@router.get("/bots/{bot_id}/guidelines")
+@router.get("/bots/{bot_id}/guidelines", dependencies=[Depends(require_bot_access)])
 def list_bot_guidelines(bot_id: str):
     """获取指定 BOT 的提示词自我强化准则"""
     bot = bot_manager.get_bot(bot_id)
@@ -1345,7 +1432,7 @@ def list_bot_guidelines(bot_id: str):
     return {"guidelines": [g.model_dump() for g in bot.learned_guidelines]}
 
 
-@router.post("/bots/{bot_id}/guidelines")
+@router.post("/bots/{bot_id}/guidelines", dependencies=[Depends(require_bot_definition_editor)])
 def add_guideline(bot_id: str, payload: GuidelinePayload):
     """手动或代添加行为准则"""
     g = bot_manager.add_learned_guideline(bot_id, payload.instruction, payload.reason or "")
@@ -1354,7 +1441,7 @@ def add_guideline(bot_id: str, payload: GuidelinePayload):
     return {"success": True, "guideline": g.model_dump()}
 
 
-@router.delete("/bots/{bot_id}/guidelines/{guideline_id}")
+@router.delete("/bots/{bot_id}/guidelines/{guideline_id}", dependencies=[Depends(require_bot_definition_editor)])
 def delete_guideline(bot_id: str, guideline_id: str):
     """删除某条增强准则"""
     ok = bot_manager.remove_learned_guideline(bot_id, guideline_id)
@@ -1364,14 +1451,14 @@ def delete_guideline(bot_id: str, guideline_id: str):
 # -------------------------------------------------------------
 # 自编技能库管理 (Skills)
 # -------------------------------------------------------------
-@router.get("/bots/{bot_id}/skills")
+@router.get("/bots/{bot_id}/skills", dependencies=[Depends(require_bot_access)])
 def list_bot_skills(bot_id: str):
     """获取指定 BOT 沉淀的技能列表"""
     skills = bot_manager.list_skills(bot_id)
     return {"skills": [s.model_dump() for s in skills]}
 
 
-@router.post("/bots/{bot_id}/skills")
+@router.post("/bots/{bot_id}/skills", dependencies=[Depends(require_bot_definition_editor)])
 def create_or_save_skill(bot_id: str, payload: SaveSkillPayload):
     """用户或前端一键将验证通过的脚本沉淀为专属技能"""
     bot = bot_manager.get_bot(bot_id)
@@ -1387,7 +1474,7 @@ def create_or_save_skill(bot_id: str, payload: SaveSkillPayload):
     return {"success": True, "skill": skill.model_dump()}
 
 
-@router.get("/bots/{bot_id}/skills/{name}")
+@router.get("/bots/{bot_id}/skills/{name}", dependencies=[Depends(require_bot_access)])
 def get_bot_skill(bot_id: str, name: str):
     """获取指定技能代码与入参"""
     skill = bot_manager.get_skill(bot_id, name)
@@ -1396,8 +1483,8 @@ def get_bot_skill(bot_id: str, name: str):
     return {"skill": skill.model_dump()}
 
 
-@router.post("/bots/{bot_id}/skills/{name}/run")
-def run_bot_skill(bot_id: str, name: str, payload: RunSkillPayload):
+@router.post("/bots/{bot_id}/skills/{name}/run", dependencies=[Depends(require_bot_access), Depends(require_operator)])
+def run_bot_skill(bot_id: str, name: str, payload: RunSkillPayload, _user=Depends(require_operator)):
     """手动测试运行某个技能"""
     tim_client = TimClient()
     from core.agent.tools import RunSkillTool
@@ -1412,8 +1499,20 @@ def run_bot_skill(bot_id: str, name: str, payload: RunSkillPayload):
     def approve_specific_high_risk_call(approval: dict) -> str:
         if not payload.confirm_high_risk:
             return "reject"
-        api_path = str(approval.get("api_path", "")).strip().lower()
-        return "approve" if api_path in approved_paths else "reject"
+        api_path = str(approval.get("api_path", "")).strip()
+        api_meta = resolve_api(api_path)
+        accepted = matching_confirmation_paths(api_path, api_meta)
+        accepted.update(
+            str(item).strip().lower()
+            for item in (approval.get("api_paths") or [])
+            if str(item).strip()
+        )
+        accepted.update(
+            str(approval.get(key, "")).strip().lower()
+            for key in ("api_id", "canonical_action")
+            if str(approval.get(key, "")).strip()
+        )
+        return "approve" if accepted & approved_paths else "reject"
 
     runner = RunSkillTool(
         bot_id,
@@ -1425,7 +1524,7 @@ def run_bot_skill(bot_id: str, name: str, payload: RunSkillPayload):
     return res
 
 
-@router.delete("/bots/{bot_id}/skills/{name}")
+@router.delete("/bots/{bot_id}/skills/{name}", dependencies=[Depends(require_bot_definition_editor)])
 def delete_bot_skill(bot_id: str, name: str):
     """删除技能"""
     ok = bot_manager.delete_skill(bot_id, name)
@@ -1435,7 +1534,7 @@ def delete_bot_skill(bot_id: str, name: str):
 # -------------------------------------------------------------
 # 企业知识库与运维手册挂载 (Lightweight RAG)
 # -------------------------------------------------------------
-@router.get("/bots/{bot_id}/knowledge/docs")
+@router.get("/bots/{bot_id}/knowledge/docs", dependencies=[Depends(require_bot_definition_editor)])
 def list_bot_knowledge_docs(bot_id: str):
     """获取指定智能体挂载的所有企业知识库与手册文档"""
     bot = bot_manager.get_bot(bot_id)
@@ -1445,7 +1544,7 @@ def list_bot_knowledge_docs(bot_id: str):
     return {"docs": docs}
 
 
-@router.post("/bots/{bot_id}/knowledge/upload")
+@router.post("/bots/{bot_id}/knowledge/upload", dependencies=[Depends(require_bot_definition_editor)])
 async def upload_bot_knowledge_doc(
     bot_id: str,
     file: UploadFile = File(...)
@@ -1467,7 +1566,11 @@ async def upload_bot_knowledge_doc(
     if not content:
         raise HTTPException(status_code=400, detail="上传文件内容为空")
 
-    doc_meta = await run_in_threadpool(rag_manager.add_document, bot_id, filename, content)
+    try:
+        doc_meta = await run_in_threadpool(rag_manager.add_document, bot_id, filename, content)
+    except Exception as exc:
+        logger.warning("Knowledge document indexing failed for bot %s: %s", bot_id, exc)
+        raise HTTPException(status_code=422, detail=f"知识库文档无法建立索引: {exc}") from exc
     return {
         "success": True,
         "message": f"文档《{filename}》已成功挂载并构建 RAG 索引（生成 {doc_meta.get('chunks_count')} 个检索切片）",
@@ -1475,7 +1578,7 @@ async def upload_bot_knowledge_doc(
     }
 
 
-@router.put("/bots/{bot_id}/knowledge/docs/{doc_id}")
+@router.put("/bots/{bot_id}/knowledge/docs/{doc_id}", dependencies=[Depends(require_bot_definition_editor)])
 def update_bot_knowledge_doc(bot_id: str, doc_id: str, payload: ToggleKnowledgePayload):
     """启用或禁用某篇文档参与 RAG 语义检索"""
     ok = rag_manager.toggle_document(bot_id, doc_id, payload.enabled)
@@ -1484,7 +1587,7 @@ def update_bot_knowledge_doc(bot_id: str, doc_id: str, payload: ToggleKnowledgeP
     return {"success": True}
 
 
-@router.delete("/bots/{bot_id}/knowledge/docs/{doc_id}")
+@router.delete("/bots/{bot_id}/knowledge/docs/{doc_id}", dependencies=[Depends(require_bot_definition_editor)])
 def delete_bot_knowledge_doc(bot_id: str, doc_id: str):
     """删除挂载的知识文档及其索引切片"""
     ok = rag_manager.delete_document(bot_id, doc_id)
@@ -1493,7 +1596,7 @@ def delete_bot_knowledge_doc(bot_id: str, doc_id: str):
     return {"success": True}
 
 
-@router.post("/bots/{bot_id}/knowledge/search")
+@router.post("/bots/{bot_id}/knowledge/search", dependencies=[Depends(require_bot_definition_editor)])
 def test_search_bot_knowledge(bot_id: str, payload: SearchKnowledgePayload):
     """在线检索与召回调试：测试特定问题在知识库中的命中结果与匹配分数"""
     results = rag_manager.search(
@@ -1509,7 +1612,7 @@ def test_search_bot_knowledge(bot_id: str, payload: SearchKnowledgePayload):
     }
 
 
-@router.get("/bots/{bot_id}/knowledge/docs/{doc_id}/download")
+@router.get("/bots/{bot_id}/knowledge/docs/{doc_id}/download", dependencies=[Depends(require_bot_definition_editor)])
 def download_knowledge_doc(bot_id: str, doc_id: str):
     """下载知识库原始文件"""
     path = rag_manager.get_document_file_path(bot_id, doc_id)
@@ -1527,17 +1630,17 @@ def download_knowledge_doc(bot_id: str, doc_id: str):
 # -------------------------------------------------------------
 # 多智能体协同网络拓扑与流转观测 (Agent Orchestration Topology)
 # -------------------------------------------------------------
-@router.get("/topology")
+@router.get("/topology", dependencies=[Depends(require_admin)])
 def get_orchestration_topology():
     """获取系统全局多智能体协同网络拓扑（节点、流转链路、调用频次与近期协同事件）"""
     topology = bot_manager.get_orchestration_topology()
     return topology
 
 
-@router.get("/bots/{bot_id}/orchestrations")
-def get_bot_orchestrations(bot_id: str, limit: int = Query(default=20, ge=1, le=100)):
-    """获取与指定智能体相关的协同调用流水"""
-    all_events = bot_manager.get_orchestrations(limit=200)
+@router.get("/bots/{bot_id}/orchestrations", dependencies=[Depends(require_bot_access)])
+def get_bot_orchestrations(bot_id: str, limit: int = Query(default=20, ge=1, le=100), user: CurrentUser = Depends(current_user)):
+    """获取当前用户可见的协同调用流水；管理员可查看全局记录。"""
+    all_events = bot_manager.get_orchestrations(limit=200, user_id=user.subject, is_admin=user.is_admin)
     related = [e for e in all_events if e.get("caller_bot_id") == bot_id or e.get("target_bot_id") == bot_id]
     return {"orchestrations": related[:limit]}
 

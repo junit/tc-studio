@@ -187,6 +187,7 @@ def _write_config_unlocked(new_config: dict) -> dict:
             json.dump(disk_data, temp_file, ensure_ascii=False, indent=2)
             temp_file.flush()
             os.fsync(temp_file.fileno())
+        os.chmod(temp_path, 0o600)
         os.replace(temp_path, CONFIG_PATH)
         temp_path = None
     finally:

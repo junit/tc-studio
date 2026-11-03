@@ -8,34 +8,22 @@ import {
   Plus,
   Trash2,
   Edit3,
-  Code2,
-  Terminal,
   Brain,
   Zap,
   Settings,
   AtSign,
-  ChevronDown,
-  ChevronRight,
   RefreshCw,
   Copy,
   Check,
-  AlertCircle,
   Shield,
-  Layers,
   Search,
   ExternalLink,
-  MessageSquare,
   History,
-  Info,
   Key,
   Server,
   ArrowRight,
-  Activity,
   FileText,
   Lock,
-  Unlock,
-  Clock,
-  User,
   ArrowDown,
   CheckCircle2,
   Loader2,
@@ -57,22 +45,23 @@ import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { useApiStore } from '@/stores/apiStore'
 import { MarkdownView } from '@/components/common/MarkdownView'
+import { AuthenticatedImage } from '@/components/common/AuthenticatedImage'
+import { downloadWithAuth, openWithAuth } from '@/lib/auth'
 import {
   AgentExecutionRun,
   buildAgentRunFromMessage,
 } from './agent/AgentMessageCards'
 import { AgentTopologyViewer } from '@/components/agent/AgentTopologyViewer'
+import type { OrchestrationEvent } from '@/components/agent/AgentTopologyViewer'
 import { ConsentGateCard, ApprovalData } from './agent/ConsentGateCard'
 import { AgentPromptTab } from './agent/drawer/AgentPromptTab'
 import { AgentGuidelinesTab } from './agent/drawer/AgentGuidelinesTab'
 import { AgentSkillsTab } from './agent/drawer/AgentSkillsTab'
 import { AgentMemoryTab } from './agent/drawer/AgentMemoryTab'
-import { AgentFilesTab } from './agent/drawer/AgentFilesTab'
+import { AgentFilesTab as FilesTab } from './agent/drawer/AgentFilesTab'
 import { AgentKnowledgeTab } from './agent/drawer/AgentKnowledgeTab'
+import type { SkillItem } from './agent/drawer/types'
 import {
-  LearnedGuideline,
-  SkillItem,
-  MemoryItem,
   BotSummary,
   BotFileItem,
   KnowledgeDoc,
@@ -93,10 +82,24 @@ interface AttachmentData {
   data_url?: string
   summary?: string
   preview?: string
-  meta?: Record<string, any>
+  meta?: Record<string, unknown>
 }
 
 
+interface MessageMetrics {
+  elapsed_seconds?: number
+  input_tokens?: number
+  output_tokens?: number
+  total_tokens?: number
+  code_executions?: number
+  model?: string
+}
+
+interface ChatMetadata {
+  orchestrations?: OrchestrationEvent[]
+  metrics?: MessageMetrics
+  [key: string]: unknown
+}
 interface ChatMessage {
   id: string
   role: 'user' | 'assistant'
@@ -108,7 +111,7 @@ interface ChatMessage {
   pendingApproval?: ApprovalData
   toolCalls?: Array<{ step: number; output: string }>
   orchestrations?: any[]
-  metadata?: Record<string, any>
+  metadata?: ChatMetadata
   isStreaming?: boolean
   streamStatus?: 'thinking' | 'coding' | 'executing' | 'answering' | 'done' | 'error' | 'waiting_approval'
   currentStep?: number
@@ -203,7 +206,6 @@ export const AgentPanel: React.FC = () => {
   const [bots, setBots] = useState<BotSummary[]>([])
   const [activeBotId, setActiveBotId] = useState<string>('default_assistant')
   const [activeBot, setActiveBot] = useState<any>(null)
-  const [isLoadingBot, setIsLoadingBot] = useState<boolean>(false)
 
   // 智能体业务域筛选（全部 / 当前业务专属 / 通用）
   const [botDomainFilter, setBotDomainFilter] = useState<'all' | 'current' | 'general'>('all')
@@ -248,14 +250,41 @@ export const AgentPanel: React.FC = () => {
   const [inputMessage, setInputMessage] = useState<string>('')
   const [isGenerating, setIsGenerating] = useState<boolean>(false)
   const abortControllerRef = useRef<AbortController | null>(null)
+  const activeBotIdRef = useRef(activeBotId)
+  const botRequestEpochRef = useRef(0)
+  const isCurrentBotRequest = (botId: string, epoch: number) =>
+    activeBotIdRef.current === botId && botRequestEpochRef.current === epoch
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const messagesContainerRef = useRef<HTMLDivElement>(null)
-  const [isUserScrolledUp, setIsUserScrolledUp] = useState<boolean>(false)
   const [showScrollBottom, setShowScrollBottom] = useState<boolean>(false)
-  const [liveElapsed, setLiveElapsed] = useState<number>(0)
 
   // 附件上传状态
   const [attachedFiles, setAttachedFiles] = useState<AttachmentData[]>([])
+  // 本地预览 Blob URL 登记：移除附件/卸载组件时统一 revoke，避免内存泄漏
+  const localPreviewUrlsRef = useRef<Set<string>>(new Set())
+  const revokeLocalPreviewUrl = (url?: string) => {
+    if (url && url.startsWith('blob:') && localPreviewUrlsRef.current.delete(url)) {
+      URL.revokeObjectURL(url)
+    }
+  }
+  const revokeDetachedPreviewUrls = (nextMessages: Array<{ attachments?: AttachmentData[] }>) => {
+    const retained = new Set<string>()
+    for (const message of nextMessages) {
+      for (const attachment of message.attachments || []) {
+        if (attachment.data_url?.startsWith('blob:')) retained.add(attachment.data_url)
+      }
+    }
+    for (const url of [...localPreviewUrlsRef.current]) {
+      if (!retained.has(url)) revokeLocalPreviewUrl(url)
+    }
+  }
+  useEffect(() => {
+    const tracked = localPreviewUrlsRef.current
+    return () => {
+      tracked.forEach((url) => URL.revokeObjectURL(url))
+      tracked.clear()
+    }
+  }, [])
   const [isUploadingFile, setIsUploadingFile] = useState<boolean>(false)
   const [isDraggingOver, setIsDraggingOver] = useState<boolean>(false)
   const fileInputRef = useRef<HTMLInputElement>(null)
@@ -273,7 +302,7 @@ export const AgentPanel: React.FC = () => {
           setActiveRunsMap(data.active_runs)
         }
       }
-    } catch (e) {
+    } catch {
       // 忽略短暂网络闪断
     }
   }, [])
@@ -299,7 +328,10 @@ export const AgentPanel: React.FC = () => {
         if (file.type.startsWith('image/')) {
           try {
             localPreviewUrl = URL.createObjectURL(file)
-          } catch (_) {}
+            localPreviewUrlsRef.current.add(localPreviewUrl)
+          } catch (error) {
+            console.warn('Failed to create local preview URL', error)
+          }
         }
 
         const formData = new FormData()
@@ -319,8 +351,11 @@ export const AgentPanel: React.FC = () => {
               },
             ])
             showToast({ type: 'success', message: `已成功解析附件「${file.name}」` }, 2500)
+          } else {
+            revokeLocalPreviewUrl(localPreviewUrl)
           }
         } else {
+          revokeLocalPreviewUrl(localPreviewUrl)
           showToast({ type: 'error', message: `文件「${file.name}」上传失败` }, 3500)
         }
       }
@@ -368,20 +403,6 @@ export const AgentPanel: React.FC = () => {
     }
   }
 
-  // 监听流式生成过程的计时器
-  useEffect(() => {
-    let timer: any = null
-    if (isGenerating) {
-      const start = Date.now()
-      timer = setInterval(() => {
-        setLiveElapsed(Number(((Date.now() - start) / 1000).toFixed(1)))
-      }, 100)
-    } else {
-      setLiveElapsed(0)
-    }
-    return () => clearInterval(timer)
-  }, [isGenerating])
-
   // 滚动位置管理：流式吸底与用户自由翻阅保护
   const userScrolledUpRef = useRef<boolean>(false)
   const isProgrammaticScrollRef = useRef<boolean>(false)
@@ -392,7 +413,6 @@ export const AgentPanel: React.FC = () => {
     if (e.deltaY < 0) {
       // 只要用户向上滚轮，立即解除吸底跟随，允许向上查阅历史
       userScrolledUpRef.current = true
-      setIsUserScrolledUp(true)
     } else if (e.deltaY > 0) {
       // 用户向下滚轮：检查是否已接近底部 (<= 40px)
       const el = messagesContainerRef.current
@@ -400,7 +420,6 @@ export const AgentPanel: React.FC = () => {
         const dist = el.scrollHeight - el.scrollTop - el.clientHeight
         if (dist <= 40) {
           userScrolledUpRef.current = false
-          setIsUserScrolledUp(false)
           setShowScrollBottom(false)
         }
       }
@@ -427,10 +446,8 @@ export const AgentPanel: React.FC = () => {
     // 1. 焦点跟随控制：向上滑动暂停跟随；滑至底部 (<= 40px) 恢复跟随
     if (isScrollingUp) {
       userScrolledUpRef.current = true
-      setIsUserScrolledUp(true)
     } else if (distanceFromBottom <= 40) {
       userScrolledUpRef.current = false
-      setIsUserScrolledUp(false)
     }
 
     // 2. 浮动“直达最新”按钮防抖迟滞区间 (Hysteresis):
@@ -512,9 +529,8 @@ export const AgentPanel: React.FC = () => {
     }
   }
 
-  const scrollToBottom = (behavior: ScrollBehavior = 'auto') => {
+  const scrollToBottom = () => {
     userScrolledUpRef.current = false
-    setIsUserScrolledUp(false)
     setShowScrollBottom(false)
     const el = messagesContainerRef.current
     if (el) {
@@ -610,7 +626,7 @@ export const AgentPanel: React.FC = () => {
   const [isLoadingFiles, setIsLoadingFiles] = useState<boolean>(false)
   const [isCleaningFiles, setIsCleaningFiles] = useState<boolean>(false)
 
-  const fetchBotFiles = useCallback(async (botId?: string) => {
+  const fetchBotFiles = useCallback(async (botId?: string, requestEpoch = botRequestEpochRef.current) => {
     const targetId = botId || activeBotId
     if (!targetId) return
     setIsLoadingFiles(true)
@@ -618,12 +634,12 @@ export const AgentPanel: React.FC = () => {
       const res = await fetch(`/api/agent/bots/${targetId}/files`)
       if (res.ok) {
         const data = await res.json()
-        setBotFiles(data.files || [])
+        if (isCurrentBotRequest(targetId, requestEpoch)) setBotFiles(data.files || [])
       }
     } catch (e) {
       console.error('Failed to fetch bot files', e)
     } finally {
-      setIsLoadingFiles(false)
+      if (isCurrentBotRequest(targetId, requestEpoch)) setIsLoadingFiles(false)
     }
   }, [activeBotId])
 
@@ -665,7 +681,9 @@ export const AgentPanel: React.FC = () => {
   }
 
   const handleExportAllFiles = () => {
-    window.open(`/api/agent/bots/${activeBotId}/files-export`, '_blank')
+    downloadWithAuth(`/api/agent/bots/${activeBotId}/files-export`, `${activeBotId}_files.zip`).catch((error) =>
+      showToast({ type: 'error', message: error.message || '下载失败' })
+    )
   }
 
   // 资产右侧抽屉 / Tab
@@ -698,7 +716,7 @@ export const AgentPanel: React.FC = () => {
   const knowledgeFileInputRef = useRef<HTMLInputElement>(null)
 
   // 获取知识库文档
-  const fetchKnowledgeDocs = useCallback(async (botId?: string) => {
+  const fetchKnowledgeDocs = useCallback(async (botId?: string, requestEpoch = botRequestEpochRef.current) => {
     const targetId = botId || activeBotId
     if (!targetId) return
     try {
@@ -706,12 +724,12 @@ export const AgentPanel: React.FC = () => {
       const res = await fetch(`/api/agent/bots/${targetId}/knowledge/docs`)
       if (res.ok) {
         const data = await res.json()
-        setKnowledgeDocs(data.docs || [])
+        if (isCurrentBotRequest(targetId, requestEpoch)) setKnowledgeDocs(data.docs || [])
       }
     } catch (e) {
       console.error('Failed to fetch knowledge docs:', e)
     } finally {
-      setIsLoadingKnowledge(false)
+      if (isCurrentBotRequest(targetId, requestEpoch)) setIsLoadingKnowledge(false)
     }
   }, [activeBotId])
 
@@ -941,16 +959,15 @@ export const AgentPanel: React.FC = () => {
       showToast({ type: 'info', message: '当前会话暂无记录可供预览' })
       return
     }
-    window.open(`/api/agent/bots/${activeBotId}/export?format=html&preview=true`, '_blank')
+    openWithAuth(`/api/agent/bots/${activeBotId}/export?format=html&preview=true`).catch((error) =>
+      showToast({ type: 'error', message: error.message || '预览失败' })
+    )
   }
 
   // 编辑智能体资料弹窗 (名称、头像、描述)
   const [isEditProfileModalOpen, setIsEditProfileModalOpen] = useState<boolean>(false)
   const [editProfileData, setEditProfileData] = useState({ name: '', avatar: '🤖', description: '' })
   const [isSavingProfile, setIsSavingProfile] = useState<boolean>(false)
-
-  // 思考与溯源折叠状态：流式运行中默认展开看思考，完成后默认折叠聚焦最终回答
-  const [expandedTraceMap, setExpandedTraceMap] = useState<Record<string, boolean>>({})
 
   // 复制反馈
   const [copiedCodeId, setCopiedCodeId] = useState<string | null>(null)
@@ -972,6 +989,29 @@ export const AgentPanel: React.FC = () => {
 
   // 模型配置
   const [isModelModalOpen, setIsModelModalOpen] = useState<boolean>(false)
+
+  const [ownershipSubject, setOwnershipSubject] = useState('')
+
+  const handleTransferOwnership = async () => {
+    const subject = ownershipSubject.trim()
+    if (!activeBotId || !subject) return
+    try {
+      const res = await fetch(`/api/agent/bots/${activeBotId}/ownership`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ owner_id: subject }),
+      })
+      const data = await res.json()
+      if (!res.ok) throw new Error(data.detail || '转移失败')
+      showToast({ type: 'success', message: 'BOT 所有权已转移' })
+      setOwnershipSubject('')
+      await fetchBots()
+      await loadBotDetails(activeBotId)
+    } catch (error: any) {
+      showToast({ type: 'error', message: error.message || '转移失败' })
+    }
+  }
+
 
   // 二次确认删除智能体弹窗
   const [isDeleteConfirmModalOpen, setIsDeleteConfirmModalOpen] = useState<boolean>(false)
@@ -998,6 +1038,15 @@ export const AgentPanel: React.FC = () => {
   const [availableModels, setAvailableModels] = useState<string[]>([])
   const [isFetchingModels, setIsFetchingModels] = useState<boolean>(false)
   const [modelFetchMsg, setModelFetchMsg] = useState<{ type: 'success' | 'warn'; text: string } | null>(null)
+  const [isAdminUser, setIsAdminUser] = useState(false)
+
+  useEffect(() => {
+    fetch('/api/auth/me')
+      .then((response) => response.ok ? response.json() : null)
+      .then((data) => setIsAdminUser(Boolean(data?.is_admin)))
+      .catch(() => setIsAdminUser(false))
+  }, [])
+
 
   const fetchAvailableModels = async (showNotification = false, overrideConfig?: Partial<LLMConfigData>) => {
     setIsFetchingModels(true)
@@ -1071,13 +1120,15 @@ export const AgentPanel: React.FC = () => {
   // 切换 BOT 时拉取详情与历史
   useEffect(() => {
     if (activeBotId) {
+      activeBotIdRef.current = activeBotId
+      const requestEpoch = ++botRequestEpochRef.current
       if (abortControllerRef.current) {
         abortControllerRef.current.abort()
         abortControllerRef.current = null
       }
       setIsGenerating(false)
-      loadBotDetails(activeBotId)
-      loadBotHistory(activeBotId)
+      loadBotDetails(activeBotId, requestEpoch)
+      loadBotHistory(activeBotId, requestEpoch)
     }
   }, [activeBotId])
 
@@ -1144,20 +1195,21 @@ export const AgentPanel: React.FC = () => {
     }
   }
 
-  const loadBotDetails = async (botId: string) => {
-    setIsLoadingBot(true)
+  const loadBotDetails = async (botId: string, requestEpoch = botRequestEpochRef.current) => {
     try {
       const res = await fetch(`/api/agent/bots/${botId}`)
       const data = await res.json()
-      if (data.bot) {
+      if (data.bot && isCurrentBotRequest(botId, requestEpoch)) {
         setActiveBot(data.bot)
       }
-      fetchBotFiles(botId)
-      fetchKnowledgeDocs(botId)
+      if (isCurrentBotRequest(botId, requestEpoch)) {
+        fetchBotFiles(botId, requestEpoch)
+        fetchKnowledgeDocs(botId, requestEpoch)
+      }
     } catch (e) {
       console.error('Failed to load bot details:', e)
     } finally {
-      setIsLoadingBot(false)
+      console.debug('Bot details loaded:', botId)
     }
   }
 
@@ -1171,6 +1223,7 @@ export const AgentPanel: React.FC = () => {
     const reader = response.body?.getReader()
     const decoder = new TextDecoder('utf-8')
     let buffer = ''
+    let terminalEventReceived = false
 
     if (!reader) throw new Error('无法读取响应流')
 
@@ -1178,6 +1231,7 @@ export const AgentPanel: React.FC = () => {
       while (true) {
         const { value, done } = await reader.read()
         if (done) break
+        if (abortControllerRef.current !== controller || activeBotIdRef.current !== botId) return
 
         buffer += decoder.decode(value, { stream: true })
         const lines = buffer.split('\n')
@@ -1186,6 +1240,7 @@ export const AgentPanel: React.FC = () => {
         let currentEvent = 'message'
 
         for (const line of lines) {
+          if (abortControllerRef.current !== controller || activeBotIdRef.current !== botId) return
           if (line.startsWith('event: ')) {
             currentEvent = line.slice(7).trim()
           } else if (line.startsWith('data: ')) {
@@ -1221,6 +1276,7 @@ export const AgentPanel: React.FC = () => {
                     if (r.current_step) updated.currentStep = r.current_step
                     if (r.pending_approval !== undefined) updated.pendingApproval = r.pending_approval
                     if (r.status === 'done' || r.status === 'error' || r.status === 'stopped') {
+                      terminalEventReceived = true
                       updated.isStreaming = false
                       updated.streamStatus = r.status === 'error' ? 'error' : 'done'
                       setActiveRunsMap((prev) => {
@@ -1390,6 +1446,7 @@ export const AgentPanel: React.FC = () => {
                       updated.content = text || updated.content
                     }
                   } else if (currentEvent === 'done') {
+                    terminalEventReceived = true
                     updated.isStreaming = false
                     updated.streamStatus = 'done'
                     if (payload.orchestrations) {
@@ -1417,6 +1474,7 @@ export const AgentPanel: React.FC = () => {
                     // 实时联动刷新右侧抽屉「产出物与文件中心」
                     fetchBotFiles(botId)
                   } else if (currentEvent === 'error') {
+                    terminalEventReceived = true
                     updated.isStreaming = false
                     updated.streamStatus = 'error'
                     updated.content = `❌ **执行遇到错误**: ${payload.error || '未知异常'}`
@@ -1438,6 +1496,23 @@ export const AgentPanel: React.FC = () => {
         }
       }
     } finally {
+      if (activeBotIdRef.current !== botId) return
+      if (!terminalEventReceived && !controller.signal.aborted) {
+        setMessages((prev) =>
+          prev.map((msg) => msg.id === assistantMsgId
+            ? {
+                ...msg,
+                isStreaming: false,
+                streamStatus: 'error',
+                content: `${msg.content || ''}\n\n❌ 连接意外中断，请重试。`.trim(),
+                codeBlocks: msg.codeBlocks?.map((c) =>
+                  c.status === 'running' ? { ...c, status: 'error' as const } : c
+                ),
+              }
+            : msg
+          )
+        )
+      }
       if (abortControllerRef.current === controller) {
         setIsGenerating(false)
         abortControllerRef.current = null
@@ -1459,7 +1534,11 @@ export const AgentPanel: React.FC = () => {
               streamStatus: msg.streamStatus === 'error' ? 'error' : 'done',
               elapsedSeconds: msg.elapsedSeconds || elapsed,
               codeBlocks: msg.codeBlocks?.map((c) =>
-                c.status === 'running' ? { ...c, status: 'success' as const } : c
+                !terminalEventReceived && c.status === 'running'
+                  ? { ...c, status: 'error' as const }
+                  : terminalEventReceived && c.status === 'running'
+                    ? { ...c, status: 'success' as const }
+                    : c
               ),
             }
           }
@@ -1468,13 +1547,14 @@ export const AgentPanel: React.FC = () => {
       )
 
       // 刷新当前 BOT 的资产（可能已经自增强了提示词、写入了记忆或沉淀了新技能）
-      loadBotDetails(botId)
+      loadBotDetails(botId, botRequestEpochRef.current)
       fetchBots()
     }
   }
 
   // 页面刷新或切换 BOT 时无感重连后台执行中的流
   const attachToActiveRunStream = async (botId: string, assistantMsgId: string) => {
+    if (activeBotIdRef.current !== botId) return
     const controller = new AbortController()
     abortControllerRef.current = controller
     try {
@@ -1484,6 +1564,7 @@ export const AgentPanel: React.FC = () => {
       if (!response.ok) {
         throw new Error(`HTTP ${response.status}`)
       }
+      if (activeBotIdRef.current !== botId || abortControllerRef.current !== controller) return
       await consumeSSEStream(response, assistantMsgId, botId, controller)
     } catch (err: any) {
       if (err.name !== 'AbortError') {
@@ -1501,17 +1582,21 @@ export const AgentPanel: React.FC = () => {
           )
         )
       }
+      if (abortControllerRef.current === controller) {
+        abortControllerRef.current = null
+        setIsGenerating(false)
+      }
     }
   }
 
-  const loadBotHistory = async (botId: string) => {
+  const loadBotHistory = async (botId: string, requestEpoch = botRequestEpochRef.current) => {
     try {
       userScrolledUpRef.current = false
-      setIsUserScrolledUp(false)
       setShowScrollBottom(false)
 
       const res = await fetch(`/api/agent/bots/${botId}/history?limit=30`)
       const data = await res.json()
+      if (!isCurrentBotRequest(botId, requestEpoch)) return
       setHasMoreHistory(Boolean(data.has_more))
       setTotalHistoryCount(data.total || data.history?.length || 0)
       let initialMessages: ChatMessage[] = []
@@ -1553,6 +1638,8 @@ export const AgentPanel: React.FC = () => {
         console.warn('Failed to query active run:', err)
       }
 
+      if (!isCurrentBotRequest(botId, requestEpoch)) return
+
       if (activeRunData) {
         // 当前任务仍在后台运行中：检查最后一条是否为该 user message，若不是则补全
         const lastMsg = initialMessages[initialMessages.length - 1]
@@ -1593,6 +1680,7 @@ export const AgentPanel: React.FC = () => {
         }
         initialMessages.push(inProgressAssistant)
 
+        revokeDetachedPreviewUrls(initialMessages)
         setMessages(initialMessages)
         setIsGenerating(true)
         setActiveRunsMap((prev) => ({
@@ -1616,7 +1704,7 @@ export const AgentPanel: React.FC = () => {
         })
 
         // 重新接管 SSE 实时流
-        attachToActiveRunStream(botId, assistantMsgId)
+        if (isCurrentBotRequest(botId, requestEpoch)) attachToActiveRunStream(botId, assistantMsgId)
       } else {
         setActiveRunsMap((prev) => {
           if (!prev[botId]) return prev
@@ -1624,6 +1712,7 @@ export const AgentPanel: React.FC = () => {
           delete next[botId]
           return next
         })
+        revokeDetachedPreviewUrls(initialMessages)
         setMessages(initialMessages)
         setIsGenerating(false)
 
@@ -1640,7 +1729,7 @@ export const AgentPanel: React.FC = () => {
             try {
               const retryRes = await fetch(`/api/agent/bots/${botId}/history`)
               const retryData = await retryRes.json()
-              if (retryData.history && retryData.history.length > initialMessages.length) {
+              if (isCurrentBotRequest(botId, requestEpoch) && retryData.history && retryData.history.length > initialMessages.length) {
                 setMessages(
                   retryData.history.map((h: any) => ({
                     id: h.id || `msg-${Math.random()}`,
@@ -1669,7 +1758,9 @@ export const AgentPanel: React.FC = () => {
                   }
                 })
               }
-            } catch {}
+            } catch (error) {
+              console.warn('Failed to parse retry history', error)
+            }
           }, 800)
         }
       }
@@ -1701,7 +1792,6 @@ export const AgentPanel: React.FC = () => {
     setInputMessage('')
     setAttachedFiles([])
     userScrolledUpRef.current = false
-    setIsUserScrolledUp(false)
     setShowScrollBottom(false)
     const userMsgId = `usr-${Date.now()}`
     const assistantMsgId = `ast-${Date.now()}`
@@ -1782,6 +1872,10 @@ export const AgentPanel: React.FC = () => {
           )
         )
       }
+      if (abortControllerRef.current === controller) {
+        abortControllerRef.current = null
+        setIsGenerating(false)
+      }
     }
   }
 
@@ -1811,11 +1905,12 @@ export const AgentPanel: React.FC = () => {
     if (!confirm('确定清空当前智能体的会话历史吗？记忆和技能将被保留。')) return
     try {
       await fetch(`/api/agent/bots/${activeBotId}/history`, { method: 'DELETE' })
+      revokeDetachedPreviewUrls([])
       setMessages([])
       setHasMoreHistory(false)
       setTotalHistoryCount(0)
       showToast({ type: 'success', message: '会话已清空' }, 2000)
-    } catch (e) {
+    } catch {
       showToast({ type: 'error', message: '清空会话失败' })
     }
   }
@@ -2044,7 +2139,7 @@ export const AgentPanel: React.FC = () => {
       } else {
         showToast({ type: 'warning', message: data.detail || '刷新推荐失败' })
       }
-    } catch (e: any) {
+    } catch {
       showToast({ type: 'warning', message: '网络异常' })
     } finally {
       setIsRefreshingPrompts(false)
@@ -2058,7 +2153,7 @@ export const AgentPanel: React.FC = () => {
         showToast({ type: 'success', message: '准则已删除' })
         loadBotDetails(activeBotId)
       }
-    } catch (e) {
+    } catch {
       showToast({ type: 'error', message: '删除失败' })
     }
   }
@@ -2072,7 +2167,7 @@ export const AgentPanel: React.FC = () => {
         showToast({ type: 'success', message: `记忆 [${key}] 已删除` })
         loadBotDetails(activeBotId)
       }
-    } catch (e) {
+    } catch {
       showToast({ type: 'error', message: '删除失败' })
     }
   }
@@ -2158,19 +2253,6 @@ export const AgentPanel: React.FC = () => {
       setIsSavingProfile(false)
     }
   }
-
-
-  const openSaveSkillModal = (codeBlocks: Array<{ step: number; code: string }>) => {
-    const combinedCode = codeBlocks.map((c) => c.code).join('\n\n')
-    const randomSuffix = Math.floor(1000 + Math.random() * 9000)
-    setSkillToSave({
-      name: `tim_task_${Date.now().toString().slice(-4)}_${randomSuffix}`,
-      description: '由智能体现场验证通过并自主沉淀的自动化技能',
-      python_code: combinedCode,
-    })
-    setIsSaveSkillModalOpen(true)
-  }
-
   const handleSaveSkillConfirm = async () => {
     if (!skillToSave.name.trim() || !skillToSave.python_code.trim()) {
       showToast({ type: 'warning', message: '技能名称与脚本代码不能为空' })
@@ -2208,7 +2290,7 @@ export const AgentPanel: React.FC = () => {
         showToast({ type: 'success', message: `技能 [${skillName}] 已删除` })
         loadBotDetails(activeBotId)
       }
-    } catch (e) {
+    } catch {
       showToast({ type: 'error', message: '删除失败' })
     }
   }
@@ -2258,14 +2340,6 @@ export const AgentPanel: React.FC = () => {
     setCopiedCodeId(id)
     setTimeout(() => setCopiedCodeId(null), 2000)
   }
-
-  const toggleTrace = (msgId: string, currentVal: boolean) => {
-    setExpandedTraceMap((prev) => ({
-      ...prev,
-      [msgId]: !currentVal,
-    }))
-  }
-
   return (
     <div className="flex h-full w-full overflow-hidden bg-slate-50 dark:bg-slate-950 relative">
       {/* 移动端智能体抽屉遮罩 (Backdrop) */}
@@ -2788,7 +2862,7 @@ export const AgentPanel: React.FC = () => {
                             className="flex items-center gap-2.5 p-2 rounded-xl bg-blue-700/70 border border-blue-400/40 text-white"
                           >
                             {att.data_url || (att.category === 'image' && att.url) ? (
-                              <img
+<AuthenticatedImage
                                 src={att.data_url || att.url}
                                 alt={att.name}
                                 onClick={() => setPreviewImage({ url: att.url || att.data_url || '', name: att.name })}
@@ -3072,7 +3146,7 @@ export const AgentPanel: React.FC = () => {
           {/* 浮动“直达最新”气泡：瞬时直达底部，移除迟缓的滚动动画 */}
           {showScrollBottom && (
             <button
-              onClick={() => scrollToBottom('auto')}
+              onClick={() => scrollToBottom()}
               className="sticky bottom-2 left-1/2 -translate-x-1/2 z-20 flex items-center gap-1.5 px-3.5 py-1.5 rounded-full bg-blue-600 hover:bg-blue-500 text-white text-xs font-semibold shadow-lg hover:shadow-xl transition-all cursor-pointer animate-in fade-in slide-in-from-bottom-2 duration-150"
             >
               <ArrowDown className="h-3.5 w-3.5" />
@@ -3139,7 +3213,7 @@ export const AgentPanel: React.FC = () => {
                     className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 text-xs shadow-2xs group"
                   >
                     {att.data_url || (att.category === 'image' && att.url) ? (
-                      <img
+                      <AuthenticatedImage
                         src={att.data_url || att.url}
                         alt={att.name}
                         onClick={() => setPreviewImage({ url: att.url || att.data_url || '', name: att.name })}
@@ -3157,7 +3231,10 @@ export const AgentPanel: React.FC = () => {
                     </span>
                     <button
                       type="button"
-                      onClick={() => setAttachedFiles((prev) => prev.filter((_, i) => i !== idx))}
+                      onClick={() => {
+                        revokeLocalPreviewUrl(attachedFiles[idx]?.data_url)
+                        setAttachedFiles((prev) => prev.filter((_, i) => i !== idx))
+                      }}
                       className="text-slate-400 hover:text-rose-500 transition-colors ml-0.5 cursor-pointer"
                       title="移除附件"
                     >
@@ -3322,7 +3399,36 @@ export const AgentPanel: React.FC = () => {
                 </button>
               </div>
 
-            {/* Tab 切换栏 (6个 Tab: 人设设定、强化准则、自编技能、长期记忆、文件产出、企业知识库) */}
+              {isAdminUser && activeBot && activeBot.visibility !== 'public' && (
+                <div className="mx-3 mt-3 rounded-lg border border-amber-200 bg-amber-50 p-2.5 dark:border-amber-800 dark:bg-amber-950/30">
+                  <div className="mb-1 text-[11px] font-semibold text-amber-800 dark:text-amber-300">
+                    {activeBot.owner_id ? 'BOT 所有权重新转移' : '历史 BOT 所有权迁移'}
+                  </div>
+                  {activeBot.owner_id && (
+                    <div className="mb-1.5 text-[11px] text-amber-700 dark:text-amber-400">
+                      当前所有者：<span className="font-mono">{activeBot.owner_id}</span>
+                    </div>
+                  )}
+                  <div className="flex gap-1.5">
+                    <input
+                      value={ownershipSubject}
+                      onChange={(event) => setOwnershipSubject(event.target.value)}
+                      placeholder="输入 OIDC subject"
+                      className="min-w-0 flex-1 rounded-md border border-amber-200 bg-white px-2 py-1 text-[11px] dark:border-amber-700 dark:bg-slate-900"
+                    />
+                    <button
+                      type="button"
+                      onClick={handleTransferOwnership}
+                      disabled={!ownershipSubject.trim()}
+                      className="rounded-md bg-amber-600 px-2 py-1 text-[11px] font-semibold text-white disabled:opacity-50"
+                    >
+                      {activeBot.owner_id ? '重新转移' : '转移'}
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {/* Tab 切换栏 (6个 Tab: 人设设定、强化准则、自编技能、长期记忆、文件产出、企业知识库) */}
             <div className="flex items-center gap-1 border-b border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-950 p-1 text-xs overflow-x-auto scrollbar-none">
               <button
                 onClick={() => setActiveTab('prompt')}
@@ -3456,7 +3562,7 @@ export const AgentPanel: React.FC = () => {
               )}
 
               {activeTab === 'files' && (
-                <AgentFilesTab
+                <FilesTab
                   botFiles={botFiles}
                   isLoadingFiles={isLoadingFiles}
                   isCleaningFiles={isCleaningFiles}
@@ -4440,7 +4546,7 @@ export const AgentPanel: React.FC = () => {
 
             {/* 原图展示区 */}
             <div className="flex-1 overflow-auto flex items-center justify-center max-h-[80vh] w-full p-1">
-              <img
+              <AuthenticatedImage
                 src={previewImage.url}
                 alt={previewImage.name || '预览'}
                 className="max-w-full max-h-[75vh] object-contain rounded-lg shadow-md select-none"

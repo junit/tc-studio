@@ -17,6 +17,20 @@ interface EChartsViewerProps {
   className?: string
 }
 
+// ECharts HTML tooltips assign literal formatter/content strings to innerHTML.
+// Chart JSON is model/user controlled, so remove every custom HTML-producing
+// hook before handing the option to ECharts.
+const stripUnsafeEchartsContent = (value: any): any => {
+  if (Array.isArray(value)) return value.map(stripUnsafeEchartsContent)
+  if (!value || typeof value !== 'object') return value
+  const clean: Record<string, any> = {}
+  for (const [key, child] of Object.entries(value)) {
+    if (key === 'formatter' || key === 'content') continue
+    clean[key] = stripUnsafeEchartsContent(child)
+  }
+  return clean
+}
+
 export const EChartsViewer: React.FC<EChartsViewerProps> = ({ code, className = '' }) => {
   const chartRef = useRef<HTMLDivElement>(null)
   const chartInstance = useRef<echarts.ECharts | null>(null)
@@ -41,7 +55,7 @@ export const EChartsViewer: React.FC<EChartsViewerProps> = ({ code, className = 
 
       // 如果已经是标准规范的 ECharts 完整配置
       if (parsed.series && (parsed.xAxis || parsed.radar || parsed.geo || parsed.series[0]?.type === 'pie')) {
-        let opt = { ...parsed }
+        let opt = stripUnsafeEchartsContent(parsed)
         if (typeof opt.title === 'string') {
           opt.title = { text: opt.title, left: 'center' }
         }
@@ -129,7 +143,18 @@ export const EChartsViewer: React.FC<EChartsViewerProps> = ({ code, className = 
     const isDark = document.documentElement.classList.contains('dark')
 
     // 复制配置并根据图表类型切换与主题调整
-    const finalOption = JSON.parse(JSON.stringify(option))
+    const finalOption = stripUnsafeEchartsContent(JSON.parse(JSON.stringify(option)))
+    if (Array.isArray(finalOption.tooltip)) {
+      finalOption.tooltip = finalOption.tooltip.map((tooltip: any) => ({
+        ...(tooltip || {}),
+        renderMode: 'richText',
+      }))
+    } else {
+      finalOption.tooltip = {
+        ...(finalOption.tooltip || {}),
+        renderMode: 'richText',
+      }
+    }
 
     // 深色模式文字与网格线调优
     if (isDark) {

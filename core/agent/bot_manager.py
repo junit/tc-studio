@@ -1,5 +1,6 @@
 # ruff: noqa: BLE001, S110, S112, UP006, UP015, UP017, UP035, UP045
 
+import hashlib
 import json
 import os
 import re
@@ -7,8 +8,11 @@ import shutil
 import threading
 import time
 import uuid
+from contextlib import suppress
 from datetime import UTC, datetime
 from typing import Any
+
+from core.runtime_context import runtime_user_id
 
 from .constants import HIGH_RISK_API_KEYWORDS
 from .file_parser import format_file_size, get_file_category_and_type
@@ -27,18 +31,22 @@ def _atomic_dump_json(filepath: str, data: Any, indent: int = 2, default: Any | 
     """原子化安全写入 JSON：先写入临时文件，确保序列化完全成功后再原子替换目标文件。
     彻底避免因异常、不可序列化对象或意外断电导致历史会话文件被清空截断为 0 字节。
     """
-    os.makedirs(os.path.dirname(filepath), exist_ok=True)  # pi-lens-ignore: unchecked-throwing-call-python -- persistence boundary
+    parent_dir = os.path.dirname(filepath)
+    os.makedirs(parent_dir, mode=0o700, exist_ok=True)  # pi-lens-ignore: unchecked-throwing-call-python -- persistence boundary
+    with suppress(OSError):
+        os.chmod(parent_dir, 0o700)
     tmp_path = f"{filepath}.{os.getpid()}.{threading.get_ident()}.{int(time.time() * 1000)}.tmp"
     try:
-        with open(tmp_path, "w", encoding="utf-8") as f:
+        fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=indent, default=default)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp_path, 0o600)
         os.replace(tmp_path, filepath)
     except Exception:
-        if os.path.exists(tmp_path):
-            try:
-                os.remove(tmp_path)
-            except Exception:
-                pass
+        with suppress(OSError):
+            os.remove(tmp_path)
         raise
 
 
@@ -117,6 +125,113 @@ class BotManager:
         clean_id = re.sub(r"[^a-zA-Z0-9_\-]", "_", bot_id)
         return os.path.join(self.bots_dir, clean_id)
 
+    def _runtime_dir(self, bot_id: str, user_id: str | None = None) -> str:
+        """Return per-user mutable state directory for public Bots."""
+        bot_dir = self._bot_dir(bot_id)
+        bot = self.get_bot(bot_id)
+        effective_user_id = user_id or runtime_user_id.get()
+        if bot and bot.visibility == "public" and effective_user_id != "local":
+            partition = hashlib.sha256(effective_user_id.encode("utf-8")).hexdigest()[:24]
+            return os.path.join(bot_dir, "users", partition)
+        return bot_dir
+
+    def _history_path(self, bot_id: str, user_id: str | None = None) -> str:
+        return os.path.join(self._runtime_dir(bot_id, user_id), "history.json")
+
+    def _uploads_dir(self, bot_id: str, user_id: str | None = None) -> str:
+        return os.path.join(self._runtime_dir(bot_id, user_id), "uploads")
+
+    def ensure_legacy_state(self, bot_id: str, user_id: str | None = None) -> None:
+        """Lazily inherit pre-auth public BOT state into the user's partition.
+
+        Before authentication was enabled, public BOT history and uploaded files
+        lived directly under the BOT directory.  Authenticated requests use an
+        isolated ``users/<hash>`` directory, so copy the legacy state on first
+        access.  The legacy directory is never used as a live fallback and is
+        left intact, making this operation idempotent and preserving local-mode
+        compatibility.
+        """
+        bot = self.get_bot(bot_id)
+        effective_user_id = user_id or runtime_user_id.get()
+        if not bot or bot.visibility != "public" or effective_user_id == "local":
+            return
+
+        bot_dir = self._bot_dir(bot_id)
+        partition_dir = self._runtime_dir(bot_id, effective_user_id)
+        if partition_dir == bot_dir:
+            return
+
+        legacy_history = os.path.join(bot_dir, "history.json")
+        target_history = os.path.join(partition_dir, "history.json")
+        legacy_memory = os.path.join(bot_dir, "memory.json")
+        target_memory = os.path.join(partition_dir, "memory.json")
+        legacy_uploads = os.path.join(bot_dir, "uploads")
+        target_uploads = os.path.join(partition_dir, "uploads")
+        migration_marker = os.path.join(partition_dir, ".legacy_state_migrated")
+
+        with self._lock:
+            if os.path.exists(migration_marker):
+                return
+            legacy_state_exists = (
+                os.path.isfile(legacy_history)
+                or os.path.isfile(legacy_memory)
+                or os.path.isdir(legacy_uploads)
+            )
+            if not legacy_state_exists:
+                return
+
+            # A target history file is treated as an explicit user state (even
+            # when it contains []).  Never overwrite or merge it with legacy
+            # messages after that point.
+            if os.path.isfile(legacy_history) and not os.path.exists(target_history):
+                try:
+                    with open(legacy_history, "r", encoding="utf-8") as f:
+                        history = json.load(f)
+                    if isinstance(history, list):
+                        _atomic_dump_json(target_history, history, default=str)
+                except (OSError, ValueError, TypeError):
+                    # A corrupt legacy file must not make an authenticated BOT
+                    # unusable; the normal empty-history path will recover.
+                    pass
+
+            # Long-term facts were also stored in the legacy runtime directory.
+            # Preserve a valid snapshot for each user without merging later
+            # user-specific updates into another user's partition.
+            if os.path.isfile(legacy_memory) and not os.path.exists(target_memory):
+                try:
+                    with open(legacy_memory, "r", encoding="utf-8") as f:
+                        memories = json.load(f)
+                    if isinstance(memories, list):
+                        _atomic_dump_json(target_memory, memories, default=str)
+                except (OSError, ValueError, TypeError):
+                    pass
+
+            if os.path.isdir(legacy_uploads):
+                try:
+                    os.makedirs(target_uploads, exist_ok=True)
+                    for filename in os.listdir(legacy_uploads):
+                        source = os.path.join(legacy_uploads, filename)
+                        target = os.path.join(target_uploads, filename)
+                        # Legacy files are local persistence, but skip links and
+                        # directories so migration cannot copy outside the BOT.
+                        if os.path.islink(source) or not os.path.isfile(source):
+                            continue
+                        if os.path.exists(target):
+                            continue
+                        try:
+                            shutil.copy2(source, target)
+                        except OSError:
+                            continue
+                except OSError:
+                    pass
+
+            # The marker prevents a user who explicitly deleted an inherited
+            # file/history from seeing it resurrected on the next request.
+            try:
+                _atomic_dump_json(migration_marker, {"version": 1}, default=str)
+            except OSError:
+                pass
+
     def _ensure_default_bot(self):
         default_id = "default_assistant"
         path = self._bot_dir(default_id)
@@ -142,7 +257,8 @@ class BotManager:
                 avatar="🤖",
                 description=default_desc,
                 base_prompt=default_prompt,
-                suggested_prompts=default_prompts
+                suggested_prompts=default_prompts,
+                visibility="public",
             )
         else:
             # 升级已有 default_assistant 的描述与人设，平滑扩展多云业务，保留已有历史与记忆
@@ -151,12 +267,13 @@ class BotManager:
                 try:
                     with open(bot_json, "r", encoding="utf-8") as f:
                         data = json.load(f)
+                    data["visibility"] = "public"
                     if "166" in data.get("description", "") or "261" in data.get("description", "") or "IM (Instant Messaging)" in data.get("base_prompt", ""):
                         data["name"] = default_name
                         data["description"] = default_desc
                         data["base_prompt"] = default_prompt
                         data["suggested_prompts"] = default_prompts
-                        _atomic_dump_json(bot_json, data)
+                    _atomic_dump_json(bot_json, data)
                 except Exception:
                     pass
 
@@ -180,10 +297,11 @@ class BotManager:
                     "对指定的异常推流执行 DropLiveStream 立即断流",
                     "生成一套主辅画面画中画的通用混流参数 (CreateCommonMixStream)",
                     "导出本月直播录制与转码规则配置清单"
-                ]
+                ],
+                visibility="public",
             )
 
-    def list_bots(self) -> list[dict[str, Any]]:
+    def list_bots(self, user_id: str | None = None) -> list[dict[str, Any]]:
         result = []
         if not os.path.exists(self.bots_dir):
             return result
@@ -196,9 +314,11 @@ class BotManager:
                     with open(bot_json, "r", encoding="utf-8") as f:
                         data = json.load(f)
                         # 统计资产数量
+                        self.ensure_legacy_state(entry, user_id)
+                        runtime_dir = self._runtime_dir(entry, user_id)
                         skills_dir = os.path.join(bot_path, "skills")
                         skills_count = len([f for f in os.listdir(skills_dir) if f.endswith(".json")]) if os.path.exists(skills_dir) else 0
-                        mem_path = os.path.join(bot_path, "memory.json")
+                        mem_path = os.path.join(runtime_dir, "memory.json")
                         mem_count = 0
                         if os.path.exists(mem_path):
                             with open(mem_path, "r", encoding="utf-8") as mf:
@@ -207,12 +327,12 @@ class BotManager:
                         data["memories_count"] = mem_count
                         data["guidelines_count"] = len(data.get("learned_guidelines", []))
 
-                        uploads_dir = os.path.join(bot_path, "uploads")
+                        uploads_dir = os.path.join(runtime_dir, "uploads")
                         files_count = len([f for f in os.listdir(uploads_dir) if os.path.isfile(os.path.join(uploads_dir, f))]) if os.path.exists(uploads_dir) else 0
                         data["files_count"] = files_count
 
                         # 读取最近一条聊天记录 (微信/WhatsApp 风格会话列表摘要)
-                        hist_path = os.path.join(bot_path, "history.json")
+                        hist_path = self._history_path(entry, user_id)
                         last_message = None
                         if os.path.exists(hist_path):
                             try:
@@ -258,10 +378,8 @@ class BotManager:
             if m:
                 extracted = m.group(2)
                 if "\\u" in extracted:
-                    try:
-                        extracted = extracted.encode('latin1').decode('unicode_escape')
-                    except Exception:
-                        pass
+                    with suppress(Exception):
+                        extracted = extracted.encode("latin1").decode("unicode_escape")
                 return extracted.strip()
         return s
 
@@ -364,6 +482,10 @@ class BotManager:
                 api_base = llm_cfg.base_url.rstrip("/") if llm_cfg.base_url else None
                 if llm_cfg.provider == "ollama" and api_base and not api_base.endswith("/v1"):
                     api_base = f"{api_base}/v1"
+                if api_base:
+                    from core.agent.model_url_guard import validate_model_base_url
+
+                    api_base = validate_model_base_url(api_base)
                 model = OpenAIServerModel(
                     model_id=llm_cfg.model_name,
                     api_base=api_base,
@@ -432,7 +554,9 @@ class BotManager:
         description: str = "",
         base_prompt: str | None = None,
         suggested_prompts: list[str] | None = None,
-        model_override: dict | None = None
+        model_override: dict | None = None,
+        owner_id: str | None = None,
+        visibility: str = "private",
     ) -> BotConfig:
         b_dir = self._bot_dir(bot_id)
         os.makedirs(b_dir, exist_ok=True)  # pi-lens-ignore: unchecked-throwing-call-python -- persistence boundary
@@ -449,7 +573,9 @@ class BotManager:
             description=description,
             base_prompt=cleaned_base_prompt,
             suggested_prompts=suggested_prompts,
-            model_override=model_override
+            model_override=model_override,
+            owner_id=owner_id,
+            visibility=visibility,
         )
         self.save_bot(bot)
         # 初始化空记忆与历史
@@ -475,6 +601,11 @@ class BotManager:
             b_dir = self._bot_dir(bot_id)
             if os.path.exists(b_dir):
                 shutil.rmtree(b_dir)  # pi-lens-ignore: unchecked-throwing-call-python -- persistence boundary
+                try:
+                    from .engine import agent_engine
+                    agent_engine.clear_bot_sandboxes(bot_id)
+                except Exception:
+                    pass
                 return True
             return False
 
@@ -559,6 +690,10 @@ class BotManager:
                 api_base = llm_cfg.base_url.rstrip("/") if llm_cfg.base_url else None
                 if llm_cfg.provider == "ollama" and api_base and not api_base.endswith("/v1"):
                     api_base = f"{api_base}/v1"
+                if api_base:
+                    from core.agent.model_url_guard import validate_model_base_url
+
+                    api_base = validate_model_base_url(api_base)
                 model = OpenAIServerModel(
                     model_id=llm_cfg.model_name,
                     api_base=api_base,
@@ -652,7 +787,10 @@ class BotManager:
     # 长期事实记忆系统 (Memory System)
     # -------------------------------------------------------------
     def list_memories(self, bot_id: str) -> list[MemoryItem]:
-        mem_path = os.path.join(self._bot_dir(bot_id), "memory.json")
+        # Ensure pre-auth public BOT memory is inherited before the first read.
+        # This keeps the memory panel consistent with history/files migration.
+        self.ensure_legacy_state(bot_id)
+        mem_path = os.path.join(self._runtime_dir(bot_id), "memory.json")
         if not os.path.exists(mem_path):
             return []
         try:
@@ -679,7 +817,7 @@ class BotManager:
                 target_item = MemoryItem(key=key, content=content, created_at=now_str, updated_at=now_str)
                 memories.append(target_item)
 
-            mem_path = os.path.join(self._bot_dir(bot_id), "memory.json")
+            mem_path = os.path.join(self._runtime_dir(bot_id), "memory.json")
             _atomic_dump_json(mem_path, [m.model_dump() for m in memories])
             if target_item is None:
                 raise RuntimeError("memory item was not created")
@@ -690,7 +828,7 @@ class BotManager:
             memories = self.list_memories(bot_id)
             filtered = [m for m in memories if m.key != key]
             if len(filtered) < len(memories):
-                mem_path = os.path.join(self._bot_dir(bot_id), "memory.json")
+                mem_path = os.path.join(self._runtime_dir(bot_id), "memory.json")
                 _atomic_dump_json(mem_path, [m.model_dump() for m in filtered])
                 return True
             return False
@@ -780,14 +918,15 @@ class BotManager:
     # -------------------------------------------------------------
     # 会话历史与文件关联持久化
     # -------------------------------------------------------------
-    def get_history(self, bot_id: str, limit: int = 50, before_id: str | None = None) -> list[dict[str, Any]]:
+    def get_history(self, bot_id: str, limit: int = 50, before_id: str | None = None, user_id: str | None = None) -> list[dict[str, Any]]:
         """获取指定数量的历史消息（支持 before_id 向前翻页）"""
-        return self.get_history_paged(bot_id, limit=limit, before_id=before_id)["history"]
+        return self.get_history_paged(bot_id, limit=limit, before_id=before_id, user_id=user_id)["history"]
 
-    def get_history_paged(self, bot_id: str, limit: int = 50, before_id: str | None = None) -> dict[str, Any]:
+    def get_history_paged(self, bot_id: str, limit: int = 50, before_id: str | None = None, user_id: str | None = None) -> dict[str, Any]:
         """分页获取会话历史，返回 history, total 以及 has_more 状态供前端无限滚动"""
         with self._lock:
-            hist_path = os.path.join(self._bot_dir(bot_id), "history.json")
+            self.ensure_legacy_state(bot_id, user_id)
+            hist_path = self._history_path(bot_id, user_id)
             if not os.path.exists(hist_path):
                 return {"history": [], "total": 0, "has_more": False}
             try:
@@ -815,9 +954,10 @@ class BotManager:
                     "has_more": start_idx > 0
                 }
 
-    def append_history(self, bot_id: str, role: str, content: str, metadata: dict | None = None):
+    def append_history(self, bot_id: str, role: str, content: str, metadata: dict | None = None, user_id: str | None = None):
         with self._lock:
-            hist_path = os.path.join(self._bot_dir(bot_id), "history.json")
+            self.ensure_legacy_state(bot_id, user_id)
+            hist_path = self._history_path(bot_id, user_id)
             history = []
             if os.path.exists(hist_path):
                 try:
@@ -838,22 +978,23 @@ class BotManager:
                 history = history[-5000:]
             _atomic_dump_json(hist_path, history, default=str)
 
-    def clear_history(self, bot_id: str, delete_files: bool = True):
+    def clear_history(self, bot_id: str, delete_files: bool = True, user_id: str | None = None):
         with self._lock:
-            hist_path = os.path.join(self._bot_dir(bot_id), "history.json")
+            self.ensure_legacy_state(bot_id, user_id)
+            hist_path = self._history_path(bot_id, user_id)
             _atomic_dump_json(hist_path, [])
             try:
                 from .engine import agent_engine
-                agent_engine.clear_sandbox(bot_id)
+                agent_engine.clear_sandbox(bot_id, user_id)
             except Exception:
                 pass
             try:
                 from .memory import memory_manager
-                memory_manager.clear_session_memory(bot_id, self._bot_dir(bot_id))
+                memory_manager.clear_session_memory(bot_id, self._runtime_dir(bot_id, user_id))
             except Exception:
                 pass
             if delete_files:
-                uploads_dir = os.path.join(self._bot_dir(bot_id), "uploads")
+                uploads_dir = self._uploads_dir(bot_id, user_id)
                 if os.path.exists(uploads_dir):
                     for fn in os.listdir(uploads_dir):  # pi-lens-ignore: unchecked-throwing-call-python -- persistence boundary
                         try:
@@ -863,16 +1004,16 @@ class BotManager:
                         except Exception:
                             pass
 
-    def cleanup_unreferenced_files(self, bot_id: str) -> int:
+    def cleanup_unreferenced_files(self, bot_id: str, user_id: str | None = None) -> int:
         """清理 uploads 目录下未在当前 history 中引用的孤儿文件"""
         with self._lock:
-            bot_dir = self._bot_dir(bot_id)
-            uploads_dir = os.path.join(bot_dir, "uploads")
+            self.ensure_legacy_state(bot_id, user_id)
+            uploads_dir = self._uploads_dir(bot_id, user_id)
             if not os.path.exists(uploads_dir):
                 return 0
 
             referenced_filenames = set()
-            hist_path = os.path.join(bot_dir, "history.json")
+            hist_path = self._history_path(bot_id, user_id)
             if os.path.exists(hist_path):
                 try:
                     with open(hist_path, "r", encoding="utf-8") as f:
@@ -925,18 +1066,19 @@ class BotManager:
     # -------------------------------------------------------------
     # 消息回溯、重新生成与历史截断
     # -------------------------------------------------------------
-    def get_last_user_message(self, bot_id: str) -> dict[str, Any] | None:
+    def get_last_user_message(self, bot_id: str, user_id: str | None = None) -> dict[str, Any] | None:
         """查找最近一条用户输入消息（含附件）"""
-        history = self.get_history(bot_id, limit=20)
+        history = self.get_history(bot_id, limit=20, user_id=user_id)
         for msg in reversed(history):
             if msg.get("role") == "user":
                 return msg
         return None
 
-    def pop_last_assistant_message(self, bot_id: str) -> dict[str, Any] | None:
+    def pop_last_assistant_message(self, bot_id: str, user_id: str | None = None) -> dict[str, Any] | None:
         """移除最后一条助手消息（用于触发重新生成）"""
         with self._lock:
-            hist_path = os.path.join(self._bot_dir(bot_id), "history.json")
+            self.ensure_legacy_state(bot_id, user_id)
+            hist_path = self._history_path(bot_id, user_id)
             if not os.path.exists(hist_path):
                 return None
             try:
@@ -950,10 +1092,11 @@ class BotManager:
                 pass
             return None
 
-    def truncate_history(self, bot_id: str, keep_up_to_message_id: str) -> bool:
+    def truncate_history(self, bot_id: str, keep_up_to_message_id: str, user_id: str | None = None) -> bool:
         """截断历史记录至指定消息 ID（保留该消息及之前的内容，丢弃后续内容）"""
         with self._lock:
-            hist_path = os.path.join(self._bot_dir(bot_id), "history.json")
+            self.ensure_legacy_state(bot_id, user_id)
+            hist_path = self._history_path(bot_id, user_id)
             if not os.path.exists(hist_path):
                 return False
             try:
@@ -971,35 +1114,17 @@ class BotManager:
     # -------------------------------------------------------------
     # 产出物与文件管理中心 (Artifact / File Hub)
     # -------------------------------------------------------------
-    def list_bot_files(self, bot_id: str) -> list[dict[str, Any]]:
+    def list_bot_files(self, bot_id: str, user_id: str | None = None) -> list[dict[str, Any]]:
         """查询指定智能体所有的上传与产出文件，带有大小、时间与引用状态"""
-        import shutil
         with self._lock:
-            bot_dir = self._bot_dir(bot_id)
+            self.ensure_legacy_state(bot_id, user_id)
+            bot_dir = self._runtime_dir(bot_id, user_id)
             uploads_dir = os.path.join(bot_dir, "uploads")
             os.makedirs(uploads_dir, exist_ok=True)  # pi-lens-ignore: unchecked-throwing-call-python -- persistence boundary
 
-            # 自动防护：若根目录下有非系统残留的报表或导出文件，自动归集进该智能体文件中心
-            try:
-                for fn in os.listdir("."):
-                    if fn.startswith(".") or fn in (
-                        "app.py", "config.json", "requirements.txt", "README.md",
-                        "LICENSE", "config.example.json", "package.json", "pnpm-lock.yaml"
-                    ):
-                        continue
-                    fp = os.path.join(".", fn)
-                    if os.path.isfile(fp):
-                        cat, ftype = get_file_category_and_type(fn)
-                        if cat in ("table", "image", "document") or ftype in ("xlsx", "xls", "csv", "parquet"):
-                            dest_fp = os.path.join(uploads_dir, fn)
-                            if not os.path.exists(dest_fp):
-                                shutil.move(fp, dest_fp)
-            except Exception:
-                pass
-
             # 获取所有在 history 中被引用的文件名
             referenced_filenames = set()
-            hist_path = os.path.join(bot_dir, "history.json")
+            hist_path = self._history_path(bot_id, user_id)
             if os.path.exists(hist_path):
                 try:
                     with open(hist_path, "r", encoding="utf-8") as f:
@@ -1047,10 +1172,11 @@ class BotManager:
             file_list.sort(key=lambda x: x["created_at"], reverse=True)
             return file_list
 
-    def delete_bot_file(self, bot_id: str, filename: str) -> bool:
+    def delete_bot_file(self, bot_id: str, filename: str, user_id: str | None = None) -> bool:
         """物理删除智能体专属目录下的单个文件"""
         with self._lock:
-            bot_dir = self._bot_dir(bot_id)
+            self.ensure_legacy_state(bot_id, user_id)
+            bot_dir = self._runtime_dir(bot_id, user_id)
             safe_name = os.path.basename(filename)
             uploads_dir = os.path.join(bot_dir, "uploads")
             fp = os.path.join(uploads_dir, safe_name)
@@ -1095,14 +1221,16 @@ class BotManager:
             events = events[:500]
             _atomic_dump_json(path, events)
 
-    def get_orchestrations(self, limit: int = 50) -> list[dict[str, Any]]:
-        """获取最近的多智能体协同调用流水"""
+    def get_orchestrations(self, limit: int = 50, user_id: str | None = None, is_admin: bool = False) -> list[dict[str, Any]]:
+        """获取最近的多智能体协同流水；非管理员仅返回自己的事件。"""
         with self._lock:
             path = self._orchestrations_path()
             if os.path.exists(path):
                 try:
                     with open(path, "r", encoding="utf-8") as f:
                         events = json.load(f)
+                    if not is_admin and user_id:
+                        events = [event for event in events if event.get("owner_id") == user_id]
                     return events[:limit]
                 except Exception:
                     return []

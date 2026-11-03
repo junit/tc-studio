@@ -4,6 +4,7 @@ import hljs from 'highlight.js'
 import 'highlight.js/styles/atom-one-dark.css'
 import { Copy, Check } from 'lucide-react'
 import { EChartsViewer } from '@/components/agent/EChartsViewer'
+import { fetchAuthenticatedBlob } from '@/lib/auth'
 
 interface MarkdownViewProps {
   content: string
@@ -38,6 +39,60 @@ const sanitizeImageSrc = (value: unknown): string => {
     return isSafeBase64Image && src.length <= 10 * 1024 * 1024 ? src : '#'
   }
   return sanitizeHref(src)
+}
+
+
+const markdownImageCache = new Map<string, { url?: string; promise?: Promise<string>; lastUsed: number; consumers: number }>()
+const MAX_MARKDOWN_IMAGE_CACHE = 32
+
+// 引用计数：被挂载中的 <img> 消费中的 URL 不参与驱逐回收，
+// 避免 LRU 驱逐时 revoke 掉仍在页面上显示的图片
+function acquireMarkdownImage(src: string): void {
+  const entry = markdownImageCache.get(src)
+  if (entry) {
+    entry.consumers += 1
+  } else {
+    markdownImageCache.set(src, { lastUsed: Date.now(), consumers: 1 })
+  }
+}
+
+function releaseMarkdownImage(src: string): void {
+  const entry = markdownImageCache.get(src)
+  if (entry && entry.consumers > 0) entry.consumers -= 1
+}
+
+function loadCachedMarkdownImage(src: string): Promise<string> {
+  const now = Date.now()
+  const cached = markdownImageCache.get(src)
+  if (cached?.url) {
+    cached.lastUsed = now
+    return Promise.resolve(cached.url)
+  }
+  if (cached?.promise) return cached.promise
+
+  const entry = cached ?? ({ lastUsed: now, consumers: 0 } as { url?: string; promise?: Promise<string>; lastUsed: number; consumers: number })
+  entry.lastUsed = now
+  entry.promise = fetchAuthenticatedBlob(src).then((blob) => {
+    const objectUrl = URL.createObjectURL(blob)
+    entry.url = objectUrl
+    entry.promise = undefined
+    entry.lastUsed = Date.now()
+    return objectUrl
+  }).catch((error) => {
+    markdownImageCache.delete(src)
+    throw error
+  })
+  if (!cached) markdownImageCache.set(src, entry)
+
+  while (markdownImageCache.size > MAX_MARKDOWN_IMAGE_CACHE) {
+    const oldest = [...markdownImageCache.entries()]
+      .filter(([, value]) => !value.promise && value.consumers <= 0)
+      .sort(([, a], [, b]) => a.lastUsed - b.lastUsed)[0]
+    if (!oldest) break
+    URL.revokeObjectURL(oldest[1].url || '')
+    markdownImageCache.delete(oldest[0])
+  }
+  return entry.promise
 }
 
 
@@ -76,6 +131,15 @@ marked.use({
           <pre class="hljs-pre !my-0 !rounded-none !border-0 bg-slate-50 text-slate-800 dark:bg-[#0b0f19] dark:text-[#e2e8f0]"><code class="hljs ${validLang ? `language-${escapeHtml(cleanLang)}` : ''}">${highlighted}</code></pre>
         </div>
       `
+    },
+    image({ href, title, text }: { href: string; title?: string | null; text: string }) {
+      const safeSrc = sanitizeImageSrc(href)
+      const placeholder = 'data:image/gif;base64,R0lGODlhAQABAAD/ACwAAAAAAQABAAACADs='
+      const titleAttr = title ? ` title="${escapeHtml(title)}"` : ''
+      const isAuthenticatedApiImage = safeSrc.startsWith('/api/')
+      const imageSrc = isAuthenticatedApiImage ? placeholder : safeSrc
+      const dataSrcAttr = isAuthenticatedApiImage ? ` data-src="${escapeHtml(safeSrc)}"` : ''
+      return `<img src="${imageSrc}"${dataSrcAttr} alt="${escapeHtml(text)}"${titleAttr} class="max-w-full rounded-lg" />`
     },
     link({ href, title, text }: { href: string; title?: string | null; text: string }) {
       const safeHref = sanitizeHref(href)
@@ -131,6 +195,39 @@ const SafeMarkdownHtml: React.FC<{ html: string; className?: string }> = ({ html
       root.removeChild(root.firstChild)
     }
     container.replaceChildren(fragment)
+  }, [html])
+
+  useEffect(() => {
+    const container = containerRef.current
+    if (!container) return
+    let cancelled = false
+    const acquired: string[] = []
+    const imageElements = Array.from(container.querySelectorAll('img[data-src]'))
+      imageElements.forEach((image) => {
+        const src = image.getAttribute('data-src') || ''
+        if (!src.startsWith('/api/')) return
+        acquireMarkdownImage(src)
+        acquired.push(src)
+        loadCachedMarkdownImage(src)
+          .then((objectUrl) => {
+            if (cancelled) return
+            image.removeAttribute('data-src')
+            image.setAttribute('src', objectUrl)
+          })
+          .catch(() => {
+            if (cancelled) return
+            const fallback = document.createElement('a')
+            fallback.href = src
+            fallback.download = ''
+            fallback.textContent = `图片未内联预览：${image.getAttribute('alt') || '点击下载查看'}`
+            fallback.className = 'inline-flex items-center rounded-md border border-amber-200 bg-amber-50 px-2 py-1 text-xs text-amber-700 no-underline'
+            image.replaceWith(fallback)
+          })
+      })
+    return () => {
+      cancelled = true
+      acquired.forEach(releaseMarkdownImage)
+    }
   }, [html])
 
   return <div ref={containerRef} className={className} />
@@ -300,7 +397,7 @@ export const MarkdownView: React.FC<MarkdownViewProps> = ({
       )}
 
       {segments.some((s) => s.type === 'echarts') ? (
-        <div className={`space-y-2 ${copyable && copyMode === 'floating' ? 'pr-16' : ''} ${className}`}>
+        <div className={`space-y-3 ${copyable && copyMode === 'floating' ? 'pr-16' : ''} ${className}`}>
           {segments.map((seg, idx) => {
             if (seg.type === 'echarts') {
               return <EChartsViewer key={idx} code={seg.text} />
@@ -311,8 +408,13 @@ export const MarkdownView: React.FC<MarkdownViewProps> = ({
             } catch {
               html = seg.text
             }
+            if (!html || !html.trim()) return null
             return (
-              <SafeMarkdownHtml html={html} />
+              <SafeMarkdownHtml
+                key={idx}
+                html={html}
+                className={`markdown-content ${className}`}
+              />
             )
           })}
         </div>

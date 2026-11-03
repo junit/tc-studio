@@ -7,7 +7,7 @@
 
 import hashlib
 import time
-from typing import Dict, Optional
+from typing import Any, Optional
 from urllib.parse import parse_qs, urlparse
 
 
@@ -17,11 +17,13 @@ def generate_live_push_url(
     key: Optional[str] = None,
     expire_seconds: int = 86400,
     app_name: str = "live"
-) -> Dict[str, str]:
+) -> dict[str, Any]:
     """
     生成腾讯云直播推流地址 (RTMP / WebRTC / SRT)
     公式: txSecret = MD5(key + stream_name + txTime)
     """
+    if not isinstance(domain, str) or not domain.strip():
+        raise ValueError("domain is required")
     domain = domain.strip().rstrip("/")
     if domain.startswith("http://") or domain.startswith("https://"):
         domain = domain.split("://", 1)[1]
@@ -63,10 +65,12 @@ def generate_live_play_urls(
     expire_seconds: int = 86400,
     app_name: str = "live",
     use_https: bool = True
-) -> Dict[str, str]:
+) -> dict[str, Any]:
     """
     生成腾讯云直播多协议播放地址 (FLV / HLS / WebRTC / RTMP)
     """
+    if not isinstance(domain, str) or not domain.strip():
+        raise ValueError("domain is required")
     domain = domain.strip().rstrip("/")
     if domain.startswith("http://") or domain.startswith("https://"):
         domain = domain.split("://", 1)[1]

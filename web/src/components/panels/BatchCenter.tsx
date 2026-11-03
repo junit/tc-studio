@@ -38,6 +38,7 @@ import { useBatchStore, BatchPreset } from '@/stores/batchStore'
 import { useApiStore, ApiMeta, smartMatchApi, getCleanApiName } from '@/stores/apiStore'
 import { useHistoryStore } from '@/stores/historyStore'
 import { HistoryPanel } from '@/components/panels/HistoryPanel'
+import { downloadWithAuth } from '@/lib/auth'
 
 const getPresetBadgeColor = (color: string) => {
   switch (color) {
@@ -88,7 +89,6 @@ export const BatchCenter: React.FC = () => {
   const {
     apiId,
     items,
-    fileName,
     delaySec,
     isDryRun,
     activeTaskId,
@@ -99,12 +99,13 @@ export const BatchCenter: React.FC = () => {
     presets,
     activePresetId,
     guidance,
+    highRiskConfirmed,
     failedItems,
     retryFailed,
     setApiId,
     setDelaySec,
     setDryRun,
-    loadTodayPreset,
+    setHighRiskConfirmed,
     loadPresets,
     applyPreset,
     fetchGuidance,
@@ -116,7 +117,7 @@ export const BatchCenter: React.FC = () => {
     stopBatch,
   } = useBatchStore()
 
-  const { apis, activeServiceId } = useApiStore()
+  const { apis, activeServiceId, showToast } = useApiStore()
   const logContainerRef = useRef<HTMLDivElement>(null)
   const batchGroupRef = useGroupRef()
 
@@ -186,23 +187,6 @@ export const BatchCenter: React.FC = () => {
       return smartMatchApi(api, apiSearchKeyword)
     })
   }, [currentServiceApis, activeServiceId, selectedCategory, apiSearchKeyword])
-
-  // 4. 按层级分组：全部分类视角下展示完整路径，单分类筛选视角下展示二级子分类
-  const groupedApis = useMemo(() => {
-    const groups: Record<string, ApiMeta[]> = {}
-
-    filteredApis.forEach((api) => {
-      const { l1, l2, fullGroup } = getApiCategoryInfo(api, activeServiceId)
-      const groupKey = selectedCategory !== 'all' && l2 ? l2 : fullGroup
-
-      if (!groups[groupKey]) {
-        groups[groupKey] = []
-      }
-      groups[groupKey].push(api)
-    })
-
-    return groups
-  }, [filteredApis, activeServiceId, selectedCategory])
 
   // 5. 过滤与跨服务联动：若当前 apiId 不在当前服务接口列表中，自动选中第一个有效项
   useEffect(() => {
@@ -282,10 +266,16 @@ export const BatchCenter: React.FC = () => {
     (p) => p.id === activePresetId || p.api_id === apiId
   )
 
-  const handleExportCsv = (onlyFailed = false) => {
+  const handleExportCsv = async (onlyFailed = false) => {
     if (!activeTaskId) return
-    const url = `/api/batch/${activeTaskId}/export/csv${onlyFailed ? '?only_failed=true' : ''}`
-    window.open(url, '_blank')
+    try {
+      await downloadWithAuth(
+        `/api/batch/${activeTaskId}/export/csv${onlyFailed ? '?only_failed=true' : ''}`,
+        `${activeTaskId}${onlyFailed ? '_failed' : ''}.csv`
+      )
+    } catch (error: any) {
+      showToast({ type: 'error', message: error.message || '导出失败' })
+    }
   }
 
   // 切换终端高度（最大化到 80% / 还原到 42%）
@@ -411,16 +401,16 @@ export const BatchCenter: React.FC = () => {
                   <div className="flex items-center gap-2">
                     {/* Active preset direct template download */}
                     {selectedPreset && (
-                      <a
-                        href={`/api/batch/presets/${selectedPreset.id}/csv`}
-                        download={selectedPreset.filename}
+                      <button
+                        type="button"
+                        onClick={() => downloadWithAuth(`/api/batch/presets/${selectedPreset.id}/csv`, selectedPreset.filename).catch((error) => showToast({ type: 'error', message: error.message || '下载失败' }))}
                         className="text-[11px] font-medium py-0.5 px-2 rounded-md bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-600 dark:text-slate-300 transition-colors flex items-center gap-1 cursor-pointer shrink-0"
                         title={`下载「${selectedPreset.title}」标准 CSV 模板`}
                       >
                         <Download className="h-3 w-3" />
                         <span className="hidden sm:inline">下载「{selectedPreset.title.replace('云直播：', '').replace('批量', '')}」模板</span>
                         <span className="sm:hidden">下载模板</span>
-                      </a>
+                      </button>
                     )}
 
                     {/* Expand/Collapse Toggle Button */}
@@ -527,15 +517,15 @@ export const BatchCenter: React.FC = () => {
                             >
                               载入数据
                             </button>
-                            <a
-                              href={`/api/batch/presets/${preset.id}/csv`}
-                              download={preset.filename}
+                            <button
+                              type="button"
+                              onClick={() => downloadWithAuth(`/api/batch/presets/${preset.id}/csv`, preset.filename).catch((error) => showToast({ type: 'error', message: error.message || '下载失败' }))}
                               className="text-[11px] font-medium py-1 px-2 rounded-lg bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-600 dark:text-slate-300 transition-colors flex items-center gap-1 cursor-pointer shrink-0"
                               title="下载标准 CSV 表格模板"
                             >
                               <Download className="h-3 w-3" />
                               <span>模板</span>
-                            </a>
+                            </button>
                           </div>
                         </div>
                       )
@@ -748,6 +738,16 @@ export const BatchCenter: React.FC = () => {
                               </Badge>
                             </p>
                             <p className="text-[11px] leading-relaxed opacity-90">{guidance.tip}</p>
+                           <label className="mt-2 flex items-start gap-2 cursor-pointer select-none text-[11px] font-semibold">
+                             <input
+                               type="checkbox"
+                               checked={highRiskConfirmed}
+                               onChange={(e) => setHighRiskConfirmed(e.target.checked)}
+                               disabled={isRunning || isDryRun}
+                               className="mt-0.5 h-3.5 w-3.5 rounded border-rose-300 accent-rose-600"
+                             />
+                             <span>我已核对目标范围，并确认执行该高危批量操作</span>
+                           </label>
                           </div>
                         </div>
                       )}

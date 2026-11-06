@@ -12,7 +12,7 @@ import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
-from .file_parser import format_file_size
+from .file_parser import format_file_size, validate_zip_archive
 
 MAX_RAG_TEXT_CHARS = 2_000_000
 MAX_RAG_CHUNKS = 5_000
@@ -144,6 +144,7 @@ class RagManager:
         elif ext == "docx":
             import io
             import docx
+            validate_zip_archive(content)
             doc_file = io.BytesIO(content)
             doc = docx.Document(doc_file)
             paras = [p.text for p in doc.paragraphs if p.text.strip()]

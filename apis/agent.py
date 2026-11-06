@@ -5,6 +5,7 @@
 
 import asyncio
 import base64
+import binascii
 import ipaddress
 import json
 import logging
@@ -13,17 +14,19 @@ import os
 import re
 import socket
 import time
+import xml.etree.ElementTree as ET
 from contextlib import suppress
 from typing import Any, Dict, List, Optional
-from urllib.parse import urlparse, urlunparse
+from urllib.parse import quote, urlparse, urlunparse
 
 import requests
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
-from fastapi.responses import FileResponse, StreamingResponse
-from pydantic import BaseModel, Field
+from fastapi.responses import FileResponse, Response, StreamingResponse
+from pydantic import BaseModel, Field, field_validator
 from starlette.concurrency import run_in_threadpool
 
 from core.agent.bot_manager import bot_manager
+from core.agent.tools import MAX_SKILL_CODE_BYTES, _validate_skill_ast
 from core.auth import CurrentUser, current_user, require_admin, require_operator
 from core.agent.constants import SUPPORTED_PROVIDERS, BOT_PRESET_TEMPLATES, HIGH_RISK_API_KEYWORDS
 from core.agent.risk import matching_confirmation_paths, resolve_api
@@ -66,6 +69,504 @@ def require_bot_definition_editor(bot_id: str, user: CurrentUser = Depends(curre
 
 MAX_AGENT_UPLOAD_BYTES = 50 * 1024 * 1024
 MAX_KNOWLEDGE_UPLOAD_BYTES = 20 * 1024 * 1024
+# Bound both the number and aggregate size of files an export can materialize
+# in memory.  The per-file upload limit alone does not bound generated files
+# or a long-lived bot's total export size.
+MAX_AGENT_FILES_PER_BOT = 1000
+MAX_AGENT_EXPORT_BYTES = 100 * 1024 * 1024
+MAX_ATTACHMENT_META_BYTES = 128 * 1024
+# The upload endpoint embeds image files up to 3 MiB as a base64 data URL.
+# Base64 expands that payload to roughly 4 MiB; leave room for the data URL
+# prefix and a small amount of content-type variation at the request boundary.
+MAX_ATTACHMENT_DATA_URL_LENGTH = 5 * 1024 * 1024
+# SVG is an active XML format.  It is safe to preview only after parsing and
+# removing script-capable elements/attributes and external references.  Keep
+# this separate from the general upload limit so sanitisation cannot allocate
+# an unbounded in-memory document.
+MAX_SAFE_SVG_BYTES = 5 * 1024 * 1024
+
+
+_SVG_DANGEROUS_TAGS = {
+    "script",
+    "base",
+    "foreignobject",
+    "iframe",
+    "object",
+    "embed",
+    "link",
+    "audio",
+    "video",
+    "style",
+    "animate",
+    "animatemotion",
+    "animatetransform",
+    "discard",
+    "mpath",
+    "set",
+}
+_SVG_URI_ATTRIBUTES = {"href", "src", "action", "formaction", "poster"}
+
+# Inline SVG styles are useful for exported drawings (for example
+# ``fill:#0f172a;stroke-width:2``), but SVG-capable browsers also interpret
+# CSS URLs and a handful of legacy CSS properties as active content.  Keep a
+# presentation-property allowlist so a future CSS property cannot silently
+# become an execution sink.  ``url(#id)`` is handled separately below and is
+# limited to same-document fragments.
+_SVG_SAFE_STYLE_PROPERTIES = {
+    "alignment-baseline",
+    "baseline-shift",
+    "clip",
+    "clip-path",
+    "clip-rule",
+    "color",
+    "color-interpolation",
+    "color-interpolation-filters",
+    "color-rendering",
+    "cursor",
+    "direction",
+    "display",
+    "dominant-baseline",
+    "enable-background",
+    "fill",
+    "fill-opacity",
+    "fill-rule",
+    "filter",
+    "flood-color",
+    "flood-opacity",
+    "font-family",
+    "font-size",
+    "font-size-adjust",
+    "font-stretch",
+    "font-style",
+    "font-variant",
+    "font-weight",
+    "glyph-orientation-horizontal",
+    "glyph-orientation-vertical",
+    "image-rendering",
+    "isolation",
+    "letter-spacing",
+    "lighting-color",
+    "marker-end",
+    "marker-mid",
+    "marker-start",
+    "mask",
+    "mask-type",
+    "mix-blend-mode",
+    "opacity",
+    "overflow",
+    "paint-order",
+    "pointer-events",
+    "shape-rendering",
+    "stop-color",
+    "stop-opacity",
+    "stroke",
+    "stroke-dasharray",
+    "stroke-dashoffset",
+    "stroke-linecap",
+    "stroke-linejoin",
+    "stroke-miterlimit",
+    "stroke-opacity",
+    "stroke-width",
+    "text-anchor",
+    "text-decoration",
+    "text-rendering",
+    "transform",
+    "transform-box",
+    "transform-origin",
+    "unicode-bidi",
+    "vector-effect",
+    "visibility",
+    "white-space",
+    "word-spacing",
+    "writing-mode",
+}
+
+
+def _split_svg_style_declarations(value: str) -> Optional[List[str]]:
+    """Split a CSS declaration list without treating quoted ``;`` as syntax.
+
+    This is deliberately a small parser rather than a regular expression:
+    CSS allows parentheses and quoted strings in values.  Backslash escapes,
+    comments, and control characters are rejected by the caller because they
+    are common ways to hide a dangerous token from a blacklist.
+    """
+    declarations: List[str] = []
+    start = 0
+    quote: Optional[str] = None
+    depth = 0
+    for index, char in enumerate(value):
+        if quote:
+            if char == quote:
+                quote = None
+            continue
+        if char in ("'", '"'):
+            quote = char
+        elif char == "(":
+            depth += 1
+        elif char == ")":
+            if depth == 0:
+                return None
+            depth -= 1
+        elif char == ";" and depth == 0:
+            declarations.append(value[start:index])
+            start = index + 1
+    if quote or depth:
+        return None
+    declarations.append(value[start:])
+    return declarations
+
+
+def _is_safe_svg_local_url_target(value: str) -> bool:
+    target = value.strip()
+    if len(target) >= 2 and target[0] in ("'", '"') and target[-1] == target[0]:
+        target = target[1:-1].strip()
+    return bool(re.fullmatch(r"#[A-Za-z0-9_.:-]{1,256}", target))
+
+
+def _is_safe_svg_raster_data_url(value: str, *, max_bytes: int) -> bool:
+    """Accept only well-formed, magic-byte-checked raster data URLs."""
+    prefix, separator, encoded = value.partition(",")
+    if not separator or len(value) > max_bytes or ";base64" not in prefix.lower():
+        return False
+    media_type = prefix.split(":", 1)[-1].split(";", 1)[0].lower()
+    magic_by_type = {
+        "image/png": (b"\x89PNG\r\n\x1a\n",),
+        "image/jpeg": (b"\xff\xd8\xff",),
+        "image/gif": (b"GIF87a", b"GIF89a"),
+        "image/webp": (b"RIFF",),
+    }
+    try:
+        decoded = base64.b64decode(encoded, validate=True)
+    except (ValueError, binascii.Error):
+        return False
+    if media_type not in magic_by_type or not any(decoded.startswith(magic) for magic in magic_by_type[media_type]):
+        return False
+    if media_type == "image/webp" and len(decoded) < 12:
+        return False
+    return media_type != "image/webp" or decoded[8:12] == b"WEBP"
+
+
+def _sanitize_svg_style(value: str) -> Optional[str]:
+    """Keep safe inline SVG CSS declarations and discard active ones.
+
+    The returned string contains only allowlisted presentation properties.  A
+    declaration containing a URL is retained only when the URL is a local
+    fragment (``url(#gradient)``); all external/data/script URLs, CSS imports,
+    expressions, custom-property indirection, escapes, and malformed syntax
+    are discarded.  Returning ``None`` means no safe declarations remain.
+    """
+    if not isinstance(value, str) or not value or len(value) > 8192:
+        return None
+    # Reject CSS comments, escapes, control characters, and characters that
+    # would turn a declaration into a nested rule or markup.  Whitespace is
+    # safe and is retained for readable output.
+    if (
+        "/*" in value
+        or "*/" in value
+        or "\\" in value
+        or any(ord(char) < 0x20 and char not in "\t\n\r\f" for char in value)
+        or any(char in value for char in "{}<>")
+    ):
+        return None
+
+    declarations = _split_svg_style_declarations(value)
+    if declarations is None:
+        return None
+
+    safe: List[str] = []
+    for declaration in declarations:
+        declaration = declaration.strip()
+        if not declaration:
+            continue
+        # Find the property/value separator outside a quoted string or
+        # function.  A colon inside ``url(...)`` or a quoted font name is not
+        # a declaration separator.
+        quote: Optional[str] = None
+        depth = 0
+        separator = -1
+        for index, char in enumerate(declaration):
+            if quote:
+                if char == quote:
+                    quote = None
+                continue
+            if char in ("'", '"'):
+                quote = char
+            elif char == "(":
+                depth += 1
+            elif char == ")":
+                depth -= 1
+            elif char == ":" and depth == 0:
+                separator = index
+                break
+        if separator <= 0 or quote or depth:
+            continue
+
+        property_name = declaration[:separator].strip().lower()
+        property_value = declaration[separator + 1 :].strip()
+        if (
+            property_name not in _SVG_SAFE_STYLE_PROPERTIES
+            or not property_value
+            or not re.fullmatch(r"-?[a-z][a-z0-9-]*", property_name)
+        ):
+            continue
+
+        # Normalize only for inspection.  CSS whitespace can otherwise split
+        # javascript:/expression() tokens across lines.  Backslashes and
+        # comments were rejected above, so this catches their plain forms and
+        # cannot be bypassed with a CSS escape.
+        normalized_value = re.sub(r"\s+", "", property_value).lower()
+        if any(
+            token in normalized_value
+            for token in (
+                "javascript:",
+                "vbscript:",
+                "data:",
+                "expression(",
+                "var(",
+                "-moz-binding",
+                "behavior:",
+                "progid:",
+                "@import",
+            )
+        ):
+            continue
+        if "@" in property_value:
+            continue
+
+        # CSS URL functions are only useful for same-document SVG resources.
+        # Do not accept a bare ``url`` token or any external/data URL.  The
+        # exact shape also prevents nested functions and quote tricks.
+        urls = re.findall(r"url\s*\(([^)]*)\)", property_value, flags=re.IGNORECASE)
+        if re.search(r"url\s*\(", property_value, flags=re.IGNORECASE):
+            if not urls or any(not _is_safe_svg_local_url_target(target) for target in urls):
+                continue
+            if re.sub(r"url\s*\([^)]*\)", "", property_value, flags=re.IGNORECASE).lower().find("url") >= 0:
+                continue
+        elif re.search(r"\burl\b", normalized_value, flags=re.IGNORECASE):
+            continue
+
+        safe.append(f"{property_name}:{property_value}")
+
+    return ";".join(safe) or None
+
+
+def _sanitize_svg_stylesheet(value: str) -> Optional[str]:
+    """Filter a small, static subset of an SVG ``<style>`` stylesheet.
+
+    SVG exports commonly put presentation declarations in rules such as
+    ``.background{fill:#fff}``.  At-rules (including ``@import`` and
+    ``@font-face``) and nested CSS are intentionally unsupported; retaining
+    only selector/declaration blocks keeps the stylesheet useful without
+    exposing browser-specific CSS execution features.
+    """
+    if not isinstance(value, str) or not value or len(value) > 64 * 1024:
+        return None
+    if (
+        "/*" in value
+        or "*/" in value
+        or "\\" in value
+        or any(ord(char) < 0x20 and char not in "\t\n\r\f" for char in value)
+        or any(char in value for char in "<>")
+    ):
+        return None
+
+    rules: List[str] = []
+    cursor = 0
+    length = len(value)
+    while cursor < length:
+        while cursor < length and value[cursor].isspace():
+            cursor += 1
+        if cursor >= length:
+            break
+
+        # Find the next top-level rule opener/terminator.  A top-level
+        # semicolon belongs to an at-rule such as @import; discard that
+        # at-rule and continue so a later safe rule is still useful.
+        quote: Optional[str] = None
+        paren_depth = 0
+        opener = -1
+        terminator = ""
+        index = cursor
+        while index < length:
+            char = value[index]
+            if quote:
+                if char == quote:
+                    quote = None
+            elif char in ("'", '"'):
+                quote = char
+            elif char == "(":
+                paren_depth += 1
+            elif char == ")":
+                if paren_depth == 0:
+                    return None
+                paren_depth -= 1
+            elif paren_depth == 0 and char in "{};":
+                opener = index
+                terminator = char
+                break
+            index += 1
+        if quote or paren_depth or opener == -1:
+            return None
+        if terminator == ";":
+            # Only at-rules may appear between ordinary rules.  A stray
+            # declaration or selector is malformed and causes the style
+            # element to be dropped.
+            if not value[cursor:opener].lstrip().startswith("@"):
+                return None
+            cursor = opener + 1
+            continue
+        if terminator == "}":
+            return None
+
+        selector = value[cursor:opener].strip()
+        body_start = opener + 1
+        index = body_start
+        quote = None
+        paren_depth = 0
+        nested_depth = 0
+        closer = -1
+        while index < length:
+            char = value[index]
+            if quote:
+                if char == quote:
+                    quote = None
+            elif char in ("'", '"'):
+                quote = char
+            elif char == "(":
+                paren_depth += 1
+            elif char == ")":
+                if paren_depth == 0:
+                    return None
+                paren_depth -= 1
+            elif paren_depth == 0 and char == "{":
+                nested_depth += 1
+            elif paren_depth == 0 and char == "}":
+                if nested_depth:
+                    nested_depth -= 1
+                else:
+                    closer = index
+                    break
+            index += 1
+        if quote or paren_depth or closer == -1:
+            return None
+
+        # At-rules with blocks (for example @font-face/@media) and nested
+        # blocks are skipped as a unit.  The preceding and following ordinary
+        # rules remain available for preview.
+        if (
+            not selector
+            or ";" in selector
+            or selector.lstrip().startswith("@")
+            or nested_depth
+            or re.search(r"(?:url|javascript|vbscript|data)\s*\(", selector, flags=re.IGNORECASE)
+        ):
+            cursor = closer + 1
+            continue
+
+        declarations = _sanitize_svg_style(value[body_start:closer])
+        if declarations:
+            rules.append(f"{selector}{{{declarations}}}")
+        cursor = closer + 1
+
+    return "".join(rules) or None
+
+
+def _svg_local_name(value: str) -> str:
+    return value.rsplit("}", 1)[-1].lower()
+
+
+def sanitize_svg(content: bytes, *, max_bytes: int = MAX_SAFE_SVG_BYTES) -> bytes:
+    """Return a conservative, non-active SVG suitable for an ``<img>``.
+
+    SVG files are user-controlled XML and may contain script, event handlers,
+    CSS, or external references.  We reject DTD/entity constructs before
+    parsing (the stdlib parser is not an HTML sanitizer), remove active nodes
+    and event attributes, retain only filtered static CSS declarations, and
+    keep URI attributes only for local fragments or embedded raster images.
+    Callers should fall back to an attachment when this validation fails.
+    """
+    if not isinstance(content, (bytes, bytearray)) or len(content) > max_bytes:
+        raise ValueError("SVG 文件超过安全预览大小限制")
+    raw = bytes(content)
+    lowered = raw.lower()
+    # Do not let an XML entity/stylesheet declaration reach ElementTree.  This
+    # also rejects external entities and the common billion-laughs payload.
+    if any(marker in lowered for marker in (b"<!doctype", b"<!entity", b"<?xml-stylesheet")):
+        raise ValueError("SVG 包含不允许的 XML 声明")
+    try:
+        root = ET.fromstring(raw)
+    except (ET.ParseError, ValueError, UnicodeError) as exc:
+        raise ValueError("SVG XML 结构无效") from exc
+    if _svg_local_name(root.tag) != "svg":
+        raise ValueError("SVG 根元素无效")
+
+    def scrub(element: ET.Element) -> None:
+        for child in list(element):
+            child_local = _svg_local_name(child.tag)
+            if child_local == "style":
+                # Keep only ordinary selector/declaration rules.  A style
+                # element with nested XML, unsupported at-rules, or no safe
+                # declarations is removed as active content.
+                if list(child) or not child.text:
+                    element.remove(child)
+                    continue
+                safe_stylesheet = _sanitize_svg_stylesheet(child.text)
+                if safe_stylesheet is None:
+                    element.remove(child)
+                    continue
+                child.attrib.clear()
+                child.text = safe_stylesheet
+            elif child_local in _SVG_DANGEROUS_TAGS:
+                element.remove(child)
+            else:
+                scrub(child)
+
+        for attr_name, attr_value in list(element.attrib.items()):
+            local = _svg_local_name(attr_name)
+            value = str(attr_value).strip()
+            lowered_value = value.lower()
+            # Event attributes (onload, onclick, ...) are executable in
+            # SVG-capable user agents.  Inline CSS is filtered declaration by
+            # declaration so static presentation styles remain usable.
+            if local.startswith("on"):
+                element.attrib.pop(attr_name, None)
+                continue
+            if local == "style":
+                safe_style = _sanitize_svg_style(value)
+                if safe_style is None:
+                    element.attrib.pop(attr_name, None)
+                else:
+                    element.attrib[attr_name] = safe_style
+                continue
+            # URI-bearing values can occur in presentation attributes too
+            # (fill/filter/clip-path).  Keep only local fragment references;
+            # external URLs and javascript/data markup are removed globally.
+            if (
+                any(scheme in lowered_value for scheme in ("javascript:", "vbscript:", "data:text/", "data:image/svg"))
+                or ("url(" in lowered_value and not re.fullmatch(r"url\(\s*#[^)]{1,256}\s*\)", lowered_value))
+            ):
+                element.attrib.pop(attr_name, None)
+                continue
+            if local in _SVG_URI_ATTRIBUTES:
+                # Permit only same-document fragments and embedded raster
+                # images.  SVG-in-SVG, javascript:, http(s), and data URLs
+                # containing markup are intentionally not previewable.
+                safe_local = value.startswith("#") and len(value) <= 256
+                safe_raster = _is_safe_svg_raster_data_url(value, max_bytes=max_bytes)
+                if not (safe_local or safe_raster):
+                    element.attrib.pop(attr_name, None)
+
+    try:
+        scrub(root)
+    except RecursionError as exc:
+        raise ValueError("SVG 嵌套层级超过安全上限") from exc
+    try:
+        sanitized = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+    except RecursionError as exc:
+        raise ValueError("SVG 嵌套层级超过安全上限") from exc
+    if len(sanitized) > max_bytes:
+        raise ValueError("SVG 清洗结果超过安全预览大小限制")
+    return sanitized
 
 
 # -------------------------------------------------------------
@@ -121,24 +622,40 @@ class UpdateBotPayload(BaseModel):
 
 
 class AttachmentItem(BaseModel):
-    id: str = Field(..., description="附件唯一标识")
-    name: str = Field(..., description="原始文件名")
+    id: str = Field(..., max_length=256, description="附件唯一标识")
+    name: str = Field(..., max_length=512, description="原始文件名")
     size: int = Field(default=0, description="文件大小（字节）")
-    type: str = Field(default="file", description="文件格式类型，如 docx, xlsx, csv, txt, pdf, png 等")
-    category: Optional[str] = Field(default="file", description="分类：document, table, text, image, code 等")
-    path: str = Field(..., description="服务器本地文件绝对路径")
-    url: Optional[str] = Field(default=None, description="在线访问/下载地址")
-    data_url: Optional[str] = Field(default=None, description="用于图片快速缩略图的 Base64 Data URL")
-    size_formatted: Optional[str] = Field(default=None, description="人性化大小表示")
-    summary: Optional[str] = Field(default=None, description="结构化摘要")
-    preview: Optional[str] = Field(default=None, description="预览文本")
+    type: str = Field(default="file", max_length=64, description="文件格式类型，如 docx, xlsx, csv, txt, pdf, png 等")
+    category: Optional[str] = Field(default="file", max_length=64, description="分类：document, table, text, image, code 等")
+    path: str = Field(..., max_length=4096, description="服务器本地文件绝对路径")
+    url: Optional[str] = Field(default=None, max_length=4096, description="在线访问/下载地址")
+    # The server resolves attachments from its uploads directory; accepting a
+    # multi-megabyte client supplied data URL only duplicates request/SSE state.
+    data_url: Optional[str] = Field(
+        default=None,
+        max_length=MAX_ATTACHMENT_DATA_URL_LENGTH,
+        description="用于图片快速缩略图的 Base64 Data URL（最多 5 MiB）",
+    )
+    size_formatted: Optional[str] = Field(default=None, max_length=128, description="人性化大小表示")
+    summary: Optional[str] = Field(default=None, max_length=65_536, description="结构化摘要")
+    preview: Optional[str] = Field(default=None, max_length=65_536, description="预览文本")
     meta: Optional[Dict[str, Any]] = Field(default=None, description="结构元数据")
+
+    @field_validator("meta")
+    @classmethod
+    def bound_meta_size(cls, value: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        if value is None:
+            return None
+        encoded = json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str).encode("utf-8")
+        if len(encoded) > MAX_ATTACHMENT_META_BYTES:
+            raise ValueError("附件元数据超过 128 KiB 限制")
+        return value
 
 
 class ChatPayload(BaseModel):
-    message: str = Field(default="", description="用户输入的指令或问题")
+    message: str = Field(default="", max_length=1_048_576, description="用户输入的指令或问题")
     client_msg_id: Optional[str] = Field(default=None, description="前端指定的消息ID")
-    attachments: Optional[List[AttachmentItem]] = Field(default=None, description="随消息发送的附件列表")
+    attachments: Optional[List[AttachmentItem]] = Field(default=None, max_length=20, description="随消息发送的附件列表")
 
 
 class TruncateHistoryPayload(BaseModel):
@@ -158,8 +675,15 @@ class GuidelinePayload(BaseModel):
 class SaveSkillPayload(BaseModel):
     name: str = Field(..., description="技能名称")
     description: str = Field(..., description="功能描述")
-    python_code: str = Field(..., description="Python 代码")
+    python_code: str = Field(..., max_length=MAX_SKILL_CODE_BYTES, description="Python 代码")
     input_schema: Optional[Dict[str, Any]] = Field(default_factory=dict, description="入参模式说明")
+
+    @field_validator("python_code")
+    @classmethod
+    def bound_python_code_bytes(cls, value: str) -> str:
+        if len(value.encode("utf-8")) > MAX_SKILL_CODE_BYTES:
+            raise ValueError("技能代码超过 64 KiB 限制")
+        return value
 
 
 class RunSkillPayload(BaseModel):
@@ -744,7 +1268,6 @@ async def upload_bot_file(
         os.makedirs(uploads_dir, exist_ok=True)
     except OSError as exc:
         raise HTTPException(status_code=500, detail="无法创建文件上传目录") from exc
-
     original_filename = file.filename or "uploaded_file"
     safe_name = os.path.basename(original_filename)
     safe_name = re.sub(r"[^\w\.\-\u4e00-\u9fa5]", "_", safe_name)
@@ -755,11 +1278,23 @@ async def upload_bot_file(
     content = await file.read(MAX_AGENT_UPLOAD_BYTES + 1)
     if len(content) > MAX_AGENT_UPLOAD_BYTES:
         raise HTTPException(status_code=413, detail="上传文件超过 50 MiB 限制")
-    try:
-        with open(saved_path, "wb") as f:
-            f.write(content)
-    except OSError as exc:
-        raise HTTPException(status_code=500, detail="文件保存失败") from exc
+    # Serialize the count check with the write so concurrent uploads cannot
+    # all observe the same remaining slot.
+    with bot_manager._lock:
+        try:
+            existing_file_count = sum(
+                1 for entry in os.scandir(uploads_dir)
+                if entry.is_file(follow_symlinks=False)
+            )
+        except OSError as exc:
+            raise HTTPException(status_code=500, detail="读取文件上传目录失败") from exc
+        if existing_file_count >= MAX_AGENT_FILES_PER_BOT:
+            raise HTTPException(status_code=413, detail="该智能体文件数量已达到上限，请先清理旧文件")
+        try:
+            with open(saved_path, "wb") as f:
+                f.write(content)
+        except OSError as exc:
+            raise HTTPException(status_code=500, detail="文件保存失败") from exc
 
     try:
         parsed = await run_in_threadpool(parse_file_summary, saved_path, safe_name)
@@ -820,26 +1355,24 @@ def get_bot_file(bot_id: str, filename: str, download: bool = Query(default=Fals
     # 1. 尝试直接路径匹配
     if file_path is None:
         candidate = None
-        # 2. 优先从 history.json 中检索关联关系（避免同名不同批次文件混淆）
-        hist_path = os.path.join(bot_dir, "history.json")
-        if os.path.exists(hist_path):
-            try:
-                with open(hist_path, "r", encoding="utf-8") as f:
-                    history = json.load(f)
-                    for msg in history:
-                        for att in msg.get("metadata", {}).get("attachments", []):
-                            u = att.get("url", "")
-                            sn = att.get("saved_name", "")
-                            # 匹配 url 后缀或者原始文件名
-                            if (u.endswith(f"/{safe_filename}") or att.get("name") == safe_filename) and sn:
-                                sp = confined_file_path(sn)
-                                if sp:
-                                    candidate = sp
-                                    break
-                        if candidate:
+        # 2. 从 BotManager 读取当前 JSONL/兼容历史，避免只看过时的
+        # history.json 快照而漏掉新追加消息中的附件关联。
+        try:
+            history = bot_manager.get_history(bot_id, limit=5000)
+            for msg in history:
+                for att in msg.get("metadata", {}).get("attachments", []):
+                    u = att.get("url", "")
+                    sn = att.get("saved_name", "")
+                    # 匹配 url 后缀或者原始文件名
+                    if (u.endswith(f"/{safe_filename}") or att.get("name") == safe_filename) and sn:
+                        sp = confined_file_path(sn)
+                        if sp:
+                            candidate = sp
                             break
-            except Exception:
-                pass
+                if candidate:
+                    break
+        except Exception:
+            pass
 
         # 3. 尝试模糊/后缀回退匹配 (如传入 screenshot.png 匹配到 f_xxx_screenshot.png)
         if not candidate and os.path.exists(uploads_dir):
@@ -868,7 +1401,6 @@ def get_bot_file(bot_id: str, filename: str, download: bool = Query(default=Fals
     active_mime = mime_type in {
         "text/html",
         "application/xhtml+xml",
-        "image/svg+xml",
         "application/javascript",
     }
     is_previewable = bool(
@@ -877,8 +1409,36 @@ def get_bot_file(bot_id: str, filename: str, download: bool = Query(default=Fals
             or mime_type in ("application/pdf", "text/plain", "text/markdown", "application/json")
         )
     )
-    disposition = "attachment" if download or active_mime else ("inline" if is_previewable else "attachment")
-    media_type = "application/octet-stream" if active_mime else (mime_type or "application/octet-stream")
+    # SVG is executable XML.  Sanitize it before allowing an inline response,
+    # so Markdown <img> previews retain their MIME type without exposing the
+    # same-origin page to scripts or external resource loads.  Invalid,
+    # oversized, or otherwise unsafe SVGs keep the conservative download path.
+    if mime_type == "image/svg+xml":
+        try:
+            with open(file_path, "rb") as svg_file:
+                svg_content = svg_file.read(MAX_SAFE_SVG_BYTES + 1)
+            sanitized_svg = sanitize_svg(svg_content)
+        except (OSError, ValueError):
+            disposition = "attachment"
+            media_type = "application/octet-stream"
+        else:
+            disposition = "attachment" if download else "inline"
+            safe_ascii_name = re.sub(r"[^A-Za-z0-9._-]", "_", safe_filename) or "image.svg"
+            encoded_name = quote(safe_filename, safe="")
+            response = Response(
+                content=sanitized_svg,
+                media_type="image/svg+xml",
+                headers={
+                    "Content-Disposition": f'{disposition}; filename="{safe_ascii_name}"; filename*=UTF-8\'\'{encoded_name}',
+                    "Content-Security-Policy": "default-src 'none'; script-src 'none'; object-src 'none'; img-src 'data:'; base-uri 'none'; frame-ancestors 'none'",
+                    "X-Content-Type-Options": "nosniff",
+                    "Cache-Control": "no-store",
+                },
+            )
+            return response
+    else:
+        disposition = "attachment" if download or active_mime else ("inline" if is_previewable else "attachment")
+        media_type = "application/octet-stream" if active_mime else (mime_type or "application/octet-stream")
 
     response = FileResponse(
         file_path,
@@ -919,7 +1479,7 @@ def _unique_archive_name(clean_name: str, used_names: set[str]) -> str:
 @router.get("/bots/{bot_id}/files-export", dependencies=[Depends(require_bot_access)])
 def export_all_bot_files(bot_id: str):
     """一键打包下载智能体所有产出物与文件（ZIP 压缩流）"""
-    import io
+    import tempfile
     import zipfile
     bot = bot_manager.get_bot(bot_id)
     if not bot:
@@ -935,22 +1495,77 @@ def export_all_bot_files(bot_id: str):
     if not upload_names:
         raise HTTPException(status_code=404, detail="该智能体当前暂无任何产出物或文件")
 
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        used_names = set()
-        for fn in sorted(upload_names):
-            fp = os.path.join(uploads_dir, fn)
-            if os.path.isfile(fp):
+    export_files: list[tuple[str, str, int]] = []
+    total_bytes = 0
+    for fn in sorted(upload_names):
+        # Stop before touching any further directory entries once the count
+        # quota is reached; the archive is intentionally a bounded prefix.
+        if len(export_files) >= MAX_AGENT_FILES_PER_BOT:
+            break
+        fp = os.path.join(uploads_dir, fn)
+        try:
+            # Never follow a symlink from the asset directory during export.
+            if os.path.islink(fp) or not os.path.isfile(fp):
+                continue
+            size = os.path.getsize(fp)
+        except OSError as exc:
+            raise HTTPException(status_code=500, detail="读取待导出文件失败") from exc
+        if total_bytes + size > MAX_AGENT_EXPORT_BYTES:
+            # Export a bounded prefix so a full asset directory remains
+            # recoverable even after it crosses the aggregate budget.  The
+            # archive-size check below still protects the response itself.
+            break
+        export_files.append((fn, fp, size))
+        total_bytes += size
+    if not export_files:
+        raise HTTPException(status_code=404, detail="该智能体当前暂无可导出的普通文件")
+
+    # Build the ZIP on disk so a large archive does not occupy one contiguous
+    # in-process BytesIO allocation.  The response generator removes the
+    # temporary file after the client has consumed (or abandoned) the stream.
+    tmp = tempfile.NamedTemporaryFile(prefix="tim_files_export_", suffix=".zip", delete=False)
+    tmp_path = tmp.name
+    try:
+        with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zf:
+            used_names = set()
+            for fn, fp, _size in export_files:
                 clean_name = re.sub(r"^f_\d+_", "", fn)
                 arc_name = _unique_archive_name(clean_name, used_names)
                 zf.write(fp, arcname=arc_name)
-    buf.seek(0)
+                if tmp.tell() > MAX_AGENT_EXPORT_BYTES:
+                    raise HTTPException(status_code=413, detail="导出文件压缩结果超过 100 MiB 安全上限")
+        # The central directory is written when ZipFile closes; include it in
+        # the same limit check.
+        tmp.flush()
+        if os.path.getsize(tmp_path) > MAX_AGENT_EXPORT_BYTES:
+            raise HTTPException(status_code=413, detail="导出文件压缩结果超过 100 MiB 安全上限")
+    except Exception:
+        with suppress(OSError):
+            tmp.close()
+        with suppress(OSError):
+            os.remove(tmp_path)
+        raise
+    finally:
+        with suppress(OSError):
+            tmp.close()
 
     import urllib.parse
     ascii_filename = f"{bot_id}_files_{int(time.time())}.zip"
     encoded_filename = urllib.parse.quote(f"{bot.name}_files_{int(time.time())}.zip")
+    def zip_stream():
+        try:
+            with open(tmp_path, "rb") as archive:
+                while True:
+                    chunk = archive.read(64 * 1024)
+                    if not chunk:
+                        break
+                    yield chunk
+        finally:
+            with suppress(OSError):
+                os.remove(tmp_path)
+
     return StreamingResponse(
-        buf,
+        zip_stream(),
         media_type="application/zip",
         headers={
             "Content-Disposition": f'attachment; filename="{ascii_filename}"; filename*=utf-8\'\'{encoded_filename}'
@@ -983,6 +1598,8 @@ async def chat_with_bot_stream(bot_id: str, payload: ChatPayload, user: CurrentU
         # The client-provided absolute path is untrusted.  ReadFileTool resolves
         # the basename inside the server-owned uploads directory.
         item["path"] = ""
+        item["data_url"] = None
+        item["meta"] = None
         raw_attachments.append(item)
     raw_attachments = raw_attachments or None
     run = agent_run_manager.start_run(
@@ -1069,28 +1686,47 @@ def resolve_bot_approval(bot_id: str, approval_id: str, payload: ApprovalDecisio
 def export_bot_chat(
     bot_id: str,
     format: str = Query(default="markdown"),
-    preview: bool = Query(default=False)
+    preview: bool = Query(default=False),
+    user: CurrentUser | None = Depends(current_user),
 ):
     """一键导出当前智能体会话排障记录（支持 Markdown 与自包含单页交互式 HTML）"""
-    import io
     import re
     import html as html_lib
+    import tempfile
     import urllib.parse
 
     bot = bot_manager.get_bot(bot_id)
     if not bot:
         raise HTTPException(status_code=404, detail="智能体不存在")
 
-    history = bot_manager.get_history(bot_id, limit=2000)
+    export_user_id = getattr(user, "subject", None)
+    history = bot_manager.get_history(bot_id, limit=2000, user_id=export_user_id)
     if not history:
         raise HTTPException(status_code=400, detail="当前暂无会话排障记录可供导出")
+    estimated_history_bytes = 0
+    for message in history:
+        estimated_history_bytes += len(str(message.get("content") or "").encode("utf-8"))
+        try:
+            estimated_history_bytes += len(
+                json.dumps(message.get("metadata") or {}, ensure_ascii=False, default=str).encode("utf-8")
+            )
+        except (TypeError, ValueError):
+            estimated_history_bytes = MAX_AGENT_EXPORT_BYTES + 1
+        if estimated_history_bytes > MAX_AGENT_EXPORT_BYTES:
+            raise HTTPException(status_code=413, detail="会话导出内容超过 100 MiB 安全上限")
 
     export_time = time.strftime("%Y-%m-%d %H:%M:%S")
     clean_bot_name = re.sub(r'[/\\:*?"<>|]', '_', bot.name)
 
     if format.lower() == "html":
         # 生成高保真、独立可离线查看的 HTML 排障报告
-        turns_html = []
+        body_spool = tempfile.SpooledTemporaryFile(max_size=1024 * 1024, mode="w+b")
+
+        class _BodyWriter:
+            def append(self, value: str) -> None:
+                body_spool.write(value.encode("utf-8"))
+
+        turns_html = _BodyWriter()
         for idx, msg in enumerate(history, 1):
             role = msg.get("role", "user")
             content = (msg.get("content") or "").strip()
@@ -1163,12 +1799,15 @@ def export_bot_chat(
                 </div>
                 """)
 
-        body_content = "".join(turns_html)
+        # Keep the document shell small and stream the potentially large body
+        # from the spool in bounded chunks.
+        body_content = "<!-- TIM_BODY_STREAM_MARKER -->"
         html_doc = f"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-hashes' 'sha256-MguIPR6qNR8D3B+eAlK+bIRTZe8t3wkOY4B/56Me9FU='; style-src 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'">
     <title>TIM 智能体排障分析报告 - {html_lib.escape(bot.name)}</title>
     <style>
         body {{
@@ -1321,19 +1960,62 @@ def export_bot_chat(
 </body>
 </html>"""
 
+        html_prefix, html_suffix = html_doc.split(body_content, 1)
+        html_prefix_bytes = html_prefix.encode("utf-8")
+        html_suffix_bytes = html_suffix.encode("utf-8")
+        if len(html_prefix_bytes) + body_spool.tell() + len(html_suffix_bytes) > MAX_AGENT_EXPORT_BYTES:
+            body_spool.close()
+            raise HTTPException(status_code=413, detail="会话导出内容超过 100 MiB 安全上限")
+
+        body_spool.seek(0)
+
         ascii_name = f"tim_report_{bot_id}_{int(time.time())}.html"
         encoded_name = urllib.parse.quote(f"{clean_bot_name}_排障报告_{time.strftime('%Y%m%d_%H%M%S')}.html")
         disposition_type = "inline" if preview else "attachment"
+
+        def html_stream():
+            try:
+                yield html_prefix_bytes
+                while True:
+                    chunk = body_spool.read(64 * 1024)
+                    if not chunk:
+                        break
+                    yield chunk
+                yield html_suffix_bytes
+            finally:
+                body_spool.close()
+
         return StreamingResponse(
-            io.BytesIO(html_doc.encode("utf-8")),
+            html_stream(),
             media_type="text/html; charset=utf-8",
             headers={
-                "Content-Disposition": f'{disposition_type}; filename="{ascii_name}"; filename*=utf-8\'\'{encoded_name}'
+                "Content-Disposition": f'{disposition_type}; filename="{ascii_name}"; filename*=utf-8\'\'{encoded_name}',
+                # Permit only the fixed print handler; report content remains
+                # escaped and no arbitrary script source is allowed.
+                "Content-Security-Policy": "default-src 'none'; script-src 'unsafe-hashes' 'sha256-MguIPR6qNR8D3B+eAlK+bIRTZe8t3wkOY4B/56Me9FU='; style-src 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+                "X-Content-Type-Options": "nosniff",
+                "X-Frame-Options": "DENY",
+                "Referrer-Policy": "no-referrer",
+                "Cache-Control": "no-store",
             }
         )
 
     # 默认 Markdown 格式导出
-    lines = [
+    md_spool = tempfile.SpooledTemporaryFile(max_size=1024 * 1024, mode="w+b")
+
+    class _MarkdownLines:
+        def __init__(self, spool):
+            self.spool = spool
+            self.first = True
+
+        def append(self, value: str) -> None:
+            if not self.first:
+                self.spool.write(b"\n")
+            self.spool.write(str(value).encode("utf-8"))
+            self.first = False
+
+    lines = _MarkdownLines(md_spool)
+    for initial_line in [
         f"# 📋 TIM 智能体排障分析报告 - {bot.name}",
         "",
         f"> **生成时间**: {export_time}  ",
@@ -1343,7 +2025,8 @@ def export_bot_chat(
         "",
         "---",
         ""
-    ]
+    ]:
+        lines.append(initial_line)
 
     for idx, msg in enumerate(history, 1):
         role = msg.get("role", "user")
@@ -1385,11 +2068,24 @@ def export_bot_chat(
             lines.append(f"#### 🎯 智能体结论\n\n{content}\n")
             lines.append("\n---\n")
 
-    md_content = "\n".join(lines)
+    if md_spool.tell() > MAX_AGENT_EXPORT_BYTES:
+        md_spool.close()
+        raise HTTPException(status_code=413, detail="会话导出内容超过 100 MiB 安全上限")
+    md_spool.seek(0)
     ascii_name = f"tim_report_{bot_id}_{int(time.time())}.md"
     encoded_name = urllib.parse.quote(f"{clean_bot_name}_排障报告_{time.strftime('%Y%m%d_%H%M%S')}.md")
+    def markdown_stream():
+        try:
+            while True:
+                chunk = md_spool.read(64 * 1024)
+                if not chunk:
+                    break
+                yield chunk
+        finally:
+            md_spool.close()
+
     return StreamingResponse(
-        io.BytesIO(md_content.encode("utf-8")),
+        markdown_stream(),
         media_type="text/markdown; charset=utf-8",
         headers={
             "Content-Disposition": f'attachment; filename="{ascii_name}"; filename*=utf-8\'\'{encoded_name}'
@@ -1464,6 +2160,10 @@ def create_or_save_skill(bot_id: str, payload: SaveSkillPayload):
     bot = bot_manager.get_bot(bot_id)
     if not bot:
         raise HTTPException(status_code=404, detail="BOT 不存在")
+    try:
+        _validate_skill_ast(payload.python_code)
+    except (SyntaxError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=f"技能代码预检失败: {exc}") from exc
     skill = bot_manager.save_skill(
         bot_id=bot_id,
         name=payload.name,

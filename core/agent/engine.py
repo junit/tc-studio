@@ -5,18 +5,34 @@
 import inspect
 import json
 import logging
+import math
+import multiprocessing
 import os
 import re
+import select
+import signal
+import shutil
+import socket
+import struct
+import subprocess
+import sys
 import threading
 import time
+import ctypes
+import weakref
 from collections import OrderedDict
 from collections.abc import Iterable
+from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
+from contextlib import suppress
+from functools import wraps
 from datetime import UTC, datetime
 from typing import Any, cast
 
 import smolagents.agents as saa
 from smolagents import AgentMaxStepsError, CodeAgent, OpenAIServerModel
 from smolagents.agents import ActionOutput
+import smolagents.local_python_executor as local_python_executor
+from smolagents.local_python_executor import CodeOutput, PythonExecutor
 from smolagents.memory import ActionStep, FinalAnswerStep, PlanningStep, ToolCall
 from smolagents.models import (
     ChatMessageStreamDelta,
@@ -45,6 +61,1305 @@ from .tools import (
     build_bot_tools,
     build_sandbox_scope,
 )
+
+MAX_GENERATED_FILE_BYTES = 100 * 1024 * 1024
+MAX_GENERATED_FILES = 1000
+MAX_GENERATED_TOTAL_BYTES = 512 * 1024 * 1024
+MAX_SANDBOX_FOR_ITERATIONS = 100_000
+DEFAULT_CODE_EXECUTION_TIMEOUT_SECONDS = 30.0
+MAX_EXECUTOR_IPC_BYTES = 8 * 1024 * 1024
+MAX_EXECUTOR_STATE_BYTES = 512 * 1024
+
+# ``open`` is exposed to model code as a deliberately small file capability.
+# Keep the quota check and the write itself in one critical section so two
+# executor threads cannot each observe the same remaining space and exceed the
+# bot's aggregate output budget.
+_SANDBOX_FILE_QUOTA_LOCK = threading.RLock()
+_SANDBOX_FILE_ESCAPE_ATTRIBUTES = frozenset(
+    {"buffer", "raw", "detach", "fileno", "__dict__"}
+)
+_SANDBOX_QUOTA_FILES: weakref.WeakKeyDictionary[Any, dict[str, Any]] = (
+    weakref.WeakKeyDictionary()
+)
+_SANDBOX_QUOTA_TOTALS: dict[str, int] = {}
+
+
+def _sandbox_quota_file_state(proxy: Any) -> dict[str, Any]:
+    try:
+        return _SANDBOX_QUOTA_FILES[proxy]
+    except KeyError as exc:
+        raise ValueError("沙箱文件对象已失效") from exc
+
+
+def _executor_wire_value(value: Any, *, depth: int = 0, budget: list[int] | None = None) -> Any:
+    """Convert executor results/state to bounded JSON values before IPC.
+
+    Values produced by model code must never be unpickled in the parent
+    process.  Unknown objects are represented as text, while ordinary JSON
+    values retain their useful shape for CodeAgent observations.
+    """
+    if budget is None:
+        budget = [MAX_EXECUTOR_STATE_BYTES]
+    if budget[0] <= 0 or depth > 8:
+        return "<value truncated>"
+    if value is None or isinstance(value, (str, bool, int)):
+        text_len = len(value.encode("utf-8")) if isinstance(value, str) else 8
+        budget[0] -= text_len
+        return value if budget[0] >= 0 else "<value truncated>"
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            return str(value)
+        budget[0] -= 8
+        return value if budget[0] >= 0 else "<value truncated>"
+    if isinstance(value, (bytes, bytearray)):
+        budget[0] -= min(len(value), 256)
+        return f"<bytes:{len(value)}>"
+    if isinstance(value, dict):
+        result: dict[str, Any] = {}
+        for index, (key, item) in enumerate(value.items()):
+            if index >= 1000:
+                break
+            if budget[0] <= 0:
+                break
+            result[str(key)] = _executor_wire_value(item, depth=depth + 1, budget=budget)
+        return result
+    if isinstance(value, (list, tuple, set)):
+        result = []
+        for index, item in enumerate(value):
+            if index >= 1000:
+                break
+            if budget[0] <= 0:
+                break
+            result.append(_executor_wire_value(item, depth=depth + 1, budget=budget))
+        return result
+    text = str(value)
+    budget[0] -= len(text.encode("utf-8"))
+    return text if budget[0] >= 0 else "<value truncated>"
+
+
+def _executor_state_snapshot(state: dict[str, Any]) -> dict[str, Any]:
+    """Return only bounded, non-callable user variables for parent sync."""
+    snapshot: dict[str, Any] = {}
+    budget = [MAX_EXECUTOR_STATE_BYTES]
+    for key, value in state.items():
+        key = str(key)
+        if key.startswith("_") or callable(value) or budget[0] <= 0:
+            continue
+        snapshot[key] = _executor_wire_value(value, budget=budget)
+    return snapshot
+
+
+def _executor_send(conn: Any, message: dict[str, Any]) -> None:
+    payload = json.dumps(
+        _executor_wire_value(message, budget=[MAX_EXECUTOR_IPC_BYTES]),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    if len(payload) > MAX_EXECUTOR_IPC_BYTES:
+        raise RuntimeError("Python 执行器 IPC 消息超过安全上限")
+    conn.send_bytes(payload)
+
+
+def _executor_recv(conn: Any) -> dict[str, Any]:
+    payload = conn.recv_bytes(MAX_EXECUTOR_IPC_BYTES)
+    message = json.loads(payload.decode("utf-8"))
+    if not isinstance(message, dict):
+        raise RuntimeError("Python 执行器 IPC 消息格式无效")
+    return message
+
+
+def _terminate_worker_group(_signum: int = signal.SIGTERM, _frame: Any = None) -> None:
+    """Terminate the evaluator and every descendant in its private group."""
+    if os.name == "posix" and os.getpgrp() == os.getpid():
+        with suppress(OSError):
+            os.killpg(os.getpgrp(), signal.SIGKILL)
+    os._exit(128 + int(_signum))
+
+
+def _set_linux_parent_death_signal() -> None:
+    """Ask Linux to notify the worker when its parent disappears.
+
+    The liveness pipe below is the portable fallback.  ``PR_SET_PDEATHSIG``
+    closes the small race where a worker can be orphaned before its watchdog
+    has started, and the SIGTERM handler turns that notification into a
+    process-group kill so grandchildren cannot remain behind.
+    """
+    if sys.platform != "linux":
+        return
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        prctl = libc.prctl
+        prctl.argtypes = [ctypes.c_int, ctypes.c_ulong]
+        prctl.restype = ctypes.c_int
+        if prctl(1, int(signal.SIGTERM)) != 0:  # PR_SET_PDEATHSIG
+            raise OSError(ctypes.get_errno(), "prctl(PR_SET_PDEATHSIG) failed")
+    except Exception:
+        # The liveness pipe still protects the normal parent-death path.  Do
+        # not make worker startup depend on ctypes/libc details on BSD hosts.
+        logging.getLogger(__name__).warning("无法设置 Linux PDEATHSIG", exc_info=True)
+
+
+def _watch_parent_liveness(liveness_conn: Any) -> None:
+    """Kill this worker group when the parent closes its liveness pipe."""
+    try:
+        liveness_conn.recv_bytes()
+    except (EOFError, OSError, BrokenPipeError):
+        _terminate_worker_group(signal.SIGTERM)
+    except Exception:
+        _terminate_worker_group(signal.SIGTERM)
+
+
+def _windows_assign_kill_on_close_job(pid: int) -> int | None:
+    """Put a spawn worker tree in a Windows Job Object.
+
+    Closing the parent's job handle (including process exit) then terminates
+    every descendant.  The liveness pipe remains useful as a fallback when a
+    host disallows nested jobs.
+    """
+    if os.name != "nt":
+        return None
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p]
+        kernel32.CreateJobObjectW.restype = ctypes.c_void_p
+        kernel32.SetInformationJobObject.argtypes = [
+            ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_ulong
+        ]
+        kernel32.SetInformationJobObject.restype = ctypes.c_bool
+        kernel32.OpenProcess.argtypes = [ctypes.c_ulong, ctypes.c_bool, ctypes.c_ulong]
+        kernel32.OpenProcess.restype = ctypes.c_void_p
+        kernel32.AssignProcessToJobObject.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        kernel32.AssignProcessToJobObject.restype = ctypes.c_bool
+        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+        kernel32.CloseHandle.restype = ctypes.c_bool
+        handle = kernel32.CreateJobObjectW(None, None)
+        if not handle:
+            raise ctypes.WinError(ctypes.get_last_error())
+
+        class _BasicLimit(ctypes.Structure):
+            _fields_ = [
+                ("PerProcessUserTimeLimit", ctypes.c_longlong),
+                ("PerJobUserTimeLimit", ctypes.c_longlong),
+                ("LimitFlags", ctypes.c_ulong),
+                ("MinimumWorkingSetSize", ctypes.c_size_t),
+                ("MaximumWorkingSetSize", ctypes.c_size_t),
+                ("ActiveProcessLimit", ctypes.c_ulong),
+                ("Affinity", ctypes.c_void_p),
+                ("PriorityClass", ctypes.c_ulong),
+                ("SchedulingClass", ctypes.c_ulong),
+            ]
+
+        class _IoCounters(ctypes.Structure):
+            _fields_ = [(name, ctypes.c_ulonglong) for name in (
+                "ReadOperationCount", "WriteOperationCount", "OtherOperationCount",
+                "ReadTransferCount", "WriteTransferCount", "OtherTransferCount",
+            )]
+
+        class _ExtendedLimit(ctypes.Structure):
+            _fields_ = [("BasicLimitInformation", _BasicLimit), ("IoInfo", _IoCounters),
+                        ("ProcessMemoryLimit", ctypes.c_size_t),
+                        ("JobMemoryLimit", ctypes.c_size_t),
+                        ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                        ("PeakJobMemoryUsed", ctypes.c_size_t)]
+
+        info = _ExtendedLimit()
+        info.BasicLimitInformation.LimitFlags = 0x2000  # KILL_ON_JOB_CLOSE
+        if not kernel32.SetInformationJobObject(
+            handle, 9, ctypes.byref(info), ctypes.sizeof(info)
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+        process_handle = kernel32.OpenProcess(0x0200 | 0x0001, False, int(pid))
+        if not process_handle:
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            if not kernel32.AssignProcessToJobObject(handle, process_handle):
+                raise ctypes.WinError(ctypes.get_last_error())
+        finally:
+            kernel32.CloseHandle(process_handle)
+        return int(handle)
+    except Exception:
+        with suppress(Exception):
+            kernel32.CloseHandle(handle)
+        logging.getLogger(__name__).warning("无法将 Windows executor 放入 kill-on-close Job Object", exc_info=True)
+        return None
+
+
+def _windows_close_job(handle: int | None) -> None:
+    if handle and os.name == "nt":
+        with suppress(Exception):
+            ctypes.WinDLL("kernel32", use_last_error=True).CloseHandle(handle)
+
+
+def _prepare_worker_lifecycle(
+    liveness_conn: Any | None,
+    expected_parent_pid: int | None,
+    inherited_liveness_writer: Any | None = None,
+) -> int | None:
+    process_group = None
+    if os.name == "posix":
+        try:
+            os.setsid()
+            process_group = os.getpgrp()
+            if process_group != os.getpid():
+                process_group = None
+        except OSError:
+            process_group = None
+    if inherited_liveness_writer is not None:
+        with suppress(Exception):
+            inherited_liveness_writer.close()
+    signal.signal(signal.SIGTERM, _terminate_worker_group)
+    _set_linux_parent_death_signal()
+    if expected_parent_pid is not None and os.getppid() != expected_parent_pid:
+        _terminate_worker_group(signal.SIGTERM)
+    if liveness_conn is not None:
+        threading.Thread(
+            target=_watch_parent_liveness,
+            args=(liveness_conn,),
+            name="tim-code-executor-parent-watch",
+            daemon=True,
+        ).start()
+    return process_group
+
+
+class _ChildRpcProxy:
+    """Callable capability proxy used by spawn workers."""
+
+    def __init__(self, conn: Any, name: str):
+        self._conn = conn
+        self._name = name
+
+    def __getattribute__(self, name: str) -> Any:
+        if name.startswith("_") and name != "__class__":
+            raise AttributeError(name)
+        return object.__getattribute__(self, name)
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        conn = object.__getattribute__(self, "_conn")
+        name = object.__getattribute__(self, "_name")
+        _executor_send(
+            conn,
+            {
+                "kind": "tool_request",
+                "name": name,
+                "args": list(args),
+                "kwargs": kwargs,
+            },
+        )
+        while True:
+            if not conn.poll(0.2):
+                continue
+            try:
+                message = _executor_recv(conn)
+            except (EOFError, OSError, ValueError, RuntimeError) as exc:
+                raise RuntimeError("Python 执行器进程意外退出") from exc
+            kind = message.get("kind")
+            if kind == "tool_response":
+                if message.get("ok"):
+                    return message.get("result")
+                raise RuntimeError(str(message.get("error") or "工具调用失败"))
+            if kind == "stop":
+                raise RuntimeError("Python 执行器已停止")
+
+
+def _spawn_executor_worker(
+    conn: Any,
+    additional_authorized_imports: list[str],
+    max_print_outputs_length: int | None,
+    tool_names: list[str],
+    function_names: list[str],
+    liveness_conn: Any | None,
+    inherited_liveness_writer: Any | None,
+    expected_parent_pid: int,
+) -> None:
+    """Spawn-safe evaluator; capabilities are dispatched by the parent."""
+    process_group = _prepare_worker_lifecycle(
+        liveness_conn, expected_parent_pid, inherited_liveness_writer
+    )
+    try:
+        with suppress(Exception):
+            _executor_send(conn, {"kind": "ready", "process_group": process_group})
+        local = local_python_executor.LocalPythonExecutor(
+            additional_authorized_imports,
+            max_print_outputs_length=max_print_outputs_length,
+            timeout_seconds=None,
+        )
+        base_tools = getattr(local_python_executor, "BASE_PYTHON_TOOLS", {})
+        local.static_tools = {
+            **{name: _ChildRpcProxy(conn, name) for name in tool_names},
+            **dict(base_tools),
+            **{name: _ChildRpcProxy(conn, name) for name in function_names},
+        }
+        while True:
+            try:
+                message = _executor_recv(conn)
+            except (EOFError, OSError, ValueError, RuntimeError):
+                return
+            kind = message.get("kind")
+            if kind == "close":
+                return
+            if kind == "variables":
+                variables = message.get("variables")
+                if isinstance(variables, dict):
+                    local.state.update(variables)
+                continue
+            if kind != "execute":
+                continue
+            try:
+                result = local(str(message.get("code", "")))
+                _executor_send(
+                    conn,
+                    {
+                        "kind": "result",
+                        "output": result.output,
+                        "logs": result.logs,
+                        "is_final_answer": result.is_final_answer,
+                        "state": _executor_state_snapshot(local.state),
+                    },
+                )
+            except BaseException as exc:
+                with suppress(Exception):
+                    _executor_send(
+                        conn,
+                        {
+                            "kind": "error",
+                            "error_type": type(exc).__name__,
+                            "error": str(exc),
+                            "state": _executor_state_snapshot(local.state),
+                        },
+                    )
+    finally:
+        with suppress(Exception):
+            conn.close()
+        if liveness_conn is not None:
+            with suppress(Exception):
+                liveness_conn.close()
+
+
+def _killable_executor_worker(
+    conn: Any,
+    executor: "KillablePythonExecutor",
+    liveness_conn: Any | None = None,
+    inherited_liveness_writer: Any | None = None,
+    expected_parent_pid: int | None = None,
+) -> None:
+    """Run one persistent evaluator in a child process.
+
+    The child receives the already-built capability functions through the
+    POSIX fork boundary, but the parent only accepts bounded JSON results.  A
+    timed-out call is terminated by the parent, so no evaluator thread can
+    continue mutating state or invoking a capability after the timeout.
+    """
+    executor._conn = conn
+    executor._in_worker = True
+    try:
+        process_group = _prepare_worker_lifecycle(
+            liveness_conn, expected_parent_pid, inherited_liveness_writer
+        )
+        with suppress(Exception):
+            _executor_send(conn, {"kind": "ready", "process_group": process_group})
+        local = local_python_executor.LocalPythonExecutor(
+            executor.additional_authorized_imports,
+            max_print_outputs_length=executor.max_print_outputs_length,
+            timeout_seconds=None,
+        )
+        local.state = executor.state
+        local.static_tools = executor.static_tools
+        local.custom_tools = executor.custom_tools
+        while True:
+            try:
+                message = _executor_recv(conn)
+            except (EOFError, OSError, ValueError, RuntimeError):
+                return
+            kind = message.get("kind")
+            if kind == "close":
+                return
+            if kind == "variables":
+                variables = message.get("variables")
+                if isinstance(variables, dict):
+                    local.state.update(variables)
+                continue
+            if kind != "execute":
+                continue
+            try:
+                result = local(str(message.get("code", "")))
+                _executor_send(
+                    conn,
+                    {
+                        "kind": "result",
+                        "output": result.output,
+                        "logs": result.logs,
+                        "is_final_answer": result.is_final_answer,
+                        "state": _executor_state_snapshot(local.state),
+                    },
+                )
+            except BaseException as exc:
+                with suppress(Exception):
+                    _executor_send(
+                        conn,
+                        {
+                            "kind": "error",
+                            "error_type": type(exc).__name__,
+                            "error": str(exc),
+                            "state": _executor_state_snapshot(local.state),
+                        },
+                    )
+    finally:
+        with suppress(Exception):
+            conn.close()
+
+
+class _ProcessApprovalRequester:
+    """Tool callback proxy that routes approval requests to the parent."""
+
+    def __init__(self, executor: "KillablePythonExecutor"):
+        self._executor = executor
+
+    def __call__(self, request: dict[str, Any]) -> str:
+        if self._executor._handling_child_tool_request:
+            callback = self._executor._approval_callback
+            if callback is None:
+                return "reject"
+            try:
+                return str(callback(request) or "reject")
+            except Exception:
+                return "reject"
+        return self._executor._request_approval_from_child(request)
+
+
+class _ProcessOrchestrationRecorder:
+    """Forward nested-agent records to the parent execution thread."""
+
+    def __init__(self, executor: "KillablePythonExecutor"):
+        self._executor = executor
+
+    def __call__(self, record: dict[str, Any]) -> None:
+        if self._executor._handling_child_tool_request:
+            callback = self._executor._orchestration_callback
+            if callback:
+                with suppress(Exception):
+                    callback(record)
+            return
+        self._executor._send_orchestration_record(record)
+
+
+class KillablePythonExecutor(PythonExecutor):
+    """A process-bound CodeAgent executor with a real wall-clock deadline.
+
+    ``LocalPythonExecutor`` is intentionally retained inside the child for
+    AST semantics and cross-step state, but it runs with its own timeout
+    disabled.  The parent enforces the deadline and terminates the child, so
+    a blocking call cannot outlive the reported timeout.  POSIX single-threaded
+    callers use ``fork`` for compatibility with existing capability closures;
+    multi-threaded callers and Windows use a spawn-safe RPC worker.  The
+    executor never falls back to an in-process evaluator.
+    """
+
+    def __init__(
+        self,
+        additional_authorized_imports: list[str],
+        max_print_outputs_length: int | None = None,
+        timeout_seconds: float | None = DEFAULT_CODE_EXECUTION_TIMEOUT_SECONDS,
+        *,
+        force_spawn: bool = False,
+    ):
+        methods = multiprocessing.get_all_start_methods()
+        if "fork" not in methods and "spawn" not in methods:
+            raise RuntimeError("Python 执行器缺少 fork/spawn 进程边界")
+        self.additional_authorized_imports = list(additional_authorized_imports)
+        self.max_print_outputs_length = max_print_outputs_length
+        self.timeout_seconds = timeout_seconds
+        self.force_spawn = force_spawn
+        self.state: dict[str, Any] = {"__name__": "__main__"}
+        self.static_tools: dict[str, Any] | None = None
+        self.custom_tools: dict[str, Any] = {}
+        self.additional_functions: dict[str, Any] = {}
+        self._fork_ctx = multiprocessing.get_context("fork") if "fork" in methods else None
+        self._spawn_ctx = multiprocessing.get_context("spawn") if "spawn" in methods else None
+        self._conn: Any | None = None
+        self._process: Any | None = None
+        self._process_group_id: int | None = None
+        self._windows_job_handle: int | None = None
+        self._liveness_conn: Any | None = None
+        self._spawn_worker = False
+        self._child_tool_names: list[str] = []
+        self._child_function_names: list[str] = []
+        self._closed = False
+        self._approval_callback: Any | None = None
+        self._orchestration_callback: Any | None = None
+        self._in_worker = False
+        self._handling_child_tool_request = False
+
+    def approval_requester(self, callback: Any | None) -> Any | None:
+        self._approval_callback = callback
+        return _ProcessApprovalRequester(self) if callback else None
+
+    def orchestration_recorder(self, callback: Any | None) -> Any | None:
+        self._orchestration_callback = callback
+        return _ProcessOrchestrationRecorder(self) if callback else None
+
+    def send_variables(self, variables: dict[str, Any]) -> None:
+        self.state.update(variables)
+        if self._conn is not None and self._process is not None and self._process.is_alive():
+            _executor_send(
+                self._conn,
+                {"kind": "variables", "variables": _executor_state_snapshot(variables)},
+            )
+
+    def send_tools(self, tools: dict[str, Any]) -> None:
+        base_tools = getattr(local_python_executor, "BASE_PYTHON_TOOLS", {})
+        self.static_tools = {
+            **tools,
+            **dict(base_tools),
+            **self.additional_functions,
+        }
+        self._child_tool_names = list(tools)
+        self._child_function_names = list(self.additional_functions)
+        self._ensure_worker()
+
+    def _ensure_worker(self) -> None:
+        if self._closed:
+            raise RuntimeError("Python 执行器已关闭")
+        if self._process is not None and self._process.is_alive():
+            return
+        if self._conn is not None:
+            with suppress(Exception):
+                self._conn.close()
+        if self._liveness_conn is not None:
+            with suppress(Exception):
+                self._liveness_conn.close()
+        # macOS can report a single active Python thread while Objective-C /
+        # CoreFoundation worker threads and runtime locks still exist below
+        # Python.  Avoid fork there; the spawn/RPC path is the portable
+        # process boundary for Darwin and Windows.
+        use_fork = (
+            not self.force_spawn
+            and self._fork_ctx is not None
+            and os.name == "posix"
+            and not sys.platform.startswith("darwin")
+            and threading.active_count() == 1
+        )
+        if not use_fork and self._spawn_ctx is None:
+            raise RuntimeError("当前平台多线程执行缺少 spawn 进程边界")
+        ctx = self._fork_ctx if use_fork else self._spawn_ctx
+        self._spawn_worker = not use_fork
+        self._process_group_id = None
+        parent_conn, child_conn = ctx.Pipe(duplex=True)
+        liveness_read, liveness_write = ctx.Pipe(duplex=False)
+        self._conn = parent_conn
+        self._liveness_conn = liveness_write
+        if self._spawn_worker:
+            target = _spawn_executor_worker
+            args = (
+                child_conn,
+                self.additional_authorized_imports,
+                self.max_print_outputs_length,
+                self._child_tool_names,
+                self._child_function_names,
+                liveness_read,
+                liveness_write,
+                os.getpid(),
+            )
+        else:
+            target = _killable_executor_worker
+            args = (child_conn, self, liveness_read, liveness_write, os.getpid())
+        process = ctx.Process(
+            target=target,
+            args=args,
+            name="tim-code-executor",
+        )
+        process.daemon = False
+        try:
+            process.start()
+        except BaseException:
+            with suppress(Exception):
+                child_conn.close()
+            with suppress(Exception):
+                liveness_read.close()
+            with suppress(Exception):
+                liveness_write.close()
+            self._conn = None
+            self._liveness_conn = None
+            raise
+        self._windows_job_handle = _windows_assign_kill_on_close_job(process.pid)
+        with suppress(Exception):
+            child_conn.close()
+        with suppress(Exception):
+            liveness_read.close()
+        self._process = process
+        if self._spawn_worker:
+            try:
+                _executor_send(
+                    self._conn,
+                    {
+                        "kind": "variables",
+                        "variables": _executor_state_snapshot(self.state),
+                    },
+                )
+                # Spawn startup and module import time are infrastructure
+                # overhead, not user code execution.  Wait for the worker's
+                # ready handshake before starting the first code deadline so
+                # short (for example 100 ms) budgets remain meaningful on
+                # macOS and Windows.
+                if not self._conn.poll(5.0):
+                    raise RuntimeError("Python 执行器进程启动超时")
+                ready = _executor_recv(self._conn)
+                if ready.get("kind") != "ready":
+                    raise RuntimeError("Python 执行器握手失败")
+                process_group_id = ready.get("process_group")
+                if isinstance(process_group_id, int) and process_group_id > 1:
+                    self._process_group_id = process_group_id
+            except BaseException:
+                self._terminate_process()
+                raise
+
+    def _apply_state(self, snapshot: Any) -> None:
+        if isinstance(snapshot, dict):
+            self.state.update(snapshot)
+
+    def _request_approval_from_child(self, request: dict[str, Any]) -> str:
+        conn = self._conn
+        if conn is None:
+            return "reject"
+        _executor_send(conn, {"kind": "approval_request", "request": request})
+        while True:
+            if not conn.poll(0.2):
+                if not self._in_worker and (self._process is None or not self._process.is_alive()):
+                    return "reject"
+                continue
+            try:
+                message = _executor_recv(conn)
+            except (EOFError, OSError, ValueError, RuntimeError):
+                return "reject"
+            if message.get("kind") == "approval_response":
+                return str(message.get("decision") or "reject")
+            if message.get("kind") == "stop":
+                return "reject"
+
+    def _send_orchestration_record(self, record: dict[str, Any]) -> None:
+        conn = self._conn
+        if conn is None:
+            return
+        with suppress(Exception):
+            _executor_send(conn, {"kind": "orchestration", "record": record})
+
+    def _dispatch_child_tool_request(self, message: dict[str, Any], conn: Any) -> None:
+        name = str(message.get("name") or "")
+        target = self.additional_functions.get(name)
+        if target is None and self.static_tools is not None:
+            target = self.static_tools.get(name)
+        if not callable(target):
+            _executor_send(conn, {"kind": "tool_response", "ok": False, "error": "工具不存在"})
+            return
+        args = message.get("args")
+        kwargs = message.get("kwargs")
+        if not isinstance(args, list) or not isinstance(kwargs, dict):
+            _executor_send(conn, {"kind": "tool_response", "ok": False, "error": "工具参数无效"})
+            return
+        self._handling_child_tool_request = True
+        try:
+            result = target(*args, **kwargs)
+            _executor_send(conn, {"kind": "tool_response", "ok": True, "result": result})
+        except BaseException as exc:
+            with suppress(Exception):
+                _executor_send(
+                    conn,
+                    {
+                        "kind": "tool_response",
+                        "ok": False,
+                        "error": f"{type(exc).__name__}: {exc}",
+                    },
+                )
+        finally:
+            self._handling_child_tool_request = False
+
+    def _terminate_process(self) -> None:
+        process = self._process
+        self._process = None
+        process_group_id = self._process_group_id
+        self._process_group_id = None
+        windows_job_handle = self._windows_job_handle
+        self._windows_job_handle = None
+        conn = self._conn
+        self._conn = None
+        liveness_conn = self._liveness_conn
+        self._liveness_conn = None
+        if liveness_conn is not None:
+            with suppress(Exception):
+                liveness_conn.close()
+        _windows_close_job(windows_job_handle)
+        if conn is not None:
+            with suppress(Exception):
+                conn.close()
+        if process is None:
+            return
+        if process.is_alive():
+            if process_group_id and os.name == "posix":
+                with suppress(OSError):
+                    os.killpg(process_group_id, signal.SIGTERM)
+            elif os.name == "nt":
+                # ``multiprocessing`` has no portable process-group API on
+                # Windows.  taskkill /T asks the kernel to terminate the
+                # worker tree before the direct handle fallback below.
+                with suppress(Exception):
+                    subprocess.run(
+                        ["taskkill", "/PID", str(int(process.pid)), "/T", "/F"],
+                        check=False,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+            process.terminate()
+            process.join(timeout=0.5)
+            if process.is_alive() and hasattr(process, "kill"):
+                if process_group_id and os.name == "posix":
+                    with suppress(OSError):
+                        os.killpg(process_group_id, signal.SIGKILL)
+                process.kill()
+                process.join(timeout=0.5)
+        else:
+            process.join(timeout=0.1)
+
+    def terminate(self) -> None:
+        """Interrupt the current code call, used by AgentRun.stop_run."""
+        self._terminate_process()
+
+    def __call__(self, code_action: str) -> CodeOutput:
+        self._ensure_worker()
+        conn = self._conn
+        if conn is None:
+            raise RuntimeError("Python 执行器 IPC 未初始化")
+        _executor_send(conn, {"kind": "execute", "code": code_action})
+        deadline = None if self.timeout_seconds is None else time.monotonic() + float(self.timeout_seconds)
+        while True:
+            if deadline is None:
+                wait_seconds = 0.2
+            else:
+                wait_seconds = min(0.2, deadline - time.monotonic())
+                if wait_seconds <= 0:
+                    self._terminate_process()
+                    raise local_python_executor.ExecutionTimeoutError(
+                        f"Code execution exceeded the maximum execution time of {self.timeout_seconds} seconds"
+                    )
+            if not conn.poll(wait_seconds):
+                if self._process is None or not self._process.is_alive():
+                    self._terminate_process()
+                    raise RuntimeError("Python 执行器进程意外退出")
+                continue
+            try:
+                message = _executor_recv(conn)
+            except (EOFError, OSError, ValueError, RuntimeError) as exc:
+                self._terminate_process()
+                raise RuntimeError("Python 执行器进程意外退出") from exc
+            kind = message.get("kind")
+            if kind == "ready":
+                process_group_id = message.get("process_group")
+                if isinstance(process_group_id, int) and process_group_id > 1:
+                    self._process_group_id = process_group_id
+                continue
+            if kind == "approval_request":
+                callback = self._approval_callback
+                decision = callback(message.get("request") or {}) if callback else "reject"
+                _executor_send(conn, {"kind": "approval_response", "decision": decision})
+                # Approval waiting is user time, matching RunSkillTool's
+                # deadline semantics.  Start a fresh code budget after the
+                # decision so a slow human response is not misclassified as
+                # a Python execution timeout.
+                if self.timeout_seconds is not None:
+                    deadline = time.monotonic() + float(self.timeout_seconds)
+                continue
+            if kind == "tool_request":
+                # Capability execution happens in the parent and may block on
+                # network I/O or operator approval.  That wait is outside the
+                # Python code budget; extend the deadline by the elapsed
+                # dispatch time so a successful tool return is not followed by
+                # an artificial ExecutionTimeoutError.
+                tool_started = time.monotonic()
+                self._dispatch_child_tool_request(message, conn)
+                if deadline is not None:
+                    deadline += max(0.0, time.monotonic() - tool_started)
+                continue
+            if kind == "orchestration":
+                callback = self._orchestration_callback
+                if callback:
+                    with suppress(Exception):
+                        callback(message.get("record") or {})
+                continue
+            if kind == "result":
+                self._apply_state(message.get("state"))
+                return CodeOutput(
+                    output=message.get("output"),
+                    logs=str(message.get("logs") or ""),
+                    is_final_answer=bool(message.get("is_final_answer")),
+                )
+            if kind == "error":
+                self._apply_state(message.get("state"))
+                error_type = str(message.get("error_type") or "RuntimeError")
+                error_class = getattr(local_python_executor, error_type, RuntimeError)
+                if not isinstance(error_class, type) or not issubclass(error_class, Exception):
+                    error_class = RuntimeError
+                raise error_class(str(message.get("error") or "Python 执行失败"))
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._terminate_process()
+
+
+def _nsjail_send(sock: socket.socket, message: dict[str, Any]) -> None:
+    payload = json.dumps(
+        _executor_wire_value(message, budget=[MAX_EXECUTOR_IPC_BYTES]),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    if len(payload) > MAX_EXECUTOR_IPC_BYTES:
+        raise RuntimeError("nsjail worker IPC 消息超过安全上限")
+    sock.sendall(struct.pack("!I", len(payload)) + payload)
+
+
+def _nsjail_read_exact(sock: socket.socket, size: int) -> bytes:
+    chunks: list[bytes] = []
+    remaining = size
+    while remaining:
+        chunk = sock.recv(remaining)
+        if not chunk:
+            raise EOFError("nsjail worker 已断开 RPC")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def _nsjail_recv(sock: socket.socket, timeout: float | None = None) -> dict[str, Any] | None:
+    if timeout is not None:
+        readable, _, _ = select.select([sock], [], [], max(0.0, timeout))
+        if not readable:
+            return None
+    header = _nsjail_read_exact(sock, 4)
+    size = struct.unpack("!I", header)[0]
+    if size > MAX_EXECUTOR_IPC_BYTES:
+        raise RuntimeError("nsjail worker IPC 消息超过安全上限")
+    message = json.loads(_nsjail_read_exact(sock, size).decode("utf-8"))
+    if not isinstance(message, dict):
+        raise RuntimeError("nsjail worker IPC 消息格式无效")
+    return message
+
+
+class NsJailPythonExecutor(PythonExecutor):
+    """Run the AST evaluator in a separate nsjail process with RPC tools.
+
+    The worker never receives application ``Tool`` instances.  It receives
+    only proxy names; the parent dispatches each capability call, so cloud
+    clients, BotManager, and AgentEngine stay outside the jailed process.
+    This mode is intentionally opt-in because the nsjail binary and a
+    deployment-provided rootfs are Linux host dependencies.
+    """
+
+    def __init__(
+        self,
+        additional_authorized_imports: list[str],
+        max_print_outputs_length: int | None = None,
+        timeout_seconds: float | None = DEFAULT_CODE_EXECUTION_TIMEOUT_SECONDS,
+    ):
+        if os.name != "posix" or not sys.platform.startswith("linux"):
+            raise RuntimeError("nsjail 执行器只支持 Linux 部署")
+        self.nsjail_path = os.environ.get("TIM_NSJAIL_BIN") or shutil.which("nsjail")
+        if not self.nsjail_path:
+            raise RuntimeError("未找到 nsjail；生产环境拒绝回退到进程内执行器")
+        self.rootfs = os.environ.get("TIM_NSJAIL_ROOT")
+        if not self.rootfs or not os.path.isdir(self.rootfs):
+            raise RuntimeError("TIM_NSJAIL_ROOT 未配置或目录不存在；拒绝启动 nsjail worker")
+        self.seccomp_policy = os.environ.get("TIM_NSJAIL_SECCOMP_POLICY")
+        if not self.seccomp_policy or not os.path.isfile(self.seccomp_policy):
+            raise RuntimeError("TIM_NSJAIL_SECCOMP_POLICY 未配置；拒绝启动无 seccomp 的 worker")
+        self.additional_authorized_imports = list(additional_authorized_imports)
+        self.max_print_outputs_length = max_print_outputs_length
+        self.timeout_seconds = timeout_seconds
+        self.state: dict[str, Any] = {"__name__": "__main__"}
+        self.static_tools: dict[str, Any] | None = None
+        self.custom_tools: dict[str, Any] = {}
+        self.additional_functions: dict[str, Any] = {}
+        self._tools: dict[str, Any] = {}
+        self._process: subprocess.Popen[bytes] | None = None
+        self._socket: socket.socket | None = None
+        self._closed = False
+        self._approval_callback: Any | None = None
+        self._orchestration_callback: Any | None = None
+
+    def approval_requester(self, callback: Any | None) -> Any | None:
+        self._approval_callback = callback
+        return callback
+
+    def orchestration_recorder(self, callback: Any | None) -> Any | None:
+        self._orchestration_callback = callback
+        return callback
+
+    def send_variables(self, variables: dict[str, Any]) -> None:
+        self.state.update(variables)
+        if self._socket is not None and self._process is not None and self._process.poll() is None:
+            _nsjail_send(self._socket, {"kind": "variables", "variables": _executor_state_snapshot(variables)})
+
+    def send_tools(self, tools: dict[str, Any]) -> None:
+        self._tools = dict(tools)
+        self.static_tools = {**tools, **self.additional_functions}
+        self._ensure_worker()
+        assert self._socket is not None
+        _nsjail_send(
+            self._socket,
+            {
+                "kind": "init",
+                "tool_names": list(self._tools),
+                "function_names": list(self.additional_functions),
+                "state": _executor_state_snapshot(self.state),
+            },
+        )
+        ready = _nsjail_recv(self._socket, timeout=5.0)
+        if not ready or ready.get("kind") != "initialized":
+            self._terminate_process()
+            raise RuntimeError("nsjail worker 初始化失败")
+
+    def _ensure_worker(self) -> None:
+        if self._closed:
+            raise RuntimeError("nsjail Python 执行器已关闭")
+        if self._process is not None and self._process.poll() is None:
+            return
+        repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+        child, parent = socket.socketpair()
+        child_fd = child.fileno()
+        child.set_inheritable(True)
+        python_path = os.environ.get("TIM_NSJAIL_PYTHON", "/usr/bin/python3")
+        time_limit = max(1, int(math.ceil(float(self.timeout_seconds or 30.0) + 5)))
+        command = [
+            self.nsjail_path,
+            "--mode",
+            "o",
+            "--quiet",
+            "--pass_fd",
+            str(child_fd),
+            "--iface_no_lo",
+            "--disable_proc",
+            "--time_limit",
+            str(time_limit),
+            "--rlimit_cpu",
+            str(max(1, int(math.ceil(float(self.timeout_seconds or 30.0))))),
+            "--rlimit_as",
+            os.environ.get("TIM_NSJAIL_RLIMIT_AS_MB", "1024"),
+            "--rlimit_nofile",
+            os.environ.get("TIM_NSJAIL_RLIMIT_NOFILE", "256"),
+            "--rlimit_nproc",
+            os.environ.get("TIM_NSJAIL_RLIMIT_NPROC", "32"),
+            "--tmpfsmount",
+            "/tmp",
+            "--seccomp_policy",
+            self.seccomp_policy,
+            "--chroot",
+            self.rootfs,
+            "--bindmount_ro",
+            f"{repo_root}:/app",
+            "--cwd",
+            "/app",
+            "--env",
+            "PYTHONPATH=/app",
+            "--env",
+            "PYTHONUNBUFFERED=1",
+            "--",
+            python_path,
+            "-m",
+            "core.agent.nsjail_worker",
+            "--fd",
+            str(child_fd),
+            "--imports-json",
+            json.dumps(self.additional_authorized_imports, ensure_ascii=False),
+        ]
+        try:
+            process = subprocess.Popen(
+                command,
+                cwd=repo_root,
+                env={"PATH": os.environ.get("PATH", ""), "PYTHONPATH": repo_root, "PYTHONUNBUFFERED": "1"},
+                pass_fds=(child_fd,),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except Exception:
+            child.close()
+            parent.close()
+            raise
+        child.close()
+        self._socket = parent
+        self._process = process
+        try:
+            ready = _nsjail_recv(parent, timeout=5.0)
+            if not ready or ready.get("kind") != "ready":
+                raise RuntimeError("nsjail worker 未就绪")
+        except Exception:
+            self._terminate_process()
+            raise
+
+    def _dispatch_capability(self, message: dict[str, Any]) -> Any:
+        name = str(message.get("name") or "")
+        args = message.get("args") or []
+        kwargs = message.get("kwargs") or {}
+        if not isinstance(args, list) or not isinstance(kwargs, dict):
+            raise ValueError("RPC capability 参数格式无效")
+        kind = message.get("kind")
+        if kind == "function_call" and name in self.additional_functions:
+            return self.additional_functions[name](*args, **kwargs)
+        if kind == "tool_call" and name in self._tools:
+            tool = self._tools[name]
+            return tool(*args, **kwargs)
+        raise RuntimeError(f"nsjail worker 请求了未注册能力或类型不匹配: {name}")
+
+    def _terminate_process(self) -> None:
+        process = self._process
+        self._process = None
+        sock = self._socket
+        self._socket = None
+        if sock is not None:
+            with suppress(Exception):
+                sock.close()
+        if process is None:
+            return
+        if process.poll() is None:
+            with suppress(OSError):
+                os.killpg(process.pid, signal.SIGTERM)
+            with suppress(Exception):
+                process.terminate()
+            try:
+                process.wait(timeout=0.5)
+            except subprocess.TimeoutExpired:
+                with suppress(OSError):
+                    os.killpg(process.pid, signal.SIGKILL)
+                with suppress(Exception):
+                    process.kill()
+                with suppress(Exception):
+                    process.wait(timeout=0.5)
+        else:
+            with suppress(Exception):
+                process.wait(timeout=0.1)
+
+    def terminate(self) -> None:
+        self._terminate_process()
+
+    def __call__(self, code_action: str) -> CodeOutput:
+        self._ensure_worker()
+        if self._socket is None:
+            raise RuntimeError("nsjail worker RPC 未初始化")
+        _nsjail_send(self._socket, {"kind": "execute", "code": code_action})
+        deadline = None if self.timeout_seconds is None else time.monotonic() + float(self.timeout_seconds)
+        while True:
+            if deadline is None:
+                wait = 0.2
+            else:
+                wait = min(0.2, deadline - time.monotonic())
+                if wait <= 0:
+                    self._terminate_process()
+                    raise local_python_executor.ExecutionTimeoutError(
+                        f"Code execution exceeded the maximum execution time of {self.timeout_seconds} seconds"
+                    )
+            message = _nsjail_recv(self._socket, timeout=wait)
+            if message is None:
+                if self._process is None or self._process.poll() is not None:
+                    self._terminate_process()
+                    raise RuntimeError("nsjail worker 进程意外退出")
+                continue
+            kind = message.get("kind")
+            if kind in {"tool_call", "function_call"}:
+                # Parent-side capabilities can wait on network services or a
+                # human approval decision.  Do not charge that wait against
+                # the child Python evaluation budget.
+                tool_started = time.monotonic()
+                try:
+                    value = self._dispatch_capability(message)
+                    _nsjail_send(self._socket, {"kind": "response", "ok": True, "value": value})
+                except Exception as exc:
+                    _nsjail_send(self._socket, {"kind": "response", "ok": False, "error": str(exc)})
+                finally:
+                    if deadline is not None:
+                        deadline += max(0.0, time.monotonic() - tool_started)
+                continue
+            if kind == "result":
+                self._apply_state(message.get("state"))
+                return CodeOutput(
+                    output=message.get("output"),
+                    logs=str(message.get("logs") or ""),
+                    is_final_answer=bool(message.get("is_final_answer")),
+                )
+            if kind == "error":
+                self._apply_state(message.get("state"))
+                error_type = str(message.get("error_type") or "RuntimeError")
+                error_class = getattr(local_python_executor, error_type, RuntimeError)
+                if not isinstance(error_class, type) or not issubclass(error_class, Exception):
+                    error_class = RuntimeError
+                raise error_class(str(message.get("error") or "Python 执行失败"))
+
+    def _apply_state(self, snapshot: Any) -> None:
+        if isinstance(snapshot, dict):
+            self.state.update(snapshot)
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        if self._socket is not None and self._process is not None and self._process.poll() is None:
+            with suppress(Exception):
+                _nsjail_send(self._socket, {"kind": "close"})
+        self._terminate_process()
+
+
+def _create_code_executor(
+    additional_authorized_imports: list[str],
+    *,
+    max_print_outputs_length: int | None = None,
+    timeout_seconds: float | None = DEFAULT_CODE_EXECUTION_TIMEOUT_SECONDS,
+) -> PythonExecutor:
+    """Select the execution boundary without silently weakening production.
+
+    Linux production/staging must use nsjail.  macOS and Windows have no
+    nsjail deployment contract, so their explicitly controlled fallback uses
+    the spawn/RPC executor and is reported as lacking OS-level isolation.
+    """
+    mode = os.environ.get("TIM_CODE_EXECUTOR_MODE", "fork").strip().lower()
+    app_env = os.environ.get("APP_ENV", "development").strip().lower()
+    production = app_env in {"production", "prod", "staging"}
+    linux_host = os.name == "posix" and sys.platform.startswith("linux")
+    if mode not in {"fork", "spawn", "nsjail"}:
+        raise RuntimeError("TIM_CODE_EXECUTOR_MODE 必须为 fork 或 nsjail；非 Linux 可额外使用 spawn")
+    allow_unconfined = os.environ.get("ALLOW_UNCONFINED_CODE_EXECUTOR", "").strip().lower() in {"1", "true", "yes", "on"}
+    if production and linux_host and mode != "nsjail" and not allow_unconfined:
+        raise RuntimeError("Linux 生产环境必须设置 TIM_CODE_EXECUTOR_MODE=nsjail，或显式设置 ALLOW_UNCONFINED_CODE_EXECUTOR=true")
+    if production and mode in {"fork", "spawn"} and (not linux_host or allow_unconfined):
+        logging.getLogger(__name__).warning(
+            "生产环境使用受控 spawn/RPC executor；该路径不提供 nsjail 的 OS 级隔离，"
+            "仅适用于已评估风险的受信部署，不得将其宣称为 seccomp、namespace 或 rootfs 沙箱"
+        )
+    executor_type = NsJailPythonExecutor if mode == "nsjail" else KillablePythonExecutor
+    executor_kwargs: dict[str, Any] = {
+        "max_print_outputs_length": max_print_outputs_length,
+        "timeout_seconds": timeout_seconds,
+    }
+    if mode in {"fork", "spawn"}:
+        executor_kwargs["force_spawn"] = mode == "spawn" or (production and (not linux_host or allow_unconfined))
+    return executor_type(
+        additional_authorized_imports,
+        **executor_kwargs,
+    )
+
+
+def _install_local_executor_safety_limits() -> None:
+    """Patch smolagents' cooperative evaluator without claiming hard isolation.
+
+    smolagents' stock timeout uses a context manager whose shutdown waits for
+    the worker thread after a timeout.  Returning immediately prevents the
+    request thread from being held by a finite blocking call; the worker is
+    still not killable, so production hard isolation remains a process/host
+    boundary requirement.
+    """
+    if not getattr(local_python_executor, "_tim_timeout_patched", False):
+        def nonblocking_timeout(timeout_seconds: int):
+            def decorator(func):
+                @wraps(func)
+                def wrapper(*args, **kwargs):
+                    executor = ThreadPoolExecutor(max_workers=1)
+                    future: Future = executor.submit(func, *args, **kwargs)
+                    try:
+                        return future.result(timeout=timeout_seconds)
+                    except FuturesTimeoutError as exc:
+                        future.cancel()
+                        executor.shutdown(wait=False, cancel_futures=True)
+                        raise local_python_executor.ExecutionTimeoutError(
+                            f"Code execution exceeded the maximum execution time of {timeout_seconds} seconds"
+                        ) from exc
+                    except BaseException:
+                        executor.shutdown(wait=True, cancel_futures=True)
+                        raise
+                    else:
+                        executor.shutdown(wait=True, cancel_futures=True)
+
+                return wrapper
+
+            return decorator
+
+        local_python_executor.timeout = nonblocking_timeout
+        local_python_executor._tim_timeout_patched = True
+
+    if not getattr(local_python_executor, "_tim_for_loop_patched", False):
+        def bounded_evaluate_for(for_loop, state, static_tools, custom_tools, authorized_imports):
+            result = None
+            iterator = local_python_executor.evaluate_ast(
+                for_loop.iter, state, static_tools, custom_tools, authorized_imports
+            )
+            for iteration, counter in enumerate(iterator, start=1):
+                if iteration > MAX_SANDBOX_FOR_ITERATIONS:
+                    raise local_python_executor.InterpreterError(
+                        f"Maximum number of {MAX_SANDBOX_FOR_ITERATIONS} for-loop iterations exceeded"
+                    )
+                local_python_executor.set_value(
+                    for_loop.target,
+                    counter,
+                    state,
+                    static_tools,
+                    custom_tools,
+                    authorized_imports,
+                )
+                for node in for_loop.body:
+                    try:
+                        line_result = local_python_executor.evaluate_ast(
+                            node, state, static_tools, custom_tools, authorized_imports
+                        )
+                        if line_result is not None:
+                            result = line_result
+                    except local_python_executor.BreakException:
+                        return result
+                    except local_python_executor.ContinueException:
+                        break
+            return result
+
+        local_python_executor.evaluate_for = bounded_evaluate_for
+        local_python_executor._tim_for_loop_patched = True
+
+    # Keep the dependency's built-in while-loop guard conservative as an
+    # additional evaluator limit.  This is version-sensitive defense in depth,
+    # not a substitute for a killable worker process.
+    if hasattr(local_python_executor, "MAX_WHILE_ITERATIONS"):
+        local_python_executor.MAX_WHILE_ITERATIONS = min(
+            local_python_executor.MAX_WHILE_ITERATIONS,
+            MAX_SANDBOX_FOR_ITERATIONS,
+        )
+
+
+_install_local_executor_safety_limits()
+
+
+def _asset_temp_path(destination: str) -> str:
+    stem, suffix = os.path.splitext(destination)
+    return f"{stem}.{os.getpid()}.{threading.get_ident()}.tmp{suffix}"
+
+
+def _commit_generated_asset(temp_path: str, destination: str, uploads_dir: str) -> int:
+    """Apply generated-file quotas before exposing the asset to downloads."""
+    try:
+        file_size = os.path.getsize(temp_path)
+        if file_size > MAX_GENERATED_FILE_BYTES:
+            raise ValueError("生成文件超过 100 MiB 限制")
+        existing_files = []
+        for entry in os.scandir(uploads_dir):
+            if entry.name in {os.path.basename(temp_path), os.path.basename(destination)}:
+                continue
+            if entry.is_file(follow_symlinks=False):
+                existing_files.append(entry)
+        if len(existing_files) + (0 if os.path.exists(destination) else 1) > MAX_GENERATED_FILES:
+            raise ValueError("智能体生成文件数量已达到上限")
+        existing_bytes = sum(entry.stat(follow_symlinks=False).st_size for entry in existing_files)
+        if existing_bytes + file_size > MAX_GENERATED_TOTAL_BYTES:
+            raise ValueError("智能体生成文件总大小已达到 512 MiB 限制")
+        os.replace(temp_path, destination)
+        with _SANDBOX_FILE_QUOTA_LOCK:
+            _SANDBOX_QUOTA_TOTALS.pop(uploads_dir, None)
+        return file_size
+    except Exception:
+        with suppress(OSError):
+            os.remove(temp_path)
+        raise
 
 # 增强 smolagents 代码块解析器：无缝兼容 DeepSeek 原生 DSML、标准 Markdown 与 XML parameter
 _original_parse_code_blobs = getattr(saa, "parse_code_blobs", None)
@@ -156,8 +1471,199 @@ def render_chart(
     return f"\n```echarts\n{json.dumps(chart_cfg, ensure_ascii=False, indent=2)}\n```\n"
 
 
+def _sandbox_regular_file_bytes(root_dir: str) -> int:
+    """Return the current size of regular files directly in ``root_dir``.
+
+    Model code can only address basenames, so a flat directory scan is enough
+    here and avoids following links that might point outside the bot runtime.
+    A missing directory is treated as empty; the subsequent ``open`` call will
+    still report the ordinary filesystem error when appropriate.
+    """
+    total = 0
+    try:
+        entries = os.scandir(root_dir)
+    except OSError:
+        return 0
+    with entries:
+        for entry in entries:
+            try:
+                if entry.is_file(follow_symlinks=False):
+                    total += entry.stat(follow_symlinks=False).st_size
+            except OSError:
+                # Files can disappear while the directory is being scanned.
+                # The next quota check will observe the new state.
+                continue
+    return total
+
+
+def _sandbox_write_size(file_obj: Any, data: Any) -> int:
+    """Estimate the bytes a file object's ``write`` call will append.
+
+    Text streams expose their encoding and error policy.  Computing the encoded
+    size before writing lets the proxy reject an over-quota operation without
+    partially modifying the file.  Newline translation is platform-native and
+    is a no-op on the Linux workers where the sandbox runs.
+    """
+    if isinstance(data, str):
+        encoding = getattr(file_obj, "encoding", None) or "utf-8"
+        errors = getattr(file_obj, "errors", None) or "strict"
+        return len(data.encode(encoding, errors))
+    if isinstance(data, (bytes, bytearray, memoryview)):
+        return memoryview(data).nbytes
+    # Let the underlying stream produce its normal TypeError for unsupported
+    # values.  Returning zero here would make the quota check misleading.
+    raise TypeError("a bytes-like object or string is required")
+
+
+class _QuotaFile:
+    """A file-object proxy that enforces bot output quotas efficiently.
+
+    Quota accounting is incremental after the handle is opened.  Opening a
+    handle performs one directory scan to establish the aggregate baseline;
+    repeated small writes update the shared total by their size delta instead
+    of flushing and rescanning the whole directory on every call.
+    """
+
+    __slots__ = ("__weakref__",)
+
+    def __init__(self, file_obj: Any, root_dir: str, candidate: str, mode: str):
+        with _SANDBOX_FILE_QUOTA_LOCK:
+            # Opening in ``w`` may have truncated an existing file, so scan
+            # after open.  This is the only normal full-directory scan for a
+            # handle's lifetime; later writes use the shared delta counter.
+            current_size = self._native_size(file_obj, candidate)
+            _SANDBOX_QUOTA_TOTALS[root_dir] = _sandbox_regular_file_bytes(root_dir)
+            _SANDBOX_QUOTA_FILES[self] = {
+                "file": file_obj,
+                "root": root_dir,
+                "path": candidate,
+                "mode": mode,
+                "size": current_size,
+                "closed": False,
+            }
+
+    @staticmethod
+    def _native_size(file_obj: Any, candidate: str) -> int:
+        try:
+            return int(os.fstat(file_obj.fileno()).st_size)
+        except (AttributeError, OSError, ValueError):
+            try:
+                return int(os.path.getsize(candidate))
+            except OSError:
+                return 0
+
+    def __getattribute__(self, name: str) -> Any:
+        if name == "_state":
+            raise AttributeError("沙箱文件对象不提供 _state 属性")
+        return object.__getattribute__(self, name)
+
+    def __getattr__(self, name: str) -> Any:
+        if name == "_state" or name in _SANDBOX_FILE_ESCAPE_ATTRIBUTES:
+            raise AttributeError(f"沙箱文件对象不提供 {name} 属性")
+        return getattr(_sandbox_quota_file_state(self)["file"], name)
+
+    def __enter__(self):
+        _sandbox_quota_file_state(self)["file"].__enter__()
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.close()
+        return False
+
+    def close(self):
+        state = _sandbox_quota_file_state(self)
+        if state["closed"]:
+            return None
+        with _SANDBOX_FILE_QUOTA_LOCK:
+            file_obj = state["file"]
+            try:
+                file_obj.flush()
+                actual_size = self._native_size(file_obj, state["path"])
+                _SANDBOX_QUOTA_TOTALS[state["root"]] = (
+                    _SANDBOX_QUOTA_TOTALS.get(state["root"], 0)
+                    + actual_size - state["size"]
+                )
+                state["size"] = actual_size
+            finally:
+                state["closed"] = True
+            return file_obj.close()
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        return next(_sandbox_quota_file_state(self)["file"])
+
+    def _stream_size(self) -> int:
+        return int(_sandbox_quota_file_state(self)["size"])
+
+    def _stream_position(self, current_size: int) -> int:
+        state = _sandbox_quota_file_state(self)
+        if "a" in state["mode"]:
+            return current_size
+        try:
+            position = state["file"].tell()
+            return max(0, int(position))
+        except (AttributeError, OSError, ValueError, TypeError):
+            return current_size
+
+    def _check_projected_size(self, projected_size: int, current_size: int) -> None:
+        if projected_size > MAX_GENERATED_FILE_BYTES:
+            raise ValueError("生成文件超过 100 MiB 限制")
+        state = _sandbox_quota_file_state(self)
+        total = _SANDBOX_QUOTA_TOTALS.get(state["root"])
+        if total is None:
+            total = _sandbox_regular_file_bytes(state["root"])
+            _SANDBOX_QUOTA_TOTALS[state["root"]] = total
+        if total - current_size + projected_size > MAX_GENERATED_TOTAL_BYTES:
+            raise ValueError("智能体生成文件总大小已达到 512 MiB 限制")
+
+    def write(self, data: Any):
+        with _SANDBOX_FILE_QUOTA_LOCK:
+            state = _sandbox_quota_file_state(self)
+            current_size = int(state["size"])
+            position = self._stream_position(current_size)
+            payload_size = _sandbox_write_size(state["file"], data)
+            projected_size = max(current_size, position + payload_size)
+            self._check_projected_size(projected_size, current_size)
+            result = state["file"].write(data)
+            # Account for the logical stream size.  The native buffer is
+            # flushed once on close, avoiding a syscall per tiny write.
+            delta = projected_size - current_size
+            state["size"] = projected_size
+            _SANDBOX_QUOTA_TOTALS[state["root"]] = (
+                _SANDBOX_QUOTA_TOTALS.get(state["root"], 0) + delta
+            )
+            return result
+
+    def writelines(self, lines: Iterable[Any]):
+        for line in lines:
+            self.write(line)
+
+    def truncate(self, size: int | None = None):
+        with _SANDBOX_FILE_QUOTA_LOCK:
+            state = _sandbox_quota_file_state(self)
+            current_size = int(state["size"])
+            if size is None:
+                size = self._stream_position(current_size)
+            try:
+                target_size = int(size)
+            except (TypeError, ValueError) as exc:
+                raise TypeError("truncate size must be an integer") from exc
+            if target_size < 0:
+                raise ValueError("negative truncate size")
+            self._check_projected_size(target_size, current_size)
+            result = state["file"].truncate(target_size)
+            delta = target_size - current_size
+            state["size"] = target_size
+            _SANDBOX_QUOTA_TOTALS[state["root"]] = (
+                _SANDBOX_QUOTA_TOTALS.get(state["root"], 0) + delta
+            )
+            return result
+
+
 def _confined_open(root_dir: str, file, mode="r", *args, **kwargs):
-    """Open only a basename inside a bot-owned directory, regardless of path type."""
+    """Open a basename inside a bot directory with bounded write capability."""
     raw_path = os.fspath(file)
     if isinstance(raw_path, bytes):
         raw_path = os.fsdecode(raw_path)
@@ -168,7 +1674,10 @@ def _confined_open(root_dir: str, file, mode="r", *args, **kwargs):
     if os.path.commonpath([root_path, candidate]) != root_path:
         raise PermissionError("沙箱文件路径超出 BOT 产出物目录")
     try:
-        return open(candidate, mode, *args, **kwargs)
+        file_obj = open(candidate, mode, *args, **kwargs)
+        if any(flag in mode for flag in "wax+"):
+            return _QuotaFile(file_obj, root_path, candidate, mode)
+        return file_obj
     except OSError as exc:
         raise OSError(f"无法访问沙箱文件: {candidate}") from exc
 
@@ -710,9 +2219,13 @@ class AgentEngine:
         task: str,
         call_chain: list[str] | None = None,
         approval_requester: Any | None = None,
+        orchestration_recorder: Any | None = None,
     ) -> str:
         """为协同调度执行子任务 (同步返回目标智能体的最终输出)"""
-        chain = call_chain or [caller_bot_id]
+        # Normalize the delegation path at the engine boundary.  Tool objects
+        # keep an immutable snapshot and callers cannot mutate the recursion
+        # guard between validation and child-agent creation.
+        chain = tuple(call_chain or (caller_bot_id,))
         if target_bot_id in chain:
             return f"⚠️ 检测到循环协同调用（{' -> '.join(chain)} -> {target_bot_id}），已自动阻断以避免死锁。"
 
@@ -732,7 +2245,7 @@ class AgentEngine:
 
         llm_cfg = self.get_effective_llm_config(target_bot)
         model = self.create_model(llm_cfg)
-        new_chain = chain + [target_bot_id]
+        new_chain = chain + (target_bot_id,)
         delegated_approval_requester = approval_requester
         if approval_requester:
 
@@ -751,14 +2264,27 @@ class AgentEngine:
 
             delegated_approval_requester = delegated_approval_request
 
+        executor = _create_code_executor(
+            AUTHORIZED_IMPORTS,
+            max_print_outputs_length=DEFAULT_MAX_PRINT_OUTPUTS_LENGTH,
+            timeout_seconds=DEFAULT_CODE_EXECUTION_TIMEOUT_SECONDS,
+        )
+        delegated_tool_approval_requester = executor.approval_requester(
+            delegated_approval_requester
+        )
+        delegated_tool_orchestration_recorder = executor.orchestration_recorder(
+            orchestration_recorder
+        )
+
         tools = build_bot_tools(
             target_bot_id,
             self.manager,
             self.tim_client,
             engine=self,
-            call_chain=new_chain,
-            approval_requester=delegated_approval_requester,
+            call_chain=list(new_chain),
+            approval_requester=delegated_tool_approval_requester,
             cloud_client=self.cloud_client,
+            orchestration_recorder=delegated_tool_orchestration_recorder,
         )
         system_prompt = self.assemble_system_prompt(target_bot)
 
@@ -776,6 +2302,7 @@ class AgentEngine:
             additional_authorized_imports=AUTHORIZED_IMPORTS,
             max_print_outputs_length=DEFAULT_MAX_PRINT_OUTPUTS_LENGTH,
             max_steps=DEFAULT_SUBTASK_MAX_STEPS,
+            executor=executor,
         )
 
         # 注入目标智能体沙箱环境与产出物工具
@@ -789,30 +2316,33 @@ class AgentEngine:
         def subtask_save_file(filename: str, data: Any) -> dict[str, Any]:
             safe_name = os.path.basename(filename)
             dest_path = os.path.join(target_uploads_dir, safe_name)
+            temp_path = _asset_temp_path(dest_path)
             if hasattr(data, "to_excel") and safe_name.endswith((".xlsx", ".xls")):
-                data.to_excel(dest_path, index=False)
+                data.to_excel(temp_path, index=False)
             elif hasattr(data, "to_csv") and safe_name.endswith(".csv"):
-                data.to_csv(dest_path, index=False)
+                data.to_csv(temp_path, index=False)
             elif isinstance(data, (bytes, bytearray)):
                 with (
-                    open(dest_path, "wb") as f  # pi-lens-ignore: unchecked-throwing-call-python -- sandbox file capability
+                    open(temp_path, "wb") as f  # pi-lens-ignore: unchecked-throwing-call-python -- sandbox file capability
                 ):
                     f.write(data)
             elif isinstance(data, str):
                 with (
-                    open(dest_path, "w", encoding="utf-8") as f  # pi-lens-ignore: unchecked-throwing-call-python -- sandbox file capability
+                    open(temp_path, "w", encoding="utf-8") as f  # pi-lens-ignore: unchecked-throwing-call-python -- sandbox file capability
                 ):
                     f.write(data)
             elif isinstance(data, (dict, list)):
                 with (
-                    open(dest_path, "w", encoding="utf-8") as f  # pi-lens-ignore: unchecked-throwing-call-python -- sandbox file capability
+                    open(temp_path, "w", encoding="utf-8") as f  # pi-lens-ignore: unchecked-throwing-call-python -- sandbox file capability
                 ):
                     json.dump(data, f, ensure_ascii=False, indent=2)
             else:
                 with (
-                    open(dest_path, "w", encoding="utf-8") as f  # pi-lens-ignore: unchecked-throwing-call-python -- sandbox file capability
+                    open(temp_path, "w", encoding="utf-8") as f  # pi-lens-ignore: unchecked-throwing-call-python -- sandbox file capability
                 ):
                     f.write(str(data))
+            with self.manager._lock:
+                _commit_generated_asset(temp_path, dest_path, target_uploads_dir)
             return {
                 "filename": safe_name,
                 "path": dest_path,
@@ -827,7 +2357,7 @@ class AgentEngine:
         ) or CloudCallTool(
             bot_manager=self.manager,
             tim_client=self.tim_client,
-            approval_requester=delegated_approval_requester,
+            approval_requester=delegated_tool_approval_requester,
         )
         subtask_search_tool = (
             next((t for t in tools if isinstance(t, CloudSearchApisTool)), None)
@@ -856,19 +2386,22 @@ class AgentEngine:
             },
         )
 
-        resp = agent.run(task_prompt)
-        final_answer = str(resp) if resp is not None else "任务已处理。"
-        cleaned_ans, _ = clean_final_answer(final_answer)
+        try:
+            resp = agent.run(task_prompt)
+            final_answer = str(resp) if resp is not None else "任务已处理。"
+            cleaned_ans, _ = clean_final_answer(final_answer)
 
-        # 存入目标智能体历史
-        self.manager.append_history(
-            target_bot_id,
-            "assistant",
-            cleaned_ans or "协同任务已执行完毕。",
-            metadata={"delegated_by": caller_bot_id},
-        )
+            # 存入目标智能体历史
+            self.manager.append_history(
+                target_bot_id,
+                "assistant",
+                cleaned_ans or "协同任务已执行完毕。",
+                metadata={"delegated_by": caller_bot_id},
+            )
 
-        return cleaned_ans or "协同任务已完成。"
+            return cleaned_ans or "协同任务已完成。"
+        finally:
+            executor.close()
 
     def run_agent_stream(
         self,
@@ -878,6 +2411,7 @@ class AgentEngine:
         skip_user_append: bool = False,
         stop_checker: Any | None = None,
         approval_requester: Any | None = None,
+        execution_controller: Any | None = None,
     ):
         """
         生成器：执行 CodeAgent 并按结构流式产生事件 (Thought, Code, Output, Message)
@@ -914,14 +2448,25 @@ class AgentEngine:
             self.manager.append_history(bot_id, "assistant", f"[配置错误] {err_msg}")
             return
 
-        # 3. 组装 Tools & Agent
+        # 3. 组装 Tools & Agent.  Code execution is delegated to a killable
+        # process; the approval callback is proxied back to this process.
+        executor = _create_code_executor(
+            AUTHORIZED_IMPORTS,
+            max_print_outputs_length=DEFAULT_MAX_PRINT_OUTPUTS_LENGTH,
+            timeout_seconds=DEFAULT_CODE_EXECUTION_TIMEOUT_SECONDS,
+        )
+        tool_approval_requester = executor.approval_requester(approval_requester)
+        tool_orchestration_recorder = executor.orchestration_recorder(
+            self.record_orchestration
+        )
         tools = build_bot_tools(
             bot_id,
             self.manager,
             self.tim_client,
             engine=self,
-            approval_requester=approval_requester,
+            approval_requester=tool_approval_requester,
             cloud_client=self.cloud_client,
+            orchestration_recorder=tool_orchestration_recorder,
         )
         system_prompt = self.assemble_system_prompt(bot)
         stream_start_time = time.time()
@@ -951,7 +2496,14 @@ class AgentEngine:
             max_print_outputs_length=DEFAULT_MAX_PRINT_OUTPUTS_LENGTH,
             max_steps=effective_max_steps,
             stream_outputs=True,
+            executor=executor,
         )
+
+        if execution_controller:
+            execution_controller(executor.terminate)
+        if stop_checker and stop_checker():
+            executor.close()
+            return
 
         # 挂载跨轮已留存的沙箱变量环境
         saved_state = self._get_sandbox(self._sandbox_key(bot_id))
@@ -1037,31 +2589,34 @@ class AgentEngine:
             """保存文件至当前智能体专属资产中心，自动支持字符串、字节、JSON字典、Pandas DataFrame"""
             safe_name = os.path.basename(filename)
             dest_path = os.path.join(uploads_dir, safe_name)
+            temp_path = _asset_temp_path(dest_path)
             if hasattr(data, "to_excel") and safe_name.endswith((".xlsx", ".xls")):
-                data.to_excel(dest_path, index=False)
+                data.to_excel(temp_path, index=False)
             elif hasattr(data, "to_csv") and safe_name.endswith(".csv"):
-                data.to_csv(dest_path, index=False)
+                data.to_csv(temp_path, index=False)
             elif isinstance(data, (bytes, bytearray)):
                 with (
-                    open(dest_path, "wb") as f  # pi-lens-ignore: unchecked-throwing-call-python -- sandbox file capability
+                    open(temp_path, "wb") as f  # pi-lens-ignore: unchecked-throwing-call-python -- sandbox file capability
                 ):
                     f.write(data)
             elif isinstance(data, str):
                 with (
-                    open(dest_path, "w", encoding="utf-8") as f  # pi-lens-ignore: unchecked-throwing-call-python -- sandbox file capability
+                    open(temp_path, "w", encoding="utf-8") as f  # pi-lens-ignore: unchecked-throwing-call-python -- sandbox file capability
                 ):
                     f.write(data)
             elif isinstance(data, (dict, list)):
                 with (
-                    open(dest_path, "w", encoding="utf-8") as f  # pi-lens-ignore: unchecked-throwing-call-python -- sandbox file capability
+                    open(temp_path, "w", encoding="utf-8") as f  # pi-lens-ignore: unchecked-throwing-call-python -- sandbox file capability
                 ):
                     json.dump(data, f, ensure_ascii=False, indent=2)
             else:
                 with (
-                    open(dest_path, "w", encoding="utf-8") as f  # pi-lens-ignore: unchecked-throwing-call-python -- sandbox file capability
+                    open(temp_path, "w", encoding="utf-8") as f  # pi-lens-ignore: unchecked-throwing-call-python -- sandbox file capability
                 ):
                     f.write(str(data))
 
+            with self.manager._lock:
+                _commit_generated_asset(temp_path, dest_path, uploads_dir)
             file_size = os.path.getsize(dest_path)
             cat, ftype = get_file_category_and_type(safe_name)
             download_url = f"/api/agent/bots/{bot_id}/files/{safe_name}?download=true"
@@ -1103,7 +2658,7 @@ class AgentEngine:
         stream_cloud_call = next(
             (t for t in tools if isinstance(t, CloudCallTool)), None
         ) or CloudCallTool(
-            approval_requester=approval_requester,
+            approval_requester=tool_approval_requester,
             bot_manager=self.manager,
             tim_client=self.tim_client,
         )
@@ -1615,6 +3170,9 @@ class AgentEngine:
             self.manager.append_history(bot_id, "assistant", f"[异常] {err_text}")
         finally:
             self._local.active_stream_orchestrations = None
+            if execution_controller:
+                execution_controller(None)
+            executor.close()
 
 
 agent_engine = AgentEngine()

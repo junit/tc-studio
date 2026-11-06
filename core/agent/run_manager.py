@@ -13,6 +13,7 @@ import json
 import threading
 import time
 import uuid
+from contextlib import suppress
 from typing import Any, Dict, List, Optional
 
 from .constants import MAX_CACHED_RUNS, RUN_TTL_SECONDS
@@ -82,13 +83,16 @@ class AgentRun:
         self.events: List[Dict[str, Any]] = []
         self.subscribers: List[AgentRunSubscriber] = []
         self._stop_requested = False
+        self._execution_terminator: Any | None = None
         self.pending_approval: Optional[Dict[str, Any]] = None
         self._approval_event: Optional[threading.Event] = None
         self._approval_decision: Optional[str] = None
+        self._approval_consumed = False
         self._lock = threading.Lock()
 
     def request_stop(self):
         """请求中断执行"""
+        terminator = None
         with self._lock:
             if self.status != "running":
                 return
@@ -98,15 +102,32 @@ class AgentRun:
             self.end_time = time.time()
             approval_event = self._approval_event
             self._approval_decision = "rejected"
+            self._approval_consumed = True
+            self.pending_approval = None
+            terminator = self._execution_terminator
         if approval_event:
             approval_event.set()
+        if terminator:
+            with suppress(Exception):
+                terminator()
         self.dispatch_event("done", {"status": "stopped"})
+
+    def set_execution_terminator(self, terminator: Any | None) -> None:
+        """Register the kill hook for the current process-bound code executor."""
+        terminate_now = False
+        with self._lock:
+            self._execution_terminator = terminator
+            terminate_now = self._stop_requested and terminator is not None
+        if terminate_now:
+            with suppress(Exception):
+                terminator()
 
     def request_approval(self, approval_data: Dict[str, Any]) -> str:
         """挂起当前执行线程，向订阅者分发 approval_required 事件，等待用户授权或拒绝"""
         with self._lock:
             self.pending_approval = approval_data
             self._approval_decision = None
+            self._approval_consumed = False
             self._approval_event = threading.Event()
             self.stream_status = "waiting_approval"
 
@@ -120,6 +141,7 @@ class AgentRun:
         with self._lock:
             decision = self._approval_decision
             self.pending_approval = None
+            self._approval_consumed = True
             self._approval_event = None
             if not signaled:
                 decision = "timeout"
@@ -136,12 +158,21 @@ class AgentRun:
     def resolve_approval(self, approval_id: str, decision: str) -> bool:
         """接收用户在前端提交的决策 (approve 或 reject) 并唤醒工作线程"""
         with self._lock:
-            if not self.pending_approval or self.pending_approval.get("approval_id") != approval_id:
+            if (
+                self._approval_consumed
+                or not self.pending_approval
+                or self.pending_approval.get("approval_id") != approval_id
+            ):
                 return False
             normalized_decision = decision.lower().strip()
             if normalized_decision not in {"approve", "reject"}:
                 return False
             self._approval_decision = normalized_decision
+            # Consume the pending approval before waking the worker.  A
+            # concurrent/replayed request must not overwrite the first
+            # decision while the execution thread is reacquiring the lock.
+            self._approval_consumed = True
+            self.pending_approval = None
             if self._approval_event:
                 self._approval_event.set()
             return True
@@ -414,6 +445,7 @@ class AgentRunManager:
                 skip_user_append=run.skip_user_append,
                 stop_checker=lambda: run.is_stopped,
                 approval_requester=run.request_approval,
+                execution_controller=run.set_execution_terminator,
             )
             for event_obj in stream_gen:
                 if run.is_stopped:

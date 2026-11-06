@@ -35,9 +35,17 @@ class CurrentUser:
 
 class AuthSettings:
     def __init__(self) -> None:
-        self.environment = os.getenv("APP_ENV", "development").lower()
+        # A missing deployment environment must fail closed.  Local callers
+        # should opt in explicitly with APP_ENV=development (and tests do so
+        # in tests/conftest.py); silently treating an unset value as a local
+        # administrator is unsafe for container and process managers.
+        raw_environment = os.getenv("APP_ENV")
+        self.environment = (raw_environment or "").strip().lower()
+        self.app_env_configured = bool(raw_environment and raw_environment.strip())
         self.allow_insecure_local = os.getenv("ALLOW_INSECURE_LOCAL_AUTH", "false").lower() in {"1", "true", "yes", "on"}
-        self.enabled = os.getenv("AUTH_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
+        raw_enabled = os.getenv("AUTH_ENABLED")
+        self.auth_enabled_configured = bool(raw_enabled and raw_enabled.strip())
+        self.enabled = (raw_enabled or "false").lower() in {"1", "true", "yes", "on"}
         self.provider = os.getenv("AUTH_PROVIDER", "oidc").lower()
         self.issuer = os.getenv("OIDC_ISSUER_URL", "").rstrip("/")
         self.client_id = os.getenv("OIDC_CLIENT_ID", "").strip()
@@ -53,8 +61,24 @@ LOCAL_DEVELOPMENT_ENVIRONMENTS = {"development", "dev", "local"}
 _settings = AuthSettings()
 _jwks_cache: tuple[float, dict[str, Any]] | None = None
 _jwks_lock = threading.Lock()
+_jwks_refresh_state: "_JWKSRefreshState | None" = None
 _JWKS_FORCE_REFRESH_COOLDOWN = 10.0
+_UNKNOWN_KID_CACHE_MAX_ENTRIES = 1024
 _unknown_kid_cache: dict[str, float] = {}
+
+
+class _JWKSRefreshState:
+    """State shared by callers waiting for one in-flight JWKS refresh.
+
+    The network request deliberately runs outside ``_jwks_lock``.  Callers
+    that arrive while a refresh is in progress wait on this state instead of
+    issuing duplicate requests to the identity provider.
+    """
+
+    def __init__(self) -> None:
+        self.event = threading.Event()
+        self.data: dict[str, Any] | None = None
+        self.error: BaseException | None = None
 
 
 def reload_auth_settings() -> AuthSettings:
@@ -83,7 +107,7 @@ def _extract_roles(claims: dict[str, Any], client_id: str) -> frozenset[str]:
 
 
 def _get_jwks(settings: AuthSettings, force: bool = False) -> dict[str, Any]:
-    global _jwks_cache
+    global _jwks_cache, _jwks_refresh_state
     # Read the cache without holding the lock.  The request below can take
     # several seconds and must not serialize every authenticated request.
     initial_cache = _jwks_cache
@@ -100,34 +124,66 @@ def _get_jwks(settings: AuthSettings, force: bool = False) -> dict[str, Any]:
         raise RuntimeError("OIDC_JWKS_URL 或 HTTPS OIDC_ISSUER_URL 未配置")
 
     # Double-check after acquiring the short-lived lock.  Only cache reads and
-    # the eventual publication are protected; the network request stays out of
-    # the critical section.
-    with _jwks_lock:
-        cached = _jwks_cache
-        now = time.monotonic()
-        if cached:
-            age = now - cached[0]
-            if force and age < _JWKS_FORCE_REFRESH_COOLDOWN:
-                return cached[1]
-            if not force and age < settings.jwks_ttl:
-                return cached[1]
+    # refresh-state transitions are protected; the network request stays out
+    # of the critical section.  A single in-flight state coalesces concurrent
+    # refreshes and propagates the leader's result or error to its waiters.
+    while True:
+        with _jwks_lock:
+            cached = _jwks_cache
+            now = time.monotonic()
+            if cached:
+                age = now - cached[0]
+                if force and age < _JWKS_FORCE_REFRESH_COOLDOWN:
+                    return cached[1]
+                if not force and age < settings.jwks_ttl:
+                    return cached[1]
 
-    response = requests.get(url, timeout=(3, 5), allow_redirects=False)
-    response.raise_for_status()
-    data = response.json()
-    if not isinstance(data, dict) or not isinstance(data.get("keys"), list):
-        raise RuntimeError("OIDC JWKS 响应格式无效")
+            refresh = _jwks_refresh_state
+            if refresh is None:
+                refresh = _JWKSRefreshState()
+                _jwks_refresh_state = refresh
+                is_leader = True
+            else:
+                is_leader = False
 
-    # A concurrent fetch may have published a newer result while this request
-    # was in flight.  Never overwrite that result with an older response.
-    fetched_at = time.monotonic()
-    initial_timestamp = initial_cache[0] if initial_cache else 0.0
-    with _jwks_lock:
-        current = _jwks_cache
-        if current and current[0] > initial_timestamp:
-            return current[1]
-        _jwks_cache = (fetched_at, data)
-        return data
+        if not is_leader:
+            refresh.event.wait()
+            if refresh.error is not None:
+                raise refresh.error
+            if refresh.data is not None:
+                return refresh.data
+            # Defensive fallback if a future change signals without a result.
+            continue
+
+        try:
+            response = requests.get(url, timeout=(3, 5), allow_redirects=False)
+            response.raise_for_status()
+            data = response.json()
+            if not isinstance(data, dict) or not isinstance(data.get("keys"), list):
+                raise RuntimeError("OIDC JWKS 响应格式无效")
+
+            # A concurrent caller cannot start another refresh while this
+            # state is active.  Keep the timestamp guard for compatibility
+            # with tests or administrative cache publication.
+            fetched_at = time.monotonic()
+            initial_timestamp = initial_cache[0] if initial_cache else 0.0
+            with _jwks_lock:
+                current = _jwks_cache
+                result = current[1] if current and current[0] > initial_timestamp else data
+                if result is data:
+                    _jwks_cache = (fetched_at, data)
+                refresh.data = result
+                refresh.event.set()
+                if _jwks_refresh_state is refresh:
+                    _jwks_refresh_state = None
+                return result
+        except BaseException as exc:
+            with _jwks_lock:
+                refresh.error = exc
+                refresh.event.set()
+                if _jwks_refresh_state is refresh:
+                    _jwks_refresh_state = None
+            raise
 
 
 def _decode_oidc_token(token: str, settings: AuthSettings) -> CurrentUser:
@@ -141,8 +197,15 @@ def _decode_oidc_token(token: str, settings: AuthSettings) -> CurrentUser:
         # IdPs may rotate signing keys before the normal TTL expires. Refresh once on kid miss.
         now = time.monotonic()
         with _jwks_lock:
+            cutoff = now - _JWKS_FORCE_REFRESH_COOLDOWN
+            for cached_kid, seen_at in list(_unknown_kid_cache.items()):
+                if seen_at < cutoff:
+                    _unknown_kid_cache.pop(cached_kid, None)
             last_unknown = _unknown_kid_cache.get(str(kid))
             if last_unknown is None or now - last_unknown >= _JWKS_FORCE_REFRESH_COOLDOWN:
+                if last_unknown is None and len(_unknown_kid_cache) >= _UNKNOWN_KID_CACHE_MAX_ENTRIES:
+                    oldest_kid = min(_unknown_kid_cache, key=lambda cached_kid: _unknown_kid_cache[cached_kid])
+                    _unknown_kid_cache.pop(oldest_kid, None)
                 _unknown_kid_cache[str(kid)] = now
                 refresh_allowed = True
             else:
@@ -175,6 +238,11 @@ def _decode_oidc_token(token: str, settings: AuthSettings) -> CurrentUser:
 
 def authenticate_request(request: Request) -> CurrentUser:
     settings = _settings
+    if not settings.app_env_configured or not settings.auth_enabled_configured:
+        raise HTTPException(
+            status_code=503,
+            detail="必须显式配置 APP_ENV 与 AUTH_ENABLED；本地开发请设置 APP_ENV=development、AUTH_ENABLED=false",
+        )
     if not settings.enabled:
         if settings.environment not in LOCAL_DEVELOPMENT_ENVIRONMENTS and not settings.allow_insecure_local:
             raise HTTPException(status_code=503, detail="非本地开发环境必须启用认证（AUTH_ENABLED=true），或明确设置 ALLOW_INSECURE_LOCAL_AUTH=true")

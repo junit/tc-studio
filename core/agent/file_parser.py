@@ -16,24 +16,57 @@ import subprocess
 import zipfile
 from typing import Any, Dict, List, Optional, Tuple
 
-MAX_SPREADSHEET_EXPANDED_BYTES = 64 * 1024 * 1024
+MAX_OFFICE_EXPANDED_BYTES = 64 * 1024 * 1024
+MAX_SPREADSHEET_EXPANDED_BYTES = MAX_OFFICE_EXPANDED_BYTES
+MAX_OFFICE_ZIP_MEMBERS = 10_000
+# Compression ratios on tiny XML members are common in legitimate Office files
+# (for example, repeated whitespace/style records).  Ratio checks only add
+# useful bomb signal once a member is large enough to create material memory
+# pressure; absolute member and archive limits remain enforced for all sizes.
+MIN_ZIP_RATIO_CHECK_BYTES = 512 * 1024
 
 
-def validate_xlsx_archive(file_path: str) -> None:
-    """Validate XLSX ZIP members before openpyxl expands them."""
+def validate_zip_archive(
+    content_or_path: bytes | bytearray | str | os.PathLike[str],
+    max_expanded_bytes: int = MAX_OFFICE_EXPANDED_BYTES,
+    max_ratio: float = 200.0,
+    max_members: int = MAX_OFFICE_ZIP_MEMBERS,
+) -> None:
+    """Validate an Office ZIP before a parser expands its members.
+
+    Both XLSX and DOCX are ZIP containers.  Inspecting the central directory
+    first prevents openpyxl/python-docx from allocating unbounded expanded
+    member data for a compression bomb.  The same helper accepts upload bytes
+    and filesystem paths because the two ingestion paths use both forms.
+    """
+    if isinstance(content_or_path, (bytes, bytearray)):
+        source = io.BytesIO(bytes(content_or_path))
+    else:
+        source = content_or_path
     try:
-        with zipfile.ZipFile(file_path) as archive:
+        with zipfile.ZipFile(source) as archive:
+            members = archive.infolist()
+            if len(members) > max_members:
+                raise ValueError("Office 压缩包成员数量超过安全上限 (10000)")
             total_size = 0
-            for info in archive.infolist():
-                if info.file_size > MAX_SPREADSHEET_EXPANDED_BYTES:
-                    raise ValueError("Excel 压缩成员解压后超过限制")
+            for info in members:
+                if info.file_size > max_expanded_bytes:
+                    raise ValueError("Office 压缩成员解压后超过安全上限 (64MB)")
                 total_size += info.file_size
-                if total_size > MAX_SPREADSHEET_EXPANDED_BYTES:
-                    raise ValueError("Excel 文件解压后总大小超过限制")
-                if info.compress_size and info.file_size / info.compress_size > 200:
-                    raise ValueError("检测到异常高压缩比，拒绝可能的压缩炸弹")
+                if total_size > max_expanded_bytes:
+                    raise ValueError("Office 压缩包总解压容量超过安全上限 (64MB)")
+                if (
+                    info.compress_size
+                    and info.file_size > MIN_ZIP_RATIO_CHECK_BYTES
+                    and info.file_size / info.compress_size > max_ratio
+                ):
+                    raise ValueError("检测到异常高压缩比，拒绝可能的压缩炸弹 (Zip Bomb)")
     except (OSError, zipfile.BadZipFile) as exc:
-        raise ValueError("Excel 压缩包结构无效") from exc
+        raise ValueError("Office 压缩文件结构无效或损坏") from exc
+
+
+# Kept as a compatibility alias for callers that specifically parse XLSX.
+validate_xlsx_archive = validate_zip_archive
 
 
 _SWIFT_OCR_SCRIPT = """
@@ -252,6 +285,7 @@ def parse_file_summary(file_path: str, filename: str) -> Dict[str, Any]:
         # 3. Word 文档 (.docx)
         elif ftype == "docx":
             try:
+                validate_zip_archive(file_path)
                 import docx
                 doc = docx.Document(file_path)
                 paragraphs = [p.text.strip() for p in doc.paragraphs if p.text.strip()]

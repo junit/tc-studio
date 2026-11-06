@@ -108,13 +108,16 @@ def api_identities(target_name: str, api_meta: Any | None = None) -> list[str]:
     """Return all stable names for an API, including the submitted alias."""
     values: list[str] = [str(target_name or "")]
     if api_meta is not None:
+        # A bare service name must not be an approval identity: accepting
+        # ``approved_high_risk_paths=["live"]`` would blanket-approve every
+        # destructive action in the live service.  The service is retained
+        # only as part of the canonical ``service/command`` paths below.
         for attr in (
             "api_id",
             "command",
             "action",
             "name",
             "full_command",
-            "service_name",
         ):
             value = getattr(api_meta, attr, "")
             if value:

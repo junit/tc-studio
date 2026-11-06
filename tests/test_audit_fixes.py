@@ -186,6 +186,27 @@ def test_invalid_approval_decision_is_rejected():
     assert run.resolve_approval("approval-invalid", "maybe") is False
 
 
+def test_approval_decision_is_consumed_atomically():
+    """A resolved approval cannot be replayed or overwritten by a second call."""
+    run = AgentRun("run-one-shot", "bot-one-shot", "test")
+
+    import threading
+
+    waiter = threading.Thread(
+        target=run.request_approval,
+        args=({"approval_id": "approval-once", "timeout_seconds": 1},),
+    )
+    waiter.start()
+    for _ in range(100):
+        if run.pending_approval:
+            break
+        threading.Event().wait(0.001)
+    assert run.resolve_approval("approval-once", "approve") is True
+    assert run.resolve_approval("approval-once", "reject") is False
+    waiter.join(timeout=1)
+    assert not waiter.is_alive()
+
+
 def test_run_skill_approval_wait_does_not_consume_timeout(tmp_path, monkeypatch):
     """审批等待超过技能 deadline 后仍应返回明确的用户取消结果。"""
 
@@ -617,3 +638,77 @@ def test_high_risk_rejection_exposes_required_path(tmp_path):
     assert result["RequiredApprovalPath"] == "group_open_http_svc/destroy_group"
     assert "approved_high_risk_paths" in result["ErrorInfo"]
 
+
+def test_killable_executor_extends_deadline_for_tool_execution():
+    from core.agent.engine import KillablePythonExecutor
+    executor = KillablePythonExecutor(["time"], timeout_seconds=0.2)
+    def slow_tool():
+        time.sleep(0.35)
+        return "tool_ok"
+    executor.send_tools({"slow_tool": slow_tool})
+    try:
+        res = executor("result = slow_tool()\nprint(result)")
+        assert "tool_ok" in res.logs
+    finally:
+        executor.close()
+
+
+def test_code_executor_supports_unconfined_env_override(monkeypatch):
+    import core.agent.engine as engine_module
+    monkeypatch.setenv("APP_ENV", "production")
+    monkeypatch.setenv("TIM_CODE_EXECUTOR_MODE", "spawn")
+    monkeypatch.setattr(engine_module.sys, "platform", "linux")
+    monkeypatch.setattr(engine_module.os, "name", "posix")
+
+    monkeypatch.delenv("ALLOW_UNCONFINED_CODE_EXECUTOR", raising=False)
+    with pytest.raises(RuntimeError, match="ALLOW_UNCONFINED_CODE_EXECUTOR"):
+        engine_module._create_code_executor([])
+
+    monkeypatch.setenv("ALLOW_UNCONFINED_CODE_EXECUTOR", "true")
+    executor = engine_module._create_code_executor([])
+    assert isinstance(executor, engine_module.KillablePythonExecutor)
+
+
+@pytest.mark.asyncio
+async def test_export_bot_chat_isolates_user_history(tmp_path, monkeypatch):
+    import apis.agent as agent_api
+    from core.auth import CurrentUser
+    from core.agent.bot_manager import BotManager
+
+    mgr = BotManager(data_dir=str(tmp_path / "data"))
+    monkeypatch.setattr(agent_api, "bot_manager", mgr)
+
+    bot = mgr.create_bot("public_bot", "Public Bot", visibility="public")
+    mgr.append_history(bot.id, "user", "Alice secret prompt", user_id="alice")
+    mgr.append_history(bot.id, "assistant", "Alice secret answer", user_id="alice")
+
+    mgr.append_history(bot.id, "user", "Bob secret prompt", user_id="bob")
+    mgr.append_history(bot.id, "assistant", "Bob secret answer", user_id="bob")
+
+    alice_resp = agent_api.export_bot_chat(bot.id, format="markdown", user=CurrentUser("alice", frozenset()))
+    alice_content = b"".join([chunk async for chunk in alice_resp.body_iterator]).decode("utf-8")
+    assert "Alice secret" in alice_content
+    assert "Bob secret" not in alice_content
+
+    bob_resp = agent_api.export_bot_chat(bot.id, format="markdown", user=CurrentUser("bob", frozenset()))
+    bob_content = b"".join([chunk async for chunk in bob_resp.body_iterator]).decode("utf-8")
+    assert "Bob secret" in bob_content
+    assert "Alice secret" not in bob_content
+
+
+def test_save_history_item_triggers_orphan_cleanup(tmp_path, monkeypatch):
+    import core.task_runner as task_runner_module
+    results_dir = tmp_path / "batch_results"
+    history_path = tmp_path / "history.json"
+    results_dir.mkdir()
+    monkeypatch.setattr(task_runner_module, "RESULTS_DIR", str(results_dir))
+    monkeypatch.setattr(task_runner_module, "HISTORY_PATH", str(history_path))
+    monkeypatch.setattr(task_runner_module, "STORAGE_DIR", str(tmp_path / "storage"))
+
+    orphan = results_dir / "task_stale_orphan.jsonl"
+    orphan.write_text("{}\n", encoding="utf-8")
+    old = time.time() - 31 * 24 * 60 * 60
+    os.utime(orphan, (old, old))
+
+    task_runner_module.save_history_item({"task_id": "new_task", "status": "completed"})
+    assert not orphan.exists()

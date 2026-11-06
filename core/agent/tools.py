@@ -11,7 +11,9 @@ import json
 import multiprocessing
 import os
 import re
+import secrets
 import time
+import weakref
 from collections.abc import Coroutine
 from contextlib import suppress
 from typing import Any, cast
@@ -23,6 +25,33 @@ from ..tim_client import TimClient
 from .bot_manager import BotManager
 from .constants import HIGH_RISK_API_KEYWORDS
 from .risk import api_identities, is_high_risk_api, resolve_api
+
+
+# Dependencies used by tools must not live on the tool instance.  smolagents
+# registers tool instances in the interpreter's ``static_tools`` mapping; any
+# ordinary public attribute on such an instance is therefore model-readable.
+# Keep the capability objects in a process-local weak map instead.  The map is
+# only reachable from this module's implementation code, while tool instances
+# remain disposable and do not retain clients after collection.
+_TOOL_DEPS: weakref.WeakKeyDictionary[Any, dict[str, Any]] = weakref.WeakKeyDictionary()
+
+
+def _register_tool_deps(tool: Any, **deps: Any) -> None:
+    current = _TOOL_DEPS.get(tool)
+    if current is None:
+        current = {}
+        _TOOL_DEPS[tool] = current
+    current.update({name: value for name, value in deps.items() if value is not None})
+
+
+def _get_tool_dep(tool: Any, name: str, default: Any = None) -> Any:
+    return _TOOL_DEPS.get(tool, {}).get(name, default)
+
+
+def _clear_tool_dep(tool: Any, name: str) -> None:
+    deps = _TOOL_DEPS.get(tool)
+    if deps is not None:
+        deps.pop(name, None)
 
 
 class CloudCallTool(Tool):
@@ -59,11 +88,14 @@ class CloudCallTool(Tool):
         approval_wait_callback: Any | None = None
     ):
         super().__init__()
-        self.approval_requester = approval_requester
-        self.approval_wait_callback = approval_wait_callback
-        self.bot_manager = bot_manager
-        self.tim_client = tim_client
-        self.cloud_client = cloud_client
+        _register_tool_deps(
+            self,
+            approval_requester=approval_requester,
+            approval_wait_callback=approval_wait_callback,
+            bot_manager=bot_manager,
+            tim_client=tim_client,
+            cloud_client=cloud_client,
+        )
 
     def forward(self, action_or_path: str, payload: Any, service: str | None = None) -> dict:
         if not runtime_is_operator.get():
@@ -89,11 +121,25 @@ class CloudCallTool(Tool):
             # A registry/catalog failure must not disable the fail-closed
             # operator gate or turn into an unhandled agent exception.
             api_meta = None
-        high_risk_kws = self.bot_manager.get_high_risk_keywords() if self.bot_manager else HIGH_RISK_API_KEYWORDS
+        bot_manager = _get_tool_dep(self, "bot_manager")
+        high_risk_kws = bot_manager.get_high_risk_keywords() if bot_manager else HIGH_RISK_API_KEYWORDS
         is_high_risk = is_high_risk_api(target_name, api_meta, high_risk_kws)
 
+        # A destructive name that is absent from the registry has no
+        # canonical metadata or payload schema.  Do not let an approval
+        # callback turn the legacy TC3/TIM fallback into an unregistered
+        # destructive execution path.
+        if is_high_risk and api_meta is None:
+            return {
+                "ActionStatus": "CANCELLED",
+                "ErrorCode": -998,
+                "RequiredApprovalPath": target_name,
+                "ErrorInfo": "未注册的高危接口缺少 canonical API 元数据，已按 fail-closed 策略拒绝执行。",
+            }
+
         if is_high_risk:
-            if not self.approval_requester:
+            approval_requester = _get_tool_dep(self, "approval_requester")
+            if not approval_requester:
                 return {
                     "ActionStatus": "CANCELLED",
                     "ErrorCode": -998,
@@ -123,15 +169,18 @@ class CloudCallTool(Tool):
                     target_desc.append(f"账号: {clean_payload['Account']}")
 
             summary_str = "，".join(target_desc) if target_desc else "未指定具体目标标识"
-            approval_id = f"appr_{int(time.time() * 1000)}"
+            # Approval identifiers are exposed to the browser and must not be
+            # predictable across concurrent requests.  The pending run still
+            # binds the id to the exact user/BOT/API/payload approval record.
+            approval_id = f"appr_{secrets.token_urlsafe(18)}"
 
             # 触发人机协同门禁挂起并等待授权
-            approval_callback = self.approval_wait_callback
+            approval_callback = _get_tool_dep(self, "approval_wait_callback")
             if approval_callback:
                 with suppress(Exception):
                     approval_callback(True)
             try:
-                decision = self.approval_requester({
+                decision = approval_requester({
                     "approval_id": approval_id,
                     "api_path": target_name,
                     "api_id": getattr(api_meta, "api_id", target_name),
@@ -162,7 +211,7 @@ class CloudCallTool(Tool):
         try:
             from ..cloud_client import UniversalCloudClient
 
-            cloud_client = self.cloud_client or UniversalCloudClient()
+            cloud_client = _get_tool_dep(self, "cloud_client") or UniversalCloudClient()
 
             if api_meta:
                 res = cloud_client.invoke_api(api_meta, clean_payload)
@@ -177,15 +226,16 @@ class CloudCallTool(Tool):
                         payload=clean_payload
                     )
                 else:
-                    if self.tim_client:
-                        res = self.tim_client.invoke("", target_name, clean_payload)
+                    tim_client = _get_tool_dep(self, "tim_client")
+                    if tim_client:
+                        res = tim_client.invoke("", target_name, clean_payload)
                     else:
                         res = cloud_client.tim_client.invoke("", target_name, clean_payload)
 
             if is_high_risk and isinstance(res, dict):
                 res["_security_notice"] = {
                     "is_high_risk": True,
-                    "user_approved": bool(self.approval_requester),
+                    "user_approved": bool(_get_tool_dep(self, "approval_requester")),
                     "warning": f"⚠️ 警告: 接口 '{target_name}' 属于破坏性高危操作（解散群/删除账号/批量清理/直播断流禁推），已完成安全审计记录。"
                 }
             return res
@@ -364,17 +414,20 @@ class EnhancePromptTool(Tool):
 
     def __init__(self, bot_id: str, bot_manager: BotManager):
         super().__init__()
-        self.bot_id = bot_id
-        self.bot_manager = bot_manager
+        _register_tool_deps(self, bot_id=bot_id, bot_manager=bot_manager)
 
     def _can_edit_definition(self) -> bool:
-        bot = self.bot_manager.get_bot(self.bot_id)
+        bot_manager = _get_tool_dep(self, "bot_manager")
+        bot_id = _get_tool_dep(self, "bot_id")
+        bot = bot_manager.get_bot(bot_id)
         return not bot or bot.visibility != "public" or runtime_is_admin.get()
 
     def forward(self, instruction: str, reason: str = "") -> str:
         if not self._can_edit_definition():
             return "❌ 公共 BOT 的行为准则仅允许管理员修改"
-        guideline = self.bot_manager.add_learned_guideline(self.bot_id, instruction, reason)
+        bot_manager = _get_tool_dep(self, "bot_manager")
+        bot_id = _get_tool_dep(self, "bot_id")
+        guideline = bot_manager.add_learned_guideline(bot_id, instruction, reason)
         if guideline:
             return f"✅ 提示词已成功自我增强！新准则 ID: {guideline.id}，内容: {guideline.instruction}"
         return "❌ 增强提示词失败：未找到指定 BOT"
@@ -397,11 +450,12 @@ class SaveMemoryTool(Tool):
 
     def __init__(self, bot_id: str, bot_manager: BotManager):
         super().__init__()
-        self.bot_id = bot_id
-        self.bot_manager = bot_manager
+        _register_tool_deps(self, bot_id=bot_id, bot_manager=bot_manager)
 
     def forward(self, key: str, content: str) -> str:
-        item = self.bot_manager.save_memory(self.bot_id, key, content)
+        bot_manager = _get_tool_dep(self, "bot_manager")
+        bot_id = _get_tool_dep(self, "bot_id")
+        item = bot_manager.save_memory(bot_id, key, content)
         return f"🧠 长期记忆已保存：[{item.key}] -> {item.content}"
 
 
@@ -419,11 +473,12 @@ class RecallMemoryTool(Tool):
 
     def __init__(self, bot_id: str, bot_manager: BotManager):
         super().__init__()
-        self.bot_id = bot_id
-        self.bot_manager = bot_manager
+        _register_tool_deps(self, bot_id=bot_id, bot_manager=bot_manager)
 
     def forward(self, query: str | None = None) -> list:
-        mems = self.bot_manager.list_memories(self.bot_id)
+        bot_manager = _get_tool_dep(self, "bot_manager")
+        bot_id = _get_tool_dep(self, "bot_id")
+        mems = bot_manager.list_memories(bot_id)
         if not query or query.lower() in ("all", ""):
             return [m.model_dump() for m in mems]
         q = query.lower().strip()
@@ -472,11 +527,12 @@ class DeleteMemoryTool(Tool):
 
     def __init__(self, bot_id: str, bot_manager: BotManager):
         super().__init__()
-        self.bot_id = bot_id
-        self.bot_manager = bot_manager
+        _register_tool_deps(self, bot_id=bot_id, bot_manager=bot_manager)
 
     def forward(self, key: str) -> str:
-        ok = self.bot_manager.delete_memory(self.bot_id, key)
+        bot_manager = _get_tool_dep(self, "bot_manager")
+        bot_id = _get_tool_dep(self, "bot_id")
+        ok = bot_manager.delete_memory(bot_id, key)
         return f"记忆 [{key}] 删除成功" if ok else f"未找到记忆 [{key}]"
 
 
@@ -506,17 +562,26 @@ class SaveSkillTool(Tool):
 
     def __init__(self, bot_id: str, bot_manager: BotManager):
         super().__init__()
-        self.bot_id = bot_id
-        self.bot_manager = bot_manager
+        _register_tool_deps(self, bot_id=bot_id, bot_manager=bot_manager)
 
     def _can_edit_definition(self) -> bool:
-        bot = self.bot_manager.get_bot(self.bot_id)
+        bot_manager = _get_tool_dep(self, "bot_manager")
+        bot_id = _get_tool_dep(self, "bot_id")
+        bot = bot_manager.get_bot(bot_id)
         return not bot or bot.visibility != "public" or runtime_is_admin.get()
 
     def forward(self, name: str, description: str, python_code: str, input_schema: dict | None = None) -> str:
         if not self._can_edit_definition():
             return "❌ 公共 BOT 的技能仅允许管理员修改"
-        skill = self.bot_manager.save_skill(self.bot_id, name, description, python_code, input_schema)
+        if len(python_code.encode("utf-8")) > MAX_SKILL_CODE_BYTES:
+            return "❌ 技能代码超过 64 KiB 限制"
+        try:
+            _validate_skill_ast(python_code)
+        except (SyntaxError, ValueError) as exc:
+            return f"❌ 技能代码预检失败: {exc}"
+        bot_manager = _get_tool_dep(self, "bot_manager")
+        bot_id = _get_tool_dep(self, "bot_id")
+        skill = bot_manager.save_skill(bot_id, name, description, python_code, input_schema)
         return f"⚡ 技能 [{skill.name}] 已成功保存到当前 BOT 的专属技能库！后续可通过 run_skill('{skill.name}') 直接调用。"
 
 
@@ -528,11 +593,12 @@ class ListSkillsTool(Tool):
 
     def __init__(self, bot_id: str, bot_manager: BotManager):
         super().__init__()
-        self.bot_id = bot_id
-        self.bot_manager = bot_manager
+        _register_tool_deps(self, bot_id=bot_id, bot_manager=bot_manager)
 
     def forward(self) -> list:
-        skills = self.bot_manager.list_skills(self.bot_id)
+        bot_manager = _get_tool_dep(self, "bot_manager")
+        bot_id = _get_tool_dep(self, "bot_id")
+        skills = bot_manager.list_skills(bot_id)
         return [
             {
                 "name": s.name,
@@ -627,6 +693,7 @@ _SKILL_BLOCKED_ATTRIBUTES = frozenset({
     "__setattr__",
 })
 _SKILL_TIMEOUT_SECONDS = 25.0
+MAX_SKILL_CODE_BYTES = 64 * 1024
 _MISSING = object()
 
 _SAFE_MODULE_ATTRS = {
@@ -906,15 +973,16 @@ class RunSkillTool(Tool):
         approval_requester: Any | None = None
     ):
         super().__init__()
-        self.bot_id = bot_id
-        self.bot_manager = bot_manager
-        self.tim_client = tim_client
-        self.approval_requester = approval_requester
-        if cloud_client is not None:
-            self.cloud_client = cloud_client
-        else:
-            from ..cloud_client import UniversalCloudClient
-            self.cloud_client = UniversalCloudClient()
+        from ..cloud_client import UniversalCloudClient
+
+        _register_tool_deps(
+            self,
+            bot_id=bot_id,
+            bot_manager=bot_manager,
+            tim_client=tim_client,
+            cloud_client=cloud_client if cloud_client is not None else UniversalCloudClient(),
+            approval_requester=approval_requester,
+        )
 
     def _dispatch_skill_rpc(self, caller_tool: CloudCallTool, request: dict):
         name = request.get("name", "")
@@ -958,7 +1026,7 @@ class RunSkillTool(Tool):
         )
         approval_elapsed = 0.0
         approval_started_at = None
-        previous_approval_callback = getattr(caller_tool, "approval_wait_callback", None)
+        previous_approval_callback = _get_tool_dep(caller_tool, "approval_wait_callback")
 
         def mark_approval_waiting(waiting: bool):
             nonlocal approval_elapsed, approval_started_at
@@ -968,12 +1036,15 @@ class RunSkillTool(Tool):
                 approval_elapsed += time.monotonic() - approval_started_at
                 approval_started_at = None
 
-        caller_tool.approval_wait_callback = mark_approval_waiting
+        _register_tool_deps(caller_tool, approval_wait_callback=mark_approval_waiting)
         try:
             process.start()
             child_conn.close()
         except Exception as exc:
-            caller_tool.approval_wait_callback = previous_approval_callback
+            if previous_approval_callback is None:
+                _clear_tool_dep(caller_tool, "approval_wait_callback")
+            else:
+                _register_tool_deps(caller_tool, approval_wait_callback=previous_approval_callback)
             child_conn.close()
             parent_conn.close()
             return {"success": False, "error": f"技能隔离进程启动失败: {exc}"}
@@ -1011,7 +1082,10 @@ class RunSkillTool(Tool):
             if result_message is None:
                 result_message = {"kind": "result", "ok": False, "error": str(exc)}
         finally:
-            caller_tool.approval_wait_callback = previous_approval_callback
+            if previous_approval_callback is None:
+                _clear_tool_dep(caller_tool, "approval_wait_callback")
+            else:
+                _register_tool_deps(caller_tool, approval_wait_callback=previous_approval_callback)
             if timed_out or process.is_alive():
                 process.terminate()
                 process.join(1.0)
@@ -1033,7 +1107,9 @@ class RunSkillTool(Tool):
     def forward(self, name: str, kwargs: Any | None = None) -> dict:
         if not runtime_is_operator.get():
             return {"success": False, "error": "当前用户缺少 operator 权限，禁止通过 Agent 运行技能"}
-        skill = self.bot_manager.get_skill(self.bot_id, name)
+        bot_manager = _get_tool_dep(self, "bot_manager")
+        bot_id = _get_tool_dep(self, "bot_id")
+        skill = bot_manager.get_skill(bot_id, name)
         if not skill:
             return {"error": f"未找到技能: {name}"}
 
@@ -1058,10 +1134,10 @@ class RunSkillTool(Tool):
             return {"success": False, "error": f"技能代码语法解析失败: {exc}"}
 
         caller_tool = CloudCallTool(
-            approval_requester=self.approval_requester,
-            bot_manager=self.bot_manager,
-            tim_client=self.tim_client,
-            cloud_client=self.cloud_client,
+            approval_requester=_get_tool_dep(self, "approval_requester"),
+            bot_manager=bot_manager,
+            tim_client=_get_tool_dep(self, "tim_client"),
+            cloud_client=_get_tool_dep(self, "cloud_client"),
         )
         return self._run_isolated(skill.code, args, caller_tool)
 
@@ -1103,7 +1179,7 @@ class CreateBotTool(Tool):
 
     def __init__(self, bot_manager: BotManager):
         super().__init__()
-        self.bot_manager = bot_manager
+        _register_tool_deps(self, bot_manager=bot_manager)
 
     def forward(
         self,
@@ -1117,10 +1193,11 @@ class CreateBotTool(Tool):
         if not clean_name:
             return {"success": False, "error": "智能体名称不能为空"}
 
-        profile = self.bot_manager.generate_bot_profile(clean_name, goal or "")
+        bot_manager = _get_tool_dep(self, "bot_manager")
+        profile = bot_manager.generate_bot_profile(clean_name, goal or "")
         target_id = profile["id"]
         # 避免重名 ID 冲突
-        if self.bot_manager.get_bot(target_id):
+        if bot_manager.get_bot(target_id):
             target_id = f"{target_id}_{int(time.time()) % 1000}"
 
         target_avatar = avatar or profile.get("avatar", "🤖")
@@ -1131,7 +1208,7 @@ class CreateBotTool(Tool):
         # 清洗可能存在的 ChatMessage repr
         target_prompt = BotManager.clean_prompt_text(target_prompt)
 
-        new_bot = self.bot_manager.create_bot(
+        new_bot = bot_manager.create_bot(
             bot_id=target_id,
             name=clean_name,
             avatar=target_avatar,
@@ -1161,12 +1238,13 @@ class ListAgentsTool(Tool):
 
     def __init__(self, bot_manager: BotManager):
         super().__init__()
-        self.bot_manager = bot_manager
+        _register_tool_deps(self, bot_manager=bot_manager)
 
     def forward(self) -> list:
         user_id = runtime_user_id.get()
+        bot_manager = _get_tool_dep(self, "bot_manager")
         bots = [
-            bot for bot in self.bot_manager.list_bots(user_id=user_id)
+            bot for bot in bot_manager.list_bots(user_id=user_id)
             if runtime_is_admin.get() or bot.get("visibility") == "public" or bot.get("owner_id") == user_id
         ]
         return [
@@ -1208,18 +1286,26 @@ class CallAgentTool(Tool):
         engine: Any | None = None,
         call_chain: list[str] | None = None,
         approval_requester: Any | None = None,
+        orchestration_recorder: Any | None = None,
     ):
-
-
-
         super().__init__()
-        self.bot_id = bot_id
-        self.bot_manager = bot_manager
-        self.engine = engine
-        self.call_chain = call_chain or [bot_id]
-        self.approval_requester = approval_requester
+        _register_tool_deps(
+            self,
+            bot_id=bot_id,
+            bot_manager=bot_manager,
+            engine=engine,
+            call_chain=tuple(call_chain or (bot_id,)),
+            approval_requester=approval_requester,
+            orchestration_recorder=orchestration_recorder,
+        )
 
     def forward(self, agent_name: str, task: str) -> str:
+        bot_id = _get_tool_dep(self, "bot_id")
+        bot_manager = _get_tool_dep(self, "bot_manager")
+        engine = _get_tool_dep(self, "engine")
+        call_chain = _get_tool_dep(self, "call_chain", ())
+        approval_requester = _get_tool_dep(self, "approval_requester")
+        orchestration_recorder = _get_tool_dep(self, "orchestration_recorder")
         raw_name = (agent_name or "").strip()
         # 剥除各种标点符号、前缀与外包围符: @, #, 【】, [], "", '', 括号等
         clean_name = re.sub(r"^[@#【\[\"'（(]+", "", raw_name)
@@ -1232,14 +1318,14 @@ class CallAgentTool(Tool):
             clean_name = re.sub(r"[\(（][a-zA-Z0-9_-]+[\)）]", "", clean_name).strip()
 
         all_bots = [
-            bot for bot in self.bot_manager.list_bots(user_id=runtime_user_id.get())
+            bot for bot in bot_manager.list_bots(user_id=runtime_user_id.get())
             if runtime_is_admin.get() or bot.get("visibility") == "public" or bot.get("owner_id") == runtime_user_id.get()
         ]
         target_bot = None
 
         # 1. 显式 ID 匹配
         if explicit_id:
-            cand = self.bot_manager.get_bot(explicit_id)
+            cand = bot_manager.get_bot(explicit_id)
             if cand and (runtime_is_admin.get() or cand.visibility == "public" or cand.owner_id == runtime_user_id.get()):
                 target_bot = cand
 
@@ -1249,7 +1335,7 @@ class CallAgentTool(Tool):
                 b_id = b.get("id", "")
                 b_name = b.get("name", "")
                 if b_id == clean_name or b_name == clean_name or b_name.lower() == clean_name.lower():
-                    target_bot = self.bot_manager.get_bot(b_id)
+                    target_bot = bot_manager.get_bot(b_id)
                     break
 
         # 3. 子串双向包含匹配 (如 "风控官" in "社群风控官", "巡检" in "消息巡检员")
@@ -1258,7 +1344,7 @@ class CallAgentTool(Tool):
                 b_id = b.get("id", "")
                 b_name = b.get("name", "")
                 if clean_name in b_name or b_name in clean_name or clean_name.lower() in b_id.lower():
-                    target_bot = self.bot_manager.get_bot(b_id)
+                    target_bot = bot_manager.get_bot(b_id)
                     break
 
         # 4. 语义核心关键词/领域匹配 (自然语言口语化称谓如 "风控", "巡检", "管理员", "投研", "运维")
@@ -1270,7 +1356,7 @@ class CallAgentTool(Tool):
                     b_name = b.get("name", "")
                     b_desc = b.get("description", "")
                     if kw in b_name or kw in b_desc:
-                        target_bot = self.bot_manager.get_bot(b.get("id", ""))
+                        target_bot = bot_manager.get_bot(b.get("id", ""))
                         break
                 if target_bot:
                     break
@@ -1279,23 +1365,24 @@ class CallAgentTool(Tool):
             available = ", ".join([f"【{b.get('name', '')}】" for b in all_bots])
             return f"❌ 未能通过「{agent_name}」识别到对应智能体。当前团队入驻的智能体伙伴有：{available}。请告知目标智能体名称。"
 
-        if target_bot.id == self.bot_id:
+        if target_bot.id == bot_id:
             return f"⚠️ 智能体「{target_bot.name}」即为当前智能体自身，无需通过 call_agent 自调用，请直接在当前流程中执行该任务。"
 
-        if not self.engine:
+        if not engine:
             return f"⚠️ 系统执行引擎未就绪，无法派发给智能体【{target_bot.name}】。"
 
         t0 = time.time()
-        caller_bot = self.bot_manager.get_bot(self.bot_id)
-        caller_name = caller_bot.name if caller_bot else self.bot_id
+        caller_bot = bot_manager.get_bot(bot_id)
+        caller_name = caller_bot.name if caller_bot else bot_id
 
         try:
-            result = self.engine.execute_subtask(
-                caller_bot_id=self.bot_id,
+            result = engine.execute_subtask(
+                caller_bot_id=bot_id,
                 target_bot_id=target_bot.id,
                 task=task,
-                call_chain=self.call_chain,
-                approval_requester=self.approval_requester,
+                call_chain=list(call_chain),
+                approval_requester=approval_requester,
+                orchestration_recorder=orchestration_recorder,
             )
             elapsed = round(time.time() - t0, 2)
             preview = result.strip()
@@ -1303,7 +1390,7 @@ class CallAgentTool(Tool):
                 preview = preview[:160] + "..."
 
             record = {
-                "caller_bot_id": self.bot_id,
+                "caller_bot_id": bot_id,
                 "caller_bot_name": caller_name,
                 "target_bot_id": target_bot.id,
                 "target_bot_name": target_bot.name,
@@ -1315,8 +1402,10 @@ class CallAgentTool(Tool):
                 "timestamp": time.strftime("%H:%M:%S"),
                 "owner_id": runtime_user_id.get()
             }
-            if hasattr(self.engine, "record_orchestration"):
-                self.engine.record_orchestration(record)
+            if orchestration_recorder:
+                orchestration_recorder(record)
+            elif hasattr(engine, "record_orchestration"):
+                engine.record_orchestration(record)
 
             return (
                 f"🤖【{target_bot.name}】执行与协同反馈：\n\n"
@@ -1326,7 +1415,7 @@ class CallAgentTool(Tool):
             elapsed = round(time.time() - t0, 2)
             err_msg = str(e)
             record = {
-                "caller_bot_id": self.bot_id,
+                "caller_bot_id": bot_id,
                 "caller_bot_name": caller_name,
                 "target_bot_id": target_bot.id,
                 "target_bot_name": target_bot.name,
@@ -1338,8 +1427,10 @@ class CallAgentTool(Tool):
                 "timestamp": time.strftime("%H:%M:%S"),
                 "owner_id": runtime_user_id.get()
             }
-            if hasattr(self.engine, "record_orchestration"):
-                self.engine.record_orchestration(record)
+            if orchestration_recorder:
+                orchestration_recorder(record)
+            elif hasattr(engine, "record_orchestration"):
+                engine.record_orchestration(record)
 
             return f"❌ 调度智能体【{target_bot.name}】执行子任务时发生异常: {err_msg}"
 
@@ -1362,8 +1453,7 @@ class ReadFileTool(Tool):
 
     def __init__(self, bot_id: str | None = None, bot_manager: BotManager | None = None):
         super().__init__()
-        self.bot_id = bot_id
-        self.bot_manager = bot_manager
+        _register_tool_deps(self, bot_id=bot_id, bot_manager=bot_manager)
 
     @staticmethod
     def _is_inside_root(root: str, candidate: str) -> bool:
@@ -1374,9 +1464,11 @@ class ReadFileTool(Tool):
 
     def _resolve_readable_path(self, file_path: str) -> str | None:
         """只解析当前 BOT uploads 目录内的普通文件，拒绝宿主机路径与目录遍历。"""
-        if not self.bot_id or not self.bot_manager:
+        bot_id = _get_tool_dep(self, "bot_id")
+        bot_manager = _get_tool_dep(self, "bot_manager")
+        if not bot_id or not bot_manager:
             return None
-        uploads_dir = os.path.realpath(self.bot_manager._uploads_dir(self.bot_id))
+        uploads_dir = os.path.realpath(bot_manager._uploads_dir(bot_id))
         raw = file_path.strip()
         if os.path.isabs(raw):
             candidate = os.path.realpath(raw)
@@ -1413,6 +1505,8 @@ class ReadFileTool(Tool):
         cat, ftype = get_file_category_and_type(os.path.basename(path))
         if ftype == "docx":
             try:
+                from .file_parser import validate_zip_archive
+                validate_zip_archive(path)
                 import docx
                 doc = docx.Document(path)
                 paras = [p.text for p in doc.paragraphs if p.text]
@@ -1457,12 +1551,13 @@ class SearchKnowledgeTool(Tool):
 
     def __init__(self, bot_id: str, rag_mgr: Any | None = None):
         super().__init__()
-        self.bot_id = bot_id
         from .rag_manager import rag_manager
-        self.rag_mgr = rag_mgr or rag_manager
+        _register_tool_deps(self, bot_id=bot_id, rag_mgr=rag_mgr or rag_manager)
 
     def forward(self, query: str) -> str:
-        results = self.rag_mgr.search(self.bot_id, query, top_k=4)
+        bot_id = _get_tool_dep(self, "bot_id")
+        rag_mgr = _get_tool_dep(self, "rag_mgr")
+        results = rag_mgr.search(bot_id, query, top_k=4)
         if not results:
             return f"未在企业知识库中检索到与「{query}」相关的文档段落。请尝试更通用的关键词或查阅官方接口文档。"
 
@@ -1480,7 +1575,8 @@ def build_bot_tools(
     engine: Any | None = None,
     call_chain: list[str] | None = None,
     approval_requester: Any | None = None,
-    cloud_client: Any | None = None
+    cloud_client: Any | None = None,
+    orchestration_recorder: Any | None = None,
 ) -> list[Tool]:
     """为指定 BOT 组装能力工具集（涵盖云直播 API 3.0 与即时通信 IM REST API）"""
     tools = [
@@ -1514,7 +1610,14 @@ def build_bot_tools(
             approval_requester=approval_requester
         ),
         ListAgentsTool(bot_manager),
-        CallAgentTool(bot_id, bot_manager, engine, call_chain, approval_requester),
+        CallAgentTool(
+            bot_id,
+            bot_manager,
+            engine,
+            call_chain,
+            approval_requester,
+            orchestration_recorder,
+        ),
         ReadFileTool(bot_id, bot_manager),
         SearchKnowledgeTool(bot_id)
     ]

@@ -82,6 +82,27 @@ def test_unrecognized_environment_fails_closed_when_auth_disabled(monkeypatch):
     auth.reload_auth_settings()
 
 
+def test_missing_auth_environment_fails_closed(monkeypatch):
+    monkeypatch.delenv("APP_ENV", raising=False)
+    monkeypatch.delenv("AUTH_ENABLED", raising=False)
+    auth.reload_auth_settings()
+    response = TestClient(app).get("/api/services")
+    assert response.status_code == 503
+    monkeypatch.setenv("APP_ENV", "development")
+    monkeypatch.setenv("AUTH_ENABLED", "false")
+    auth.reload_auth_settings()
+
+
+def test_blank_auth_enabled_fails_closed(monkeypatch):
+    monkeypatch.setenv("APP_ENV", "development")
+    monkeypatch.setenv("AUTH_ENABLED", " ")
+    auth.reload_auth_settings()
+    response = TestClient(app).get("/api/services")
+    assert response.status_code == 503
+    monkeypatch.setenv("AUTH_ENABLED", "false")
+    auth.reload_auth_settings()
+
+
 def test_dry_run_redacts_credentials_for_non_admin(monkeypatch):
     from types import SimpleNamespace
 
@@ -202,6 +223,18 @@ def test_archived_task_access_falls_back_to_history(monkeypatch):
 def test_archived_task_denies_wrong_owner(monkeypatch):
     monkeypatch.setenv("AUTH_ENABLED", "true")
     auth.reload_auth_settings()
+
+
+def test_history_detail_paginates_result_rows(monkeypatch):
+    monkeypatch.setattr(
+        app_module,
+        "load_history",
+        lambda: [{"task_id": "paged", "results": [{"id": i} for i in range(5)]}],
+    )
+    response = app_module.get_history_detail("paged", offset=2, limit=2)
+    assert response["data"]["results"] == [{"id": 2}, {"id": 3}]
+    assert response["data"]["result_total"] == 5
+    assert response["data"]["result_has_more"] is True
     monkeypatch.setattr(app_module.task_runner, "get_task", lambda _task_id: None)
     monkeypatch.setattr(app_module, "load_history", lambda: [{"task_id": "old-2", "owner_id": "user-1"}])
     with pytest.raises(HTTPException):
@@ -325,7 +358,7 @@ def test_auth_middleware_keeps_user_context_until_stream_finishes(monkeypatch):
     assert runtime_user_id.get() == "local"
 
 
-def test_jwks_network_fetch_is_not_serialized_by_cache_lock(monkeypatch):
+def test_jwks_refresh_is_singleflight_and_does_not_hold_cache_lock(monkeypatch):
     settings = SimpleNamespace(
         jwks_url="https://issuer.example.test/jwks",
         issuer="https://issuer.example.test",
@@ -365,9 +398,82 @@ def test_jwks_network_fetch_is_not_serialized_by_cache_lock(monkeypatch):
     assert started.wait(timeout=1)
     second = threading.Thread(target=lambda: results.append(auth._get_jwks(settings)))
     second.start()
-    assert second_entered.wait(timeout=1), "a slow JWKS request must not hold _jwks_lock"
+    # The second caller waits for the in-flight request instead of issuing a
+    # duplicate upstream GET.  It must still be able to enter the refresh
+    # coordination path while the first request is blocked on I/O.
+    assert not second_entered.wait(timeout=0.2), "concurrent refreshes must be coalesced"
     release.set()
     first.join(timeout=2)
     second.join(timeout=2)
     assert not first.is_alive() and not second.is_alive()
     assert len(results) == 2
+    assert calls == 1
+
+
+def test_jwks_refresh_failure_is_released_to_waiters(monkeypatch):
+    settings = SimpleNamespace(
+        jwks_url="https://issuer.example.test/jwks",
+        issuer="https://issuer.example.test",
+        jwks_ttl=300,
+    )
+    started = threading.Event()
+    release = threading.Event()
+    calls = 0
+    calls_lock = threading.Lock()
+
+    def fake_get(*_args, **_kwargs):
+        nonlocal calls
+        with calls_lock:
+            calls += 1
+        started.set()
+        assert release.wait(timeout=2)
+        raise auth.requests.RequestException("IdP unavailable")
+
+    monkeypatch.setattr(auth.requests, "get", fake_get)
+    monkeypatch.setattr(auth, "_jwks_cache", None)
+    errors: list[BaseException] = []
+
+    first = threading.Thread(target=lambda: _capture_error(auth._get_jwks, settings, errors=errors))
+    first.start()
+    assert started.wait(timeout=1)
+    second = threading.Thread(target=lambda: _capture_error(auth._get_jwks, settings, errors=errors))
+    second.start()
+    release.set()
+    first.join(timeout=2)
+    second.join(timeout=2)
+
+    assert not first.is_alive() and not second.is_alive()
+    assert len(errors) == 2
+    assert all(isinstance(error, auth.requests.RequestException) for error in errors)
+    assert calls == 1
+
+
+def _capture_error(function, *args, errors):
+    try:
+        function(*args)
+    except BaseException as exc:  # noqa: BLE001 - test helper captures leader/waiter errors
+        errors.append(exc)
+
+
+def test_unknown_kid_cache_is_bounded_and_evicts_oldest(monkeypatch):
+    """Untrusted key ids cannot grow the forced-refresh cache without bound."""
+    settings = SimpleNamespace(
+        issuer="https://issuer.example.test",
+        audience="client",
+        client_id="client",
+    )
+    monkeypatch.setattr(auth, "_get_jwks", lambda *_args, **_kwargs: {"keys": []})
+    monkeypatch.setattr(auth.jwt, "get_unverified_header", lambda _token: {"kid": "new-kid"})
+    now = 2_000.0
+    monkeypatch.setattr(auth, "_unknown_kid_cache", {
+        f"kid-{index}": now - 1.0 + index / 10_000.0
+        for index in range(auth._UNKNOWN_KID_CACHE_MAX_ENTRIES)
+    })
+    monkeypatch.setattr(auth.time, "monotonic", lambda: now)
+
+    with pytest.raises(ValueError, match="signing key not found"):
+        auth._decode_oidc_token("token", settings)
+
+    assert len(auth._unknown_kid_cache) == auth._UNKNOWN_KID_CACHE_MAX_ENTRIES
+    assert "kid-0" not in auth._unknown_kid_cache
+    assert auth._unknown_kid_cache["new-kid"] == now

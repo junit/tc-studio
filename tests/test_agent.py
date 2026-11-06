@@ -16,6 +16,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 from fastapi.testclient import TestClient
 
 from app import app
+from apis.agent import sanitize_svg
 from core.agent.bot_manager import BotManager, bot_manager
 from core.agent.tools import RunSkillTool, build_bot_tools
 from core.tim_client import TimClient
@@ -771,6 +772,10 @@ def test_bot_manager_orphan_file_cleanup_and_clear_history(temp_bot_manager):
     referenced_path = os.path.join(uploads_dir, "referenced.txt")
     with open(orphan_path, "w") as f:
         f.write("orphan")
+    # Cleanup intentionally grants newly-created files a 24-hour grace
+    # period; make this fixture an actual old orphan.
+    old_mtime = time.time() - (24 * 60 * 60 + 1)
+    os.utime(orphan_path, (old_mtime, old_mtime))
     with open(referenced_path, "w") as f:
         f.write("referenced")
 
@@ -791,6 +796,38 @@ def test_bot_manager_orphan_file_cleanup_and_clear_history(temp_bot_manager):
     # 执行清空历史 (delete_files=True)
     temp_bot_manager.clear_history(bot_id, delete_files=True)
     assert not os.path.exists(referenced_path)
+
+
+def test_bot_manager_cleanup_preserves_markdown_links_and_recent_files(temp_bot_manager):
+    """GC keeps linked output files and gives new files a 24-hour grace period."""
+    bot_id = "default_assistant"
+    uploads_dir = temp_bot_manager._uploads_dir(bot_id)
+    os.makedirs(uploads_dir, exist_ok=True)
+
+    old_orphan = os.path.join(uploads_dir, "old-orphan.txt")
+    linked = os.path.join(uploads_dir, "f_123_linked-report.md")
+    recent = os.path.join(uploads_dir, "recent-output.csv")
+    for path in (old_orphan, linked, recent):
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(path)
+    old_mtime = time.time() - (24 * 60 * 60 + 1)
+    os.utime(old_orphan, (old_mtime, old_mtime))
+    os.utime(linked, (old_mtime, old_mtime))
+
+    temp_bot_manager.append_history(
+        bot_id,
+        "assistant",
+        "报告已生成：[下载报告](/api/agent/bots/default_assistant/files/f_123_linked-report.md?download=true)",
+    )
+
+    assert temp_bot_manager.cleanup_unreferenced_files(bot_id) == 1
+    assert not os.path.exists(old_orphan)
+    assert os.path.exists(linked)
+    assert os.path.exists(recent)
+
+    listed = {item["name"]: item["is_referenced"] for item in temp_bot_manager.list_bot_files(bot_id)}
+    assert listed["f_123_linked-report.md"] is True
+    assert listed["recent-output.csv"] is False
 
 
 def test_tim_call_tool_high_risk_notice():
@@ -912,14 +949,111 @@ def test_bot_file_serving_and_preview(temp_bot_manager):
         assert r4.status_code == 200
         assert "attachment" in r4.headers.get("content-disposition", "")
 
-        # 5. 测试不存在的文件返回 404
+        # 5. HTML/JS 仍强制下载；SVG 经过服务端清洗后保留 image/svg+xml
+        # 预览能力，同时不允许脚本、事件处理器或危险子节点进入响应。
+        html_path = os.path.join(uploads_dir, "f_1000_payload.html")
+        svg_path = os.path.join(uploads_dir, "f_1001_payload.svg")
+        with open(html_path, "w", encoding="utf-8") as f:
+            f.write("<script>alert(1)</script>")
+        with open(svg_path, "w", encoding="utf-8") as f:
+            f.write('<svg xmlns="http://www.w3.org/2000/svg" onload="alert(1)"><script>alert(2)</script><foreignObject><div>bad</div></foreignObject><rect width="10" height="10" fill="red" /></svg>')
+        html_response = client.get(f"/api/agent/bots/{bot_id}/files/payload.html")
+        assert html_response.status_code == 200
+        assert html_response.headers["content-type"].startswith("application/octet-stream")
+        assert "attachment" in html_response.headers.get("content-disposition", "")
+        assert html_response.headers["x-content-type-options"] == "nosniff"
+
+        svg_response = client.get(f"/api/agent/bots/{bot_id}/files/payload.svg")
+        assert svg_response.status_code == 200
+        assert svg_response.headers["content-type"].startswith("image/svg+xml")
+        assert "inline" in svg_response.headers.get("content-disposition", "")
+        assert svg_response.headers["x-content-type-options"] == "nosniff"
+        assert svg_response.headers["content-security-policy"].startswith("default-src 'none'")
+        assert b"onload" not in svg_response.content
+        assert b"<script" not in svg_response.content
+        assert b"foreignObject" not in svg_response.content
+
+        # 6. 测试不存在的文件返回 404
         r5 = client.get(f"/api/agent/bots/{bot_id}/files/not_found.png")
         assert r5.status_code == 404
 
-        # 6. 测试删除支持原名回退
+        # 7. 测试删除支持原名回退
         r6 = client.delete(f"/api/agent/bots/{bot_id}/files/screenshot.png")
         assert r6.status_code == 200
         assert not os.path.exists(img_path)
+
+
+def test_sanitize_svg_removes_active_content_and_external_references():
+    payload = b'''<?xml version="1.0"?>
+    <svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink"
+         onload="alert(1)">
+      <script>alert(2)</script>
+      <foreignObject><div>bad</div></foreignObject>
+      <use xlink:href="javascript:alert(3)" />
+      <rect fill="url(http://attacker.invalid/pixel)" style="fill:red" onclick="alert(4)" />
+      <use xlink:href="#local-symbol" />
+    </svg>'''
+    cleaned = sanitize_svg(payload)
+    assert b"<script" not in cleaned
+    assert b"foreignObject" not in cleaned
+    assert b"onload" not in cleaned
+    assert b"onclick" not in cleaned
+    assert b"javascript:" not in cleaned
+    assert b"attacker.invalid" not in cleaned
+    assert b"local-symbol" in cleaned
+
+    raster_data = b'''<svg xmlns="http://www.w3.org/2000/svg">
+      <image href="data:image/png;base64,iVBORw0KGgo=" />
+      <image href="data:image/png;base64,PHN2Zy8+" />
+    </svg>'''
+    raster_cleaned = sanitize_svg(raster_data)
+    assert b"data:image/png;base64,iVBORw0KGgo=" in raster_cleaned
+    assert b"PHN2Zy8+" not in raster_cleaned
+
+    with pytest.raises(ValueError):
+        sanitize_svg(b'<!DOCTYPE svg [<!ENTITY x "boom">]><svg>&x;</svg>')
+
+
+def test_sanitize_svg_preserves_safe_css_and_filters_active_css():
+    payload = b'''<svg xmlns="http://www.w3.org/2000/svg">
+      <defs><linearGradient id="local-gradient"><stop offset="0" /></linearGradient></defs>
+      <style>
+        .safe { fill: url(#local-gradient); stroke: #0f172a; stroke-width: 2; font-family: 'Open Sans'; }
+        .mixed { fill: #fff; fill: url(https://attacker.invalid/pixel); stroke: blue; }
+      </style>
+      <rect class="safe" style="fill: red; opacity: .5; stroke: url(#local-gradient);" />
+      <circle style="fill: green; background-image: url(javascript:alert(1));" />
+    </svg>'''
+    cleaned = sanitize_svg(payload)
+
+    # Normal static styles and same-document gradient references survive both
+    # as declarations and as a stylesheet rule.
+    assert b"fill:url(#local-gradient)" in cleaned
+    assert b"stroke:#0f172a" in cleaned
+    assert b"style=\"fill:red;opacity:.5;stroke:url(#local-gradient)\"" in cleaned
+    # External/script URLs are removed at declaration granularity, preserving
+    # the safe declarations from the same rule.
+    assert b"https://attacker.invalid" not in cleaned
+    assert b"javascript:" not in cleaned
+    assert b"background-image" not in cleaned
+    assert b".mixed{fill:#fff;stroke:blue}" in cleaned
+
+
+def test_sanitize_svg_drops_css_escape_import_and_malformed_styles():
+    payload = b'''<svg xmlns="http://www.w3.org/2000/svg">
+      <style>.escaped { fill: u\\72l(https://attacker.invalid/x); }</style>
+      <style>@import url(https://attacker.invalid/theme.css); .after-import { fill: #123456; }</style>
+      <style>.commented { fill: re/*x*/d; }</style>
+      <rect style="fill: red; stroke: url(https://attacker.invalid/line);" />
+    </svg>'''
+    cleaned = sanitize_svg(payload)
+
+    assert b"attacker.invalid" not in cleaned
+    assert b"@import" not in cleaned
+    assert b"escaped" not in cleaned
+    assert b"commented" not in cleaned
+    assert b".after-import{fill:#123456}" in cleaned
+    assert b"style=\"fill:red\"" in cleaned
 
 
 def test_render_chart_helper():

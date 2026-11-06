@@ -101,6 +101,7 @@ export const DocsCenterPanel: React.FC<DocsCenterPanelProps> = ({ onNavigateToSa
   const [viewingApi, setViewingApi] = useState<ApiMeta | null>(null)
 
   const pollTimerRef = useRef<any>(null)
+  const treePollTimerRef = useRef<any>(null)
 
   // 获取汇总数据
   const fetchSummary = async (serviceId?: string) => {
@@ -152,6 +153,7 @@ export const DocsCenterPanel: React.FC<DocsCenterPanelProps> = ({ onNavigateToSa
     pollStatus()
     return () => {
       if (pollTimerRef.current) clearTimeout(pollTimerRef.current)
+      if (treePollTimerRef.current) clearTimeout(treePollTimerRef.current)
     }
   }, [])
 
@@ -210,19 +212,42 @@ export const DocsCenterPanel: React.FC<DocsCenterPanelProps> = ({ onNavigateToSa
       const res = await fetch('/api/docs/tree/sync', { method: 'POST' })
       const json = await res.json()
       if (json.status === 'success') {
-        const info = json.data
-        showToast({
-          type: 'success',
-          message: `已从腾讯云官网动态提取最新目录树！共 ${info.total_apis} 项接口已热重载生效`,
-        })
-        await fetchApis()
-        await fetchSummary()
+        const taskId = json.task_id || json.data?.task_id
+        if (!taskId) {
+          throw new Error('目录树同步未返回任务编号')
+        }
+        const pollTreeSync = async () => {
+          try {
+            const statusRes = await fetch(`/api/docs/tree/sync/status?task_id=${encodeURIComponent(taskId)}`)
+            const statusJson = await statusRes.json()
+            const status = statusJson.data
+            if (status?.status === 'COMPLETED') {
+              const info = status.result || {}
+              showToast({
+                type: 'success',
+                message: `已从腾讯云官网动态提取最新目录树！共 ${info.total_apis || 0} 项接口已热重载生效`,
+              })
+              await fetchApis()
+              await fetchSummary()
+              setIsSyncingTree(false)
+              return
+            }
+            if (status?.status === 'FAILED') {
+              throw new Error(status.error || '同步目录树失败')
+            }
+            treePollTimerRef.current = setTimeout(pollTreeSync, 800)
+          } catch (pollError: any) {
+            showToast({ type: 'warning', message: `同步目录树失败: ${pollError.message}` })
+            setIsSyncingTree(false)
+          }
+        }
+        await pollTreeSync()
       } else {
         showToast({ type: 'warning', message: json.detail || '同步目录树失败' })
+        setIsSyncingTree(false)
       }
     } catch (e: any) {
       showToast({ type: 'warning', message: `同步目录树异常: ${e.message}` })
-    } finally {
       setIsSyncingTree(false)
     }
   }

@@ -126,6 +126,10 @@ export const useBatchStore = create<BatchState>((set, get) => ({
     set({
       items,
       fileName,
+      // The confirmation text covers the concrete target rows.  Any upload,
+      // retry or history restore changes that target and requires a fresh
+      // acknowledgement before a destructive batch can be submitted.
+      highRiskConfirmed: false,
       failedItems: [],
       progress: { current: 0, total: items.length, percent: 0, success: 0, failed: 0 },
     }),
@@ -134,6 +138,7 @@ export const useBatchStore = create<BatchState>((set, get) => ({
     set({
       items: [],
       fileName: '',
+      highRiskConfirmed: false,
       failedItems: [],
       progress: { current: 0, total: 0, percent: 0, success: 0, failed: 0 },
     }),

@@ -1496,7 +1496,25 @@ export const AgentPanel: React.FC = () => {
         }
       }
     } finally {
+      // 清理全局流状态必须无条件执行。切换 Bot 后，旧流仍会进入 finally，
+      // 不能因为当前视图已变化而留下 isGenerating 或旧控制器引用。
+      const isCurrentController = abortControllerRef.current === controller
+      if (isCurrentController) {
+        setIsGenerating(false)
+        abortControllerRef.current = null
+      }
+      if (activeBotIdRef.current !== botId || isCurrentController) {
+        setActiveRunsMap((prev) => {
+          if (!prev[botId]) return prev
+          const next = { ...prev }
+          delete next[botId]
+          return next
+        })
+      }
+
+      // 旧 Bot 的流只清理运行状态，不再更新当前视图中的消息或详情。
       if (activeBotIdRef.current !== botId) return
+
       if (!terminalEventReceived && !controller.signal.aborted) {
         setMessages((prev) =>
           prev.map((msg) => msg.id === assistantMsgId
@@ -1513,16 +1531,6 @@ export const AgentPanel: React.FC = () => {
           )
         )
       }
-      if (abortControllerRef.current === controller) {
-        setIsGenerating(false)
-        abortControllerRef.current = null
-      }
-      setActiveRunsMap((prev) => {
-        if (!prev[botId]) return prev
-        const next = { ...prev }
-        delete next[botId]
-        return next
-      })
 
       setMessages((prev) =>
         prev.map((msg) => {

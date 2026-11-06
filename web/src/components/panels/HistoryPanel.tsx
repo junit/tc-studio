@@ -154,7 +154,7 @@ export const HistoryPanel: React.FC<HistoryPanelProps> = ({
     let taskToLoad = task
     // 如果列表中的摘要没有 results，先拉取完整详情
     if (!task.results || task.results.length === 0) {
-      await fetchDetail(task.task_id)
+      await fetchDetail(task.task_id, true)
       const currentSelected = useHistoryStore.getState().selectedTask
       if (currentSelected && currentSelected.results) {
         taskToLoad = currentSelected

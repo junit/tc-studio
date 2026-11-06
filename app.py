@@ -8,15 +8,16 @@ import json
 import os
 import queue
 import re
+import threading
 import zipfile
 from typing import Any
 
 import openpyxl
-from fastapi import Depends, FastAPI, File, HTTPException, Query, UploadFile
+from fastapi import Depends, FastAPI, File, Header, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from starlette.concurrency import run_in_threadpool
 
 from apis.agent import router as agent_router
@@ -24,6 +25,7 @@ from core.auth import (
     AuthenticationMiddleware,
     CurrentUser,
     current_user,
+    reload_auth_settings,
     require_admin,
     require_operator,
 )
@@ -45,11 +47,15 @@ from core.registry import registry
 from core.agent.risk import is_high_risk_api, matching_confirmation_paths
 from core.task_runner import (
     clear_history,
+    count_task_results,
     delete_history_item,
+    iter_task_results,
     load_history,
     save_history_item,
+    task_results_path,
     task_runner,
 )
+from core.sync_task_manager import sync_task_manager
 from core.tree_syncer import fetch_official_hydration_tree, sync_catalog_from_live_tree
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -74,6 +80,20 @@ app.add_middleware(
 )
 
 app.include_router(agent_router)
+
+# Both catalog operations rewrite files consumed by the shared registry. Keep
+# their file-write/reload critical section serialized even though they have
+# separate task types and can be submitted by different operators.
+_catalog_sync_lock = threading.Lock()
+
+
+def _safe_csv_cell(value: Any) -> Any:
+    """Prevent spreadsheet formula evaluation for user-controlled values."""
+    if isinstance(value, str):
+        stripped = value.lstrip()
+        if stripped and stripped[0] in {"=", "+", "-", "@", "\t", "\r"}:
+            return "'" + value
+    return value
 
 
 def require_batch_task(task_id: str, user: CurrentUser = Depends(current_user)):
@@ -475,25 +495,112 @@ def cancel_batch_docs_sync():
     return {"status": "success", "data": res}
 
 
-@app.post("/api/docs/tree/sync", dependencies=[Depends(require_operator)])
-def sync_official_tree():
-    try:
-        res = sync_catalog_from_live_tree()
-        return {"status": "success", "data": res}
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"同步官方目录树失败: {exc!s}") from exc
+def _sync_task_response(result: dict[str, Any]) -> dict[str, Any]:
+    """Keep the existing top-level success envelope while exposing a task handle."""
+    return {
+        "status": "success",
+        "task_id": result.get("task_id"),
+        "data": result,
+    }
 
 
-@app.post("/api/live/catalog/sync", dependencies=[Depends(require_operator)])
-def sync_official_live_catalog():
-    """动态同步腾讯云官方直播 (CSS) 260+ 全量 API"""
-    try:
+def _sync_request_user(user: CurrentUser) -> CurrentUser:
+    """Keep direct Python callers usable while HTTP requests are dependency-gated."""
+    if isinstance(user, CurrentUser):
+        return user
+    return CurrentUser("local", frozenset({"operator"}))
+
+
+def _run_live_catalog_sync() -> dict[str, Any]:
+    """Run the blocking live catalog operation in the worker thread."""
+    with _catalog_sync_lock:
         from scripts.sync_live_catalog import sync_all_live_apis
+
         catalog = sync_all_live_apis()
         registry.reload()
-        return {"status": "success", "count": len(catalog)}
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"同步云直播官方接口失败: {exc!s}") from exc
+        return {"count": len(catalog)}
+
+
+def _run_docs_tree_sync() -> dict[str, Any]:
+    """Run IM tree file writes and registry reload as one critical section."""
+    with _catalog_sync_lock:
+        return sync_catalog_from_live_tree()
+
+
+@app.post("/api/docs/tree/sync", status_code=202, dependencies=[Depends(require_operator)])
+def sync_official_tree(
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+    user: CurrentUser = Depends(current_user),
+):
+    """Start an asynchronous official IM directory tree synchronization."""
+    user = _sync_request_user(user)
+    if not isinstance(idempotency_key, str):
+        idempotency_key = None
+    result = sync_task_manager.start(
+        "docs_tree",
+        _run_docs_tree_sync,
+        owner_id=user.subject,
+        is_admin=user.is_admin,
+        idempotency_key=idempotency_key,
+    )
+    return _sync_task_response(result)
+
+
+@app.get("/api/docs/tree/sync/status", dependencies=[Depends(require_operator)])
+def get_official_tree_sync_status(
+    task_id: str | None = Query(default=None),
+    user: CurrentUser = Depends(current_user),
+):
+    user = _sync_request_user(user)
+    if not isinstance(task_id, str):
+        task_id = None
+    try:
+        status = sync_task_manager.get_status(
+            "docs_tree", task_id, owner_id=user.subject, is_admin=user.is_admin
+        )
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    if task_id and status.get("task_id") is None:
+        raise HTTPException(status_code=404, detail="目录树同步任务不存在")
+    return {"status": "success", "data": status}
+
+
+@app.post("/api/live/catalog/sync", status_code=202, dependencies=[Depends(require_operator)])
+def sync_official_live_catalog(
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+    user: CurrentUser = Depends(current_user),
+):
+    """Start an asynchronous Tencent CSS full API catalog synchronization."""
+    user = _sync_request_user(user)
+    if not isinstance(idempotency_key, str):
+        idempotency_key = None
+    result = sync_task_manager.start(
+        "live_catalog",
+        _run_live_catalog_sync,
+        owner_id=user.subject,
+        is_admin=user.is_admin,
+        idempotency_key=idempotency_key,
+    )
+    return _sync_task_response(result)
+
+
+@app.get("/api/live/catalog/sync/status", dependencies=[Depends(require_operator)])
+def get_official_live_catalog_sync_status(
+    task_id: str | None = Query(default=None),
+    user: CurrentUser = Depends(current_user),
+):
+    user = _sync_request_user(user)
+    if not isinstance(task_id, str):
+        task_id = None
+    try:
+        status = sync_task_manager.get_status(
+            "live_catalog", task_id, owner_id=user.subject, is_admin=user.is_admin
+        )
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    if task_id and status.get("task_id") is None:
+        raise HTTPException(status_code=404, detail="云直播目录同步任务不存在")
+    return {"status": "success", "data": status}
 
 
 @app.get("/api/docs/tree/raw")
@@ -591,22 +698,32 @@ def sync_common_specs(service: str = Query("live")):
 
 
 MAX_BATCH_UPLOAD_BYTES = 10 * 1024 * 1024
+MAX_BATCH_INPUT_BYTES = 32 * 1024 * 1024
 MAX_SPREADSHEET_EXPANDED_BYTES = 64 * 1024 * 1024
 MAX_SPREADSHEET_ROWS = 100_000
 MAX_SPREADSHEET_COLUMNS = 200
+MAX_SPREADSHEET_ZIP_MEMBERS = 10_000
+MIN_SPREADSHEET_ZIP_RATIO_CHECK_BYTES = 512 * 1024
 
 
 def _validate_xlsx_archive(content: bytes) -> None:
     try:
         with zipfile.ZipFile(io.BytesIO(content)) as archive:
+            members = archive.infolist()
+            if len(members) > MAX_SPREADSHEET_ZIP_MEMBERS:
+                raise ValueError("Excel 压缩包成员数量超过安全上限")
             total_size = 0
-            for info in archive.infolist():
+            for info in members:
                 if info.file_size > MAX_SPREADSHEET_EXPANDED_BYTES:
                     raise ValueError("Excel 压缩成员解压后超过限制")
                 total_size += info.file_size
                 if total_size > MAX_SPREADSHEET_EXPANDED_BYTES:
                     raise ValueError("Excel 文件解压后总大小超过限制")
-                if info.compress_size and info.file_size / info.compress_size > 200:
+                if (
+                    info.compress_size
+                    and info.file_size > MIN_SPREADSHEET_ZIP_RATIO_CHECK_BYTES
+                    and info.file_size / info.compress_size > 200
+                ):
                     raise ValueError("检测到异常高压缩比，拒绝可能的压缩炸弹")
     except (OSError, zipfile.BadZipFile) as exc:
         raise ValueError("Excel 压缩包结构无效") from exc
@@ -745,11 +862,22 @@ def get_batch_guidance_api(api_id: str):
 
 class CreateBatchRequest(BaseModel):
     api_id: str
-    items: list[dict]
+    # Keep task/result persistence and CSV exports bounded even when callers
+    # bypass the spreadsheet upload endpoint and submit JSON directly.
+    items: list[dict] = Field(..., max_length=100_000)
     delay_sec: float | None = 0.05
     dry_run: bool | None = False
     confirm_high_risk: bool = False
     approved_high_risk_paths: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def bound_input_size(self):
+        total = 0
+        for item in self.items:
+            total += len(json.dumps(item, ensure_ascii=False, separators=(",", ":"), default=str).encode("utf-8"))
+            if total > MAX_BATCH_INPUT_BYTES:
+                raise ValueError("批处理请求体超过 32 MiB 安全上限")
+        return self
 
 
 @app.post("/api/batch/create", dependencies=[Depends(require_operator)])
@@ -883,45 +1011,92 @@ def stop_task(task_id: str):
 @app.get("/api/batch/{task_id}/export/csv", dependencies=[Depends(require_batch_task)])
 def export_csv(task_id: str, only_failed: bool = False):
     task = task_runner.get_task(task_id)
-    if not task or not task.results:
+    result_source = None
+    result_count = 0
+    if os.path.isfile(task_results_path(task_id)):
+        result_source = lambda: iter_task_results(task_id)
+        result_count = count_task_results(task_id)
+    elif task and task.results:
+        result_source = lambda: iter(task.results)
+        result_count = len(task.results)
+    else:
         # 尝试从 history 中查询
         history = load_history()
         match = next((h for h in history if h.get("task_id") == task_id), None)
-        if match and match.get("results"):
-            results = match["results"]
+        if not match:
+            raise HTTPException(status_code=404, detail="Task results not found")
+        path = match.get("results_path")
+        if path and os.path.isfile(path):
+            result_source = lambda: iter_task_results(task_id)
+            result_count = int(match.get("result_count") or count_task_results(task_id))
+        elif match.get("results"):
+            result_source = lambda: iter(match["results"])
+            result_count = len(match["results"])
         else:
             raise HTTPException(status_code=404, detail="Task results not found")
-    else:
-        results = task.results
 
-    if only_failed:
-        results = [r for r in results if r.get("_status") != "OK" or r.get("_err_code") != 0]
+    if result_count > 100_000:
+        raise HTTPException(status_code=413, detail="批处理导出行数超过 100000 条安全上限")
 
-    def safe_csv_cell(value: Any) -> Any:
-        """Prevent spreadsheet formula evaluation for user-controlled values."""
-        if isinstance(value, str) and value[:1] in {"=", "+", "-", "@"}:
-            return "'" + value
-        return value
+    def include_result(row: dict) -> bool:
+        return not only_failed or row.get("_status") != "OK" or row.get("_err_code") != 0
 
-    output = io.StringIO()
-    if results:
-        original_fields = list(dict.fromkeys(k for r in results for k in r))
-        field_map = [(field, safe_csv_cell(str(field))) for field in original_fields]
-        fieldnames = [safe for _, safe in field_map]
-        writer = csv.DictWriter(output, fieldnames=fieldnames, extrasaction="ignore")
-        writer.writeheader()
-        writer.writerows(
-            {
-                safe_field: safe_csv_cell(row.get(original_field, ""))
-                for original_field, safe_field in field_map
-            }
-            for row in results
-        )
-
-    output.seek(0)
     filename_suffix = "failed_items" if only_failed else "results"
+
+    def csv_stream():
+        # Keep only one encoded CSV row in memory at a time.  The task/history
+        # result list is already materialized by the batch runner, but this
+        # avoids a second full-size output copy for the HTTP response.
+        yield b"\xef\xbb\xbf"
+        if result_count == 0:
+            return
+        original_fields = []
+        seen_fields = set()
+        has_rows = False
+        for row in result_source():
+            if include_result(row):
+                has_rows = True
+                for key in row:
+                    if key not in seen_fields:
+                        seen_fields.add(key)
+                        original_fields.append(key)
+        if not has_rows:
+            return
+        field_map = [(field, _safe_csv_cell(str(field))) for field in original_fields]
+        fieldnames = [safe for _, safe in field_map]
+        class _CSVRowSink:
+            def __init__(self):
+                self.parts: list[str] = []
+
+            def write(self, value: str) -> int:
+                self.parts.append(value)
+                return len(value)
+
+            def reset(self) -> None:
+                self.parts.clear()
+
+            def to_bytes(self) -> bytes:
+                return "".join(self.parts).encode("utf-8")
+
+        output = _CSVRowSink()
+        writer = csv.DictWriter(output, fieldnames=fieldnames, extrasaction="ignore")
+
+        writer.writeheader()
+        yield output.to_bytes()
+        for row in result_source():
+            if not include_result(row):
+                continue
+            output.reset()
+            writer.writerow(
+                {
+                    safe_field: _safe_csv_cell(row.get(original_field, ""))
+                    for original_field, safe_field in field_map
+                }
+            )
+            yield output.to_bytes()
+
     return StreamingResponse(
-        iter([output.getvalue().encode("utf-8-sig")]),
+        csv_stream(),
         media_type="text/csv",
         headers={"Content-Disposition": f"attachment; filename=batch_{task_id}_{filename_suffix}.csv"}
     )
@@ -965,17 +1140,49 @@ def get_history_list(user: CurrentUser = Depends(current_user)):
         if "results" in item:
             item["result_count"] = len(item["results"])
             del item["results"]
+        elif item.get("results_path"):
+            item.setdefault("result_count", count_task_results(str(item["task_id"])))
+        # The storage path is an internal implementation detail and must not
+        # be exposed to operators through the history API.
+        item.pop("results_path", None)
         summary_list.append(item)
     return {"status": "success", "data": summary_list}
 
 
 @app.get("/api/history/{task_id}", dependencies=[Depends(require_batch_task)])
-def get_history_detail(task_id: str):
+def get_history_detail(
+    task_id: str,
+    offset: int = Query(default=0, ge=0, description="结果行起始偏移"),
+    limit: int = Query(default=1000, ge=1, le=5000, description="单页结果行数"),
+):
     history = load_history()
     match = next((h for h in history if h.get("task_id") == task_id), None)
     if not match:
         raise HTTPException(status_code=404, detail="History record not found")
-    return {"status": "success", "data": match}
+    # Keep the file backed format for now, but do not send an entire large
+    # result array in one response.  Clients can request subsequent pages with
+    # offset/limit; the default still covers ordinary task history usage.
+    data = dict(match)
+    results = match.get("results")
+    results_path = match.get("results_path")
+    if results_path and os.path.isfile(results_path):
+        total = int(match.get("result_count") or count_task_results(task_id))
+        page = list(iter_task_results(task_id, offset=offset, limit=limit))
+        data["results"] = page
+        data["result_offset"] = offset
+        data["result_limit"] = limit
+        data["result_total"] = total
+        data["result_has_more"] = offset + len(page) < total
+    elif isinstance(results, list):
+        total = len(results)
+        page = results[offset:offset + limit]
+        data["results"] = page
+        data["result_offset"] = offset
+        data["result_limit"] = limit
+        data["result_total"] = total
+        data["result_has_more"] = offset + len(page) < total
+    data.pop("results_path", None)
+    return {"status": "success", "data": data}
 
 
 @app.delete("/api/history/{task_id}", dependencies=[Depends(require_batch_task)])
@@ -994,6 +1201,17 @@ def delete_all_history():
 
 if __name__ == "__main__":
     import uvicorn
+
+    # ``AuthSettings`` is initialized when this module is imported, before
+    # uvicorn starts the server.  A direct local ``python3 app.py`` launch
+    # therefore needs an explicit development opt-in before reloading the
+    # settings.  ``setdefault`` preserves operator supplied production
+    # values, while the uvicorn/import and container paths remain fail-closed
+    # when they do not provide deployment configuration.
+    os.environ.setdefault("APP_ENV", "development")
+    os.environ.setdefault("AUTH_ENABLED", "false")
+    reload_auth_settings()
+
     print("\n" + "=" * 60)
     print("🚀 TC Studio (Nova) - 腾讯云多业务云架构控制台启动中...")
     print("👉 请在浏览器打开: http://127.0.0.1:8000")

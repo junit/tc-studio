@@ -8,9 +8,12 @@ import shutil
 import threading
 import time
 import uuid
+import weakref
+from collections import deque
 from contextlib import suppress
 from datetime import UTC, datetime
 from typing import Any
+from urllib.parse import unquote
 
 from core.runtime_context import runtime_user_id
 
@@ -25,6 +28,60 @@ from .models import (
     SkillItem,
     now_iso,
 )
+
+MAX_HISTORY_MESSAGE_BYTES = 2 * 1024 * 1024
+MAX_HISTORY_METADATA_BYTES = 2 * 1024 * 1024
+MAX_HISTORY_TOTAL_BYTES = 32 * 1024 * 1024
+MAX_RUNTIME_FILES = 1000
+MAX_RUNTIME_TOTAL_FILE_BYTES = 512 * 1024 * 1024
+
+
+def _truncate_history_text(value: Any, limit: int = MAX_HISTORY_MESSAGE_BYTES) -> str:
+    text = str(value or "")
+    encoded = text.encode("utf-8")
+    if len(encoded) <= limit:
+        return text
+    suffix = "\n[内容超过单条历史消息限制，已截断]"
+    return encoded[: max(0, limit - len(suffix.encode("utf-8")))].decode("utf-8", "ignore") + suffix
+
+
+def _bound_history_metadata(metadata: dict | None) -> dict[str, Any]:
+    candidate = metadata if isinstance(metadata, dict) else {}
+    try:
+        encoded = json.dumps(candidate, ensure_ascii=False, default=str).encode("utf-8")
+    except (TypeError, ValueError):
+        return {"_truncated": True, "_reason": "metadata_not_serializable"}
+    if len(encoded) <= MAX_HISTORY_METADATA_BYTES:
+        return candidate
+    return {
+        "_truncated": True,
+        "_reason": "metadata_size_limit",
+        "_original_size_bytes": len(encoded),
+    }
+
+
+def _estimate_history_entry_bytes(message: dict[str, Any]) -> int:
+    """Estimate persisted size without materializing the complete history."""
+    content_size = len(str(message.get("content") or "").encode("utf-8"))
+    try:
+        metadata_size = len(
+            json.dumps(
+                message.get("metadata") or {},
+                ensure_ascii=False,
+                default=str,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
+    except (TypeError, ValueError):
+        metadata_size = MAX_HISTORY_METADATA_BYTES
+    return content_size + metadata_size + 256
+
+
+def _trim_history_to_budget(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    total = sum(_estimate_history_entry_bytes(item) for item in history)
+    while len(history) > 1 and total > MAX_HISTORY_TOTAL_BYTES:
+        total -= _estimate_history_entry_bytes(history.pop(0))
+    return history
 
 
 def _atomic_dump_json(filepath: str, data: Any, indent: int = 2, default: Any | None = None) -> None:
@@ -57,6 +114,9 @@ class BotManager:
         self.bots_dir = os.path.join(self.data_dir, "bots")
         self.llm_config_path = os.path.join(self.data_dir, "llm_config.json")
         self._lock = threading.RLock()
+        # Locks are per runtime path; weak values avoid retaining one lock for
+        # every short-lived authenticated session forever.
+        self._history_locks: weakref.WeakValueDictionary[str, threading.RLock] = weakref.WeakValueDictionary()
         os.makedirs(self.bots_dir, exist_ok=True)  # pi-lens-ignore: unchecked-throwing-call-python -- persistence boundary
         self._ensure_default_bot()
 
@@ -138,6 +198,273 @@ class BotManager:
     def _history_path(self, bot_id: str, user_id: str | None = None) -> str:
         return os.path.join(self._runtime_dir(bot_id, user_id), "history.json")
 
+    def _history_jsonl_path(self, bot_id: str, user_id: str | None = None) -> str:
+        """Append-only session history path used by new writes."""
+        return os.path.join(self._runtime_dir(bot_id, user_id), "history.jsonl")
+
+    def _history_index_path(self, bot_id: str, user_id: str | None = None) -> str:
+        return f"{self._history_jsonl_path(bot_id, user_id)}.idx"
+
+    def _history_session_lock(self, bot_id: str, user_id: str | None = None) -> threading.RLock:
+        """Return a stable lock for one bot/user history stream."""
+        key = os.path.abspath(self._runtime_dir(bot_id, user_id))
+        with self._lock:
+            lock = self._history_locks.get(key)
+            if lock is None:
+                lock = threading.RLock()
+                self._history_locks[key] = lock
+            return lock
+
+    def _rebuild_history_index_unlocked(self, jsonl_path: str, index_path: str | None = None) -> None:
+        index_path = index_path or f"{jsonl_path}.idx"
+        tmp_path = f"{index_path}.{os.getpid()}.{threading.get_ident()}.tmp"
+        try:
+            with open(jsonl_path, "rb") as source, open(tmp_path, "w", encoding="utf-8") as index:
+                while True:
+                    offset = source.tell()
+                    raw = source.readline()
+                    if not raw:
+                        break
+                    try:
+                        item = json.loads(raw.decode("utf-8"))
+                    except (UnicodeDecodeError, TypeError, ValueError):
+                        continue
+                    if not isinstance(item, dict):
+                        continue
+                    index.write(json.dumps({"id": item.get("id", ""), "offset": offset, "end": source.tell()}, ensure_ascii=False))
+                    index.write("\n")
+                index.flush()
+                os.fsync(index.fileno())
+            os.chmod(tmp_path, 0o600)
+            os.replace(tmp_path, index_path)
+        except Exception:
+            with suppress(OSError):
+                os.remove(tmp_path)
+            raise
+
+    def _load_history_index_unlocked(
+        self, jsonl_path: str, index_path: str | None = None, *, rebuild_on_error: bool = True
+    ) -> list[dict[str, Any]]:
+        index_path = index_path or f"{jsonl_path}.idx"
+        try:
+            file_size = os.path.getsize(jsonl_path)
+            entries: list[dict[str, Any]] = []
+            with open(index_path, "r", encoding="utf-8") as index:
+                for line in index:
+                    item = json.loads(line)
+                    if isinstance(item, dict) and isinstance(item.get("offset"), int) and isinstance(item.get("end"), int):
+                        entries.append(item)
+            previous_end = 0
+            for item in entries:
+                offset = item["offset"]
+                end = item["end"]
+                if offset < previous_end or end <= offset or end > file_size:
+                    raise ValueError("history index is invalid")
+                previous_end = end
+            last_end = entries[-1].get("end", 0) if entries else 0
+            incomplete_tail = False
+            if last_end != file_size:
+                # A process can die after appending a partial final JSON row
+                # but before the index fsync.  Keep the valid prefix readable;
+                # a complete malformed line is still treated as corruption.
+                with open(jsonl_path, "rb") as source:
+                    source.seek(last_end)
+                    trailing = source.read()
+                incomplete_tail = bool(trailing) and b"\n" not in trailing
+                if not incomplete_tail:
+                    # A malformed final line (or a newline-only torn write)
+                    # can be discarded safely because it is not represented
+                    # by the index.  A valid JSON object after the indexed
+                    # prefix means the index is genuinely stale and must be
+                    # rebuilt instead.
+                    trailing_has_valid_row = False
+                    for raw in trailing.splitlines():
+                        if not raw.strip():
+                            continue
+                        try:
+                            candidate = json.loads(raw.decode("utf-8"))
+                        except (UnicodeDecodeError, TypeError, ValueError):
+                            continue
+                        if isinstance(candidate, dict):
+                            trailing_has_valid_row = True
+                            break
+                    if trailing_has_valid_row:
+                        raise ValueError("history index is stale")
+                    incomplete_tail = True
+                # Remove only the unindexed partial tail so the next append
+                # starts at a valid line boundary.
+                with open(jsonl_path, "r+b") as source:
+                    source.truncate(last_end)
+                    source.flush()
+                    os.fsync(source.fileno())
+                file_size = last_end
+            if not entries and file_size and not incomplete_tail:
+                raise ValueError("history index is empty")
+            return entries
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            if not rebuild_on_error:
+                raise
+            self._rebuild_history_index_unlocked(jsonl_path, index_path)
+            return self._load_history_index_unlocked(jsonl_path, index_path, rebuild_on_error=False)
+
+    def _read_history_page_from_index_unlocked(
+        self, jsonl_path: str, entries: list[dict[str, Any]], start: int, limit: int
+    ) -> list[dict[str, Any]]:
+        if not entries or start >= len(entries):
+            return []
+        page: list[dict[str, Any]] = []
+        with open(jsonl_path, "rb") as stream:
+            for index in range(start, min(len(entries), start + limit)):
+                expected = entries[index]
+                stream.seek(max(0, int(expected.get("offset", 0))))
+                raw = stream.readline()
+                if not raw:
+                    raise ValueError("history JSONL is shorter than its index")
+                if stream.tell() != expected.get("end"):
+                    raise ValueError("history index end mismatch")
+                try:
+                    item = json.loads(raw.decode("utf-8"))
+                except (UnicodeDecodeError, TypeError, ValueError) as exc:
+                    raise ValueError("history JSONL contains an invalid row") from exc
+                if not isinstance(item, dict) or item.get("id", "") != expected.get("id", ""):
+                    raise ValueError("history index row mismatch")
+                page.append(item)
+        return page
+
+    def _migrate_history_to_jsonl_unlocked(self, bot_id: str, user_id: str | None = None) -> str:
+        """Create the append-only history beside a legacy JSON snapshot.
+
+        The migration is deliberately additive: the old JSON file remains as a
+        rollback/compatibility snapshot, while all subsequent appends go to
+        JSONL.  It runs under ``self._lock`` and only once per runtime path.
+        """
+        jsonl_path = self._history_jsonl_path(bot_id, user_id)
+        if os.path.exists(jsonl_path):
+            return jsonl_path
+        legacy_path = self._history_path(bot_id, user_id)
+        if not os.path.isfile(legacy_path):
+            return jsonl_path
+        try:
+            with open(legacy_path, "r", encoding="utf-8") as stream:
+                history = json.load(stream)
+            if not isinstance(history, list):
+                return jsonl_path
+            parent = os.path.dirname(jsonl_path)
+            os.makedirs(parent, mode=0o700, exist_ok=True)
+            tmp_path = f"{jsonl_path}.{os.getpid()}.{threading.get_ident()}.tmp"
+            with open(tmp_path, "w", encoding="utf-8") as output:
+                for item in history:
+                    if isinstance(item, dict):
+                        output.write(json.dumps(item, ensure_ascii=False, default=str, separators=(",", ":")))
+                        output.write("\n")
+                output.flush()
+                os.fsync(output.fileno())
+            os.chmod(tmp_path, 0o600)
+            os.replace(tmp_path, jsonl_path)
+            self._rebuild_history_index_unlocked(jsonl_path)
+        except (OSError, TypeError, ValueError):
+            with suppress(OSError):
+                os.remove(locals().get("tmp_path", ""))
+        return jsonl_path
+
+    def _compact_history_jsonl_unlocked(self, jsonl_path: str) -> None:
+        """Compact an oversized JSONL file while retaining recent messages."""
+        try:
+            recent: deque[dict[str, Any]] = deque(maxlen=5000)
+            total_bytes = 0
+            with open(jsonl_path, "r", encoding="utf-8") as stream:
+                for line in stream:
+                    try:
+                        item = json.loads(line)
+                    except (TypeError, ValueError):
+                        continue
+                    if isinstance(item, dict):
+                        recent.append(item)
+            # Calculate from newest to oldest so the retained tail fits the
+            # same byte budget as the legacy JSON implementation.
+            retained: list[dict[str, Any]] = []
+            total_bytes = 0
+            for item in reversed(recent):
+                size = _estimate_history_entry_bytes(item)
+                if retained and total_bytes + size > MAX_HISTORY_TOTAL_BYTES:
+                    break
+                retained.append(item)
+                total_bytes += size
+            retained.reverse()
+            tmp_path = f"{jsonl_path}.{os.getpid()}.{threading.get_ident()}.compact.tmp"
+            with open(tmp_path, "w", encoding="utf-8") as output:
+                for item in retained:
+                    output.write(json.dumps(item, ensure_ascii=False, default=str, separators=(",", ":")))
+                    output.write("\n")
+                output.flush()
+                os.fsync(output.fileno())
+            os.chmod(tmp_path, 0o600)
+            os.replace(tmp_path, jsonl_path)
+            self._rebuild_history_index_unlocked(jsonl_path)
+        except (OSError, TypeError, ValueError):
+            with suppress(OSError):
+                os.remove(locals().get("tmp_path", ""))
+
+    def _replace_history_jsonl_unlocked(self, jsonl_path: str, history: list[dict[str, Any]]) -> None:
+        tmp_path = f"{jsonl_path}.{os.getpid()}.{threading.get_ident()}.replace.tmp"
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as output:
+                for item in history:
+                    output.write(json.dumps(item, ensure_ascii=False, default=str, separators=(",", ":")))
+                    output.write("\n")
+                output.flush()
+                os.fsync(output.fileno())
+            os.chmod(tmp_path, 0o600)
+            os.replace(tmp_path, jsonl_path)
+            self._rebuild_history_index_unlocked(jsonl_path)
+        except Exception:
+            with suppress(OSError):
+                os.remove(tmp_path)
+            raise
+
+    def _read_history_jsonl_unlocked(
+        self,
+        jsonl_path: str,
+        limit: int,
+        before_id: str | None = None,
+    ) -> dict[str, Any]:
+        try:
+            entries = self._load_history_index_unlocked(jsonl_path)
+        except (OSError, ValueError, TypeError):
+            return {"history": [], "total": 0, "has_more": False}
+        total = len(entries)
+        if not total:
+            return {"history": [], "total": 0, "has_more": False}
+
+        page_limit = max(1, int(limit))
+        if before_id is None:
+            target = total
+        else:
+            target = next((idx for idx, item in enumerate(entries) if item.get("id") == before_id), -1)
+            if target < 0:
+                return {"history": [], "total": total, "has_more": False}
+        start = max(0, target - page_limit)
+        try:
+            page = self._read_history_page_from_index_unlocked(jsonl_path, entries, start, target - start)
+        except (OSError, ValueError, TypeError):
+            # A crash or manual edit can leave a same-sized but stale index.
+            # Rebuild once and retry the requested page from the repaired map.
+            try:
+                self._rebuild_history_index_unlocked(jsonl_path)
+                entries = self._load_history_index_unlocked(jsonl_path)
+                total = len(entries)
+                if before_id is None:
+                    target = total
+                else:
+                    target = next((idx for idx, item in enumerate(entries) if item.get("id") == before_id), -1)
+                    if target < 0:
+                        return {"history": [], "total": total, "has_more": False}
+                start = max(0, target - page_limit)
+                page = self._read_history_page_from_index_unlocked(jsonl_path, entries, start, target - start)
+            except (OSError, ValueError, TypeError):
+                return {"history": [], "total": 0, "has_more": False}
+        return {"history": page, "total": total, "has_more": start > 0}
+
     def _uploads_dir(self, bot_id: str, user_id: str | None = None) -> str:
         return os.path.join(self._runtime_dir(bot_id, user_id), "uploads")
 
@@ -188,7 +515,15 @@ class BotManager:
                     with open(legacy_history, "r", encoding="utf-8") as f:
                         history = json.load(f)
                     if isinstance(history, list):
-                        _atomic_dump_json(target_history, history, default=str)
+                        bounded_history = []
+                        for item in history[-5000:]:
+                            if not isinstance(item, dict):
+                                continue
+                            bounded = dict(item)
+                            bounded["content"] = _truncate_history_text(bounded.get("content"))
+                            bounded["metadata"] = _bound_history_metadata(bounded.get("metadata"))
+                            bounded_history.append(bounded)
+                        _atomic_dump_json(target_history, _trim_history_to_budget(bounded_history), default=str)
                 except (OSError, ValueError, TypeError):
                     # A corrupt legacy file must not make an authenticated BOT
                     # unusable; the normal empty-history path will recover.
@@ -209,6 +544,8 @@ class BotManager:
             if os.path.isdir(legacy_uploads):
                 try:
                     os.makedirs(target_uploads, exist_ok=True)
+                    copied_count = 0
+                    copied_bytes = 0
                     for filename in os.listdir(legacy_uploads):
                         source = os.path.join(legacy_uploads, filename)
                         target = os.path.join(target_uploads, filename)
@@ -219,7 +556,15 @@ class BotManager:
                         if os.path.exists(target):
                             continue
                         try:
+                            source_size = os.path.getsize(source)
+                        except OSError:
+                            continue
+                        if copied_count >= MAX_RUNTIME_FILES or copied_bytes + source_size > MAX_RUNTIME_TOTAL_FILE_BYTES:
+                            break
+                        try:
                             shutil.copy2(source, target)
+                            copied_count += 1
+                            copied_bytes += source_size
                         except OSError:
                             continue
                 except OSError:
@@ -332,21 +677,15 @@ class BotManager:
                         data["files_count"] = files_count
 
                         # 读取最近一条聊天记录 (微信/WhatsApp 风格会话列表摘要)
-                        hist_path = self._history_path(entry, user_id)
                         last_message = None
-                        if os.path.exists(hist_path):
-                            try:
-                                with open(hist_path, "r", encoding="utf-8") as hf:
-                                    hist = json.load(hf)
-                                    if hist and isinstance(hist, list):
-                                        last_item = hist[-1]
-                                        last_message = {
-                                            "role": last_item.get("role", "assistant"),
-                                            "content": last_item.get("content", ""),
-                                            "timestamp": last_item.get("timestamp", "")
-                                        }
-                            except Exception:
-                                pass
+                        hist = self.get_history(entry, limit=1, user_id=user_id)
+                        if hist:
+                            last_item = hist[-1]
+                            last_message = {
+                                "role": last_item.get("role", "assistant"),
+                                "content": last_item.get("content", ""),
+                                "timestamp": last_item.get("timestamp", "")
+                            }
                         data["last_message"] = last_message
                         result.append(data)
                 except Exception:
@@ -926,10 +1265,19 @@ class BotManager:
         """分页获取会话历史，返回 history, total 以及 has_more 状态供前端无限滚动"""
         with self._lock:
             self.ensure_legacy_state(bot_id, user_id)
+            jsonl_path = self._migrate_history_to_jsonl_unlocked(bot_id, user_id)
+        with self._history_session_lock(bot_id, user_id):
+            if os.path.exists(jsonl_path):
+                return self._read_history_jsonl_unlocked(jsonl_path, limit, before_id)
+        with self._lock:
             hist_path = self._history_path(bot_id, user_id)
             if not os.path.exists(hist_path):
                 return {"history": [], "total": 0, "has_more": False}
             try:
+                if os.path.getsize(hist_path) > MAX_HISTORY_TOTAL_BYTES:
+                    # Do not json.load an unbounded legacy/corrupt file.  The
+                    # operator can archive or repair it offline before retrying.
+                    return {"history": [], "total": 0, "has_more": False, "truncated": True}
                 with open(hist_path, "r", encoding="utf-8") as f:
                     history = json.load(f)
             except Exception:
@@ -957,32 +1305,50 @@ class BotManager:
     def append_history(self, bot_id: str, role: str, content: str, metadata: dict | None = None, user_id: str | None = None):
         with self._lock:
             self.ensure_legacy_state(bot_id, user_id)
-            hist_path = self._history_path(bot_id, user_id)
-            history = []
-            if os.path.exists(hist_path):
-                try:
-                    with open(hist_path, "r", encoding="utf-8") as f:
-                        history = json.load(f)
-                except Exception:
-                    history = []
+            jsonl_path = self._migrate_history_to_jsonl_unlocked(bot_id, user_id)
             msg = {
                 "id": f"msg-{int(time.time() * 1000)}-{uuid.uuid4().hex[:6]}",
                 "role": role,
-                "content": content,
-                "metadata": metadata or {},
+                "content": _truncate_history_text(content),
+                "metadata": _bound_history_metadata(metadata),
                 "timestamp": now_iso()
             }
-            history.append(msg)
-            # 长周期进化智能体：最多保留 5000 条消息（避免过早丢弃历史知识）
-            if len(history) > 5000:
-                history = history[-5000:]
-            _atomic_dump_json(hist_path, history, default=str)
+        with self._history_session_lock(bot_id, user_id):
+            parent = os.path.dirname(jsonl_path)
+            os.makedirs(parent, mode=0o700, exist_ok=True)
+            if not os.path.exists(jsonl_path):
+                with open(jsonl_path, "ab"):
+                    pass
+                os.chmod(jsonl_path, 0o600)
+            self._load_history_index_unlocked(jsonl_path)
+            encoded = (json.dumps(msg, ensure_ascii=False, default=str, separators=(",", ":")) + "\n").encode("utf-8")
+            with open(jsonl_path, "ab") as stream:
+                offset = stream.tell()
+                stream.write(encoded)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.chmod(jsonl_path, 0o600)
+            index_path = self._history_index_path(bot_id, user_id)
+            with open(index_path, "a", encoding="utf-8") as index:
+                index.write(json.dumps({"id": msg["id"], "offset": offset, "end": offset + len(encoded)}, ensure_ascii=False))
+                index.write("\n")
+                index.flush()
+                os.fsync(index.fileno())
+            os.chmod(index_path, 0o600)
+            if os.path.getsize(jsonl_path) > MAX_HISTORY_TOTAL_BYTES:
+                self._compact_history_jsonl_unlocked(jsonl_path)
 
     def clear_history(self, bot_id: str, delete_files: bool = True, user_id: str | None = None):
         with self._lock:
             self.ensure_legacy_state(bot_id, user_id)
             hist_path = self._history_path(bot_id, user_id)
+            jsonl_path = self._history_jsonl_path(bot_id, user_id)
             _atomic_dump_json(hist_path, [])
+        with self._history_session_lock(bot_id, user_id):
+            with suppress(OSError):
+                os.remove(jsonl_path)
+            with suppress(OSError):
+                os.remove(self._history_index_path(bot_id, user_id))
             try:
                 from .engine import agent_engine
                 agent_engine.clear_sandbox(bot_id, user_id)
@@ -1004,41 +1370,83 @@ class BotManager:
                         except Exception:
                             pass
 
+    @staticmethod
+    def _collect_referenced_filenames(history: list[dict[str, Any]]) -> set[str]:
+        """Collect file names referenced by attachments and rendered download links."""
+        referenced_filenames: set[str] = set()
+        markdown_file_pattern = re.compile(
+            r"/api/agent/(?:bots/[^/\s?#]+/)?files/([^/?#)\s]+)"
+        )
+
+        def add_markdown_file_references(value: Any) -> None:
+            if not isinstance(value, str):
+                return
+            for match in markdown_file_pattern.finditer(value):
+                try:
+                    decoded_name = unquote(match.group(1))
+                except Exception:
+                    continue
+                safe_name = os.path.basename(decoded_name)
+                if safe_name and safe_name not in {".", ".."}:
+                    referenced_filenames.add(safe_name)
+
+        for msg in history:
+            if not isinstance(msg, dict):
+                continue
+            add_markdown_file_references(msg.get("content", ""))
+            meta = msg.get("metadata", {}) or {}
+            if not isinstance(meta, dict):
+                continue
+            for att in meta.get("attachments", []) or []:
+                if not isinstance(att, dict):
+                    continue
+                saved_name = att.get("saved_name")
+                if saved_name:
+                    referenced_filenames.add(os.path.basename(str(saved_name)))
+                path = att.get("path", "")
+                if path:
+                    referenced_filenames.add(os.path.basename(str(path)))
+                name = att.get("name")
+                if name:
+                    referenced_filenames.add(os.path.basename(str(name)))
+                add_markdown_file_references(att.get("url"))
+                add_markdown_file_references(att.get("download_url"))
+        return referenced_filenames
+
     def cleanup_unreferenced_files(self, bot_id: str, user_id: str | None = None) -> int:
-        """清理 uploads 目录下未在当前 history 中引用的孤儿文件"""
+        """清理 uploads 目录下未在当前 history 中引用的孤儿文件。
+
+        Markdown answers commonly contain generated-file download links while
+        the corresponding attachment metadata is only present on an earlier
+        execution step.  Keep those links alive, and give newly-created files
+        a 24-hour grace period so cleanup cannot race an in-flight response or
+        a client that has not persisted its history yet.
+        """
         with self._lock:
             self.ensure_legacy_state(bot_id, user_id)
             uploads_dir = self._uploads_dir(bot_id, user_id)
             if not os.path.exists(uploads_dir):
                 return 0
 
-            referenced_filenames = set()
-            hist_path = self._history_path(bot_id, user_id)
-            if os.path.exists(hist_path):
-                try:
-                    with open(hist_path, "r", encoding="utf-8") as f:
-                        history = json.load(f)
-                        for msg in history:
-                            meta = msg.get("metadata", {})
-                            for att in meta.get("attachments", []):
-                                saved_name = att.get("saved_name")
-                                if saved_name:
-                                    referenced_filenames.add(saved_name)
-                                path = att.get("path", "")
-                                if path:
-                                    referenced_filenames.add(os.path.basename(path))
-                                name = att.get("name")
-                                if name:
-                                    referenced_filenames.add(name)
-                except Exception:
-                    pass
+            referenced_filenames: set[str] = set()
+            try:
+                history = self.get_history(bot_id, limit=5000, user_id=user_id)
+                referenced_filenames = self._collect_referenced_filenames(history)
+            except Exception:
+                pass
 
             deleted_count = 0
+            recent_cutoff = time.time() - 24 * 60 * 60
             for fn in os.listdir(uploads_dir):  # pi-lens-ignore: unchecked-throwing-call-python -- persistence boundary
                 is_ref = fn in referenced_filenames or any(fn.endswith(f"_{ref}") for ref in referenced_filenames)
                 if not is_ref:
                     file_full_path = os.path.join(uploads_dir, fn)
                     try:
+                        # New files get a grace period.  This also covers
+                        # generated files whose history entry is appended
+                        # only after the streaming response completes.
+                        if os.path.isfile(file_full_path) and os.path.getmtime(file_full_path) >= recent_cutoff:
+                            continue
                         if os.path.isfile(file_full_path):
                             os.remove(file_full_path)
                             deleted_count += 1
@@ -1078,15 +1486,16 @@ class BotManager:
         """移除最后一条助手消息（用于触发重新生成）"""
         with self._lock:
             self.ensure_legacy_state(bot_id, user_id)
-            hist_path = self._history_path(bot_id, user_id)
-            if not os.path.exists(hist_path):
+            jsonl_path = self._migrate_history_to_jsonl_unlocked(bot_id, user_id)
+        with self._history_session_lock(bot_id, user_id):
+            if not os.path.exists(jsonl_path):
                 return None
             try:
-                with open(hist_path, "r", encoding="utf-8") as f:
-                    history = json.load(f)
+                entries = self._load_history_index_unlocked(jsonl_path)
+                history = self._read_history_page_from_index_unlocked(jsonl_path, entries, 0, len(entries))
                 if history and history[-1].get("role") == "assistant":
                     popped = history.pop()
-                    _atomic_dump_json(hist_path, history)
+                    self._replace_history_jsonl_unlocked(jsonl_path, history)
                     return popped
             except Exception:
                 pass
@@ -1096,16 +1505,17 @@ class BotManager:
         """截断历史记录至指定消息 ID（保留该消息及之前的内容，丢弃后续内容）"""
         with self._lock:
             self.ensure_legacy_state(bot_id, user_id)
-            hist_path = self._history_path(bot_id, user_id)
-            if not os.path.exists(hist_path):
+            jsonl_path = self._migrate_history_to_jsonl_unlocked(bot_id, user_id)
+        with self._history_session_lock(bot_id, user_id):
+            if not os.path.exists(jsonl_path):
                 return False
             try:
-                with open(hist_path, "r", encoding="utf-8") as f:
-                    history = json.load(f)
+                entries = self._load_history_index_unlocked(jsonl_path)
+                history = self._read_history_page_from_index_unlocked(jsonl_path, entries, 0, len(entries))
                 idx = next((i for i, m in enumerate(history) if m.get("id") == keep_up_to_message_id), -1)
                 if idx >= 0:
                     truncated = history[: idx + 1]
-                    _atomic_dump_json(hist_path, truncated)
+                    self._replace_history_jsonl_unlocked(jsonl_path, truncated)
                     return True
             except Exception:
                 pass
@@ -1122,23 +1532,13 @@ class BotManager:
             uploads_dir = os.path.join(bot_dir, "uploads")
             os.makedirs(uploads_dir, exist_ok=True)  # pi-lens-ignore: unchecked-throwing-call-python -- persistence boundary
 
-            # 获取所有在 history 中被引用的文件名
-            referenced_filenames = set()
-            hist_path = self._history_path(bot_id, user_id)
-            if os.path.exists(hist_path):
-                try:
-                    with open(hist_path, "r", encoding="utf-8") as f:
-                        history = json.load(f)
-                        for msg in history:
-                            for att in msg.get("metadata", {}).get("attachments", []):
-                                fn = att.get("saved_name") or os.path.basename(att.get("path", ""))
-                                if fn:
-                                    referenced_filenames.add(fn)
-                                name = att.get("name")
-                                if name:
-                                    referenced_filenames.add(name)
-                except Exception:
-                    pass
+            # 获取所有在 history 中被引用的文件名，包括正文下载链接
+            referenced_filenames: set[str] = set()
+            try:
+                history = self.get_history(bot_id, limit=5000, user_id=user_id)
+                referenced_filenames = self._collect_referenced_filenames(history)
+            except Exception:
+                pass
 
             file_list = []
             for fn in os.listdir(uploads_dir):  # pi-lens-ignore: unchecked-throwing-call-python -- persistence boundary

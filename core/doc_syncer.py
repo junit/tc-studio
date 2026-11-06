@@ -732,8 +732,11 @@ class DocSyncManager:
             finally:
                 for future in futures:
                     future.cancel()
-                # Do not block the cancellation response on in-flight network work.
-                executor.shutdown(wait=False, cancel_futures=True)
+                # ``cancel_futures`` cannot stop an already running HTTP
+                # request.  Wait for those requests before publishing the
+                # terminal status so a cancelled batch cannot overlap a new
+                # batch or continue writing after it claims to be finished.
+                executor.shutdown(wait=True, cancel_futures=True)
 
             with self._lock:
                 self._is_running = False

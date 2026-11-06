@@ -271,7 +271,8 @@ cp config.example.json config.json
 ### 3. 启动服务
 
 ```bash
-python3 app.py
+# 本地开发（直接运行 app.py 时也会使用这两个安全的本地默认值）
+APP_ENV=development AUTH_ENABLED=false python3 app.py
 ```
 
 服务启动后，在浏览器中打开：
@@ -336,12 +337,17 @@ pytest
 
 ## 🔐 可插拔企业级认证（本地开发 / OIDC / Keycloak / Authentik）
 
-系统提供**开箱即用与生产严格防御（Fail-Closed）兼备**的可插拔鉴权机制。在本地开发模式（`APP_ENV=development/dev/local`）下认证默认关闭并自动使用本地管理员身份；在任何非本地或生产部署中，系统默认阻断匿名访问，必须启用标准 OIDC 认证。
+系统提供可插拔鉴权机制，并对缺失配置 fail-closed。必须显式设置 `APP_ENV` 与 `AUTH_ENABLED`；本地开发可设置 `APP_ENV=development`、`AUTH_ENABLED=false`，生产环境必须设置 `APP_ENV=production`、`AUTH_ENABLED=true` 以及完整 OIDC 配置。任何未配置环境变量或非本地环境关闭认证的请求都会被拒绝。
 
 ### 1. 环境变量配置指南
 
 ```bash
+# 本地开发（必须显式声明，不会再从缺失变量推断本地管理员模式）
+export APP_ENV=development
+export AUTH_ENABLED=false
+
 # 启用 OIDC 认证
+export APP_ENV=production
 export AUTH_ENABLED=true
 export AUTH_PROVIDER=oidc
 export OIDC_ISSUER_URL=https://sso.example.com/realms/ops
@@ -355,7 +361,27 @@ export OIDC_JWKS_URL=https://sso.example.com/realms/ops/protocol/openid-connect/
 python3 app.py
 ```
 
-### 2. RBAC 角色与权限矩阵
+### 2. CodeAgent 执行边界（Linux 生产必须使用 nsjail）
+
+主 CodeAgent 的代码执行通过独立的非 daemon worker、父子 JSON RPC、父端硬超时和进程组回收实现。单线程 POSIX 开发进程可使用 `fork`；FastAPI/AgentRun 多线程场景会自动切换为 spawn + RPC，Windows 始终使用 spawn + RPC。
+
+Linux 生产、预发布环境必须使用 `nsjail`，并由部署提供最小 rootfs 与 seccomp-bpf（Kafel）策略文件：
+
+```bash
+export APP_ENV=production
+export TIM_CODE_EXECUTOR_MODE=nsjail
+export TIM_NSJAIL_BIN=/usr/local/bin/nsjail
+export TIM_NSJAIL_ROOT=/opt/tim/nsjail-rootfs
+export TIM_NSJAIL_PYTHON=/usr/bin/python3
+export TIM_NSJAIL_SECCOMP_POLICY=/opt/tim/nsjail-python.policy
+python3 app.py
+```
+
+nsjail worker 只接收工具名和 RPC 代理；云客户端、BotManager、AgentEngine 以及审批回调留在父进程。nsjail profile 应将应用代码与 Python 运行时以只读方式挂载，将 `/tmp` 设为临时文件系统，启用网络、PID/IPC/UTS 命名空间隔离，并设置 CPU、地址空间、文件描述符和墙钟时间上限。`TIM_NSJAIL_SECCOMP_POLICY` 是宿主机上的 Kafel 策略文件路径。未安装 nsjail、未配置 rootfs 或缺少 seccomp 策略时，生产请求会 fail-closed。
+
+macOS/Windows 生产环境没有本项目支持的 nsjail 部署契约。此时应显式设置 `TIM_CODE_EXECUTOR_MODE=spawn`；历史配置 `fork` 也会被强制切换为 spawn + JSON RPC，并在启动时记录安全警告：子进程只拿工具名称和代理，真实工具调用留在父进程，超时、父死通知和进程树回收仍有效。该路径**不提供 nsjail 的操作系统级隔离**，没有 seccomp、namespace 或 rootfs 边界，不能宣称等同于沙箱；面向公网或高风险租户的生产部署应迁移到 Linux `nsjail`。
+
+### 3. RBAC 角色与权限矩阵
 
 系统通过解码 OIDC Token claims（自动识别 `roles`、`groups`、`realm_access.roles` 或 `resource_access`）提取用户角色，并实行严格分级授权：
 
@@ -365,7 +391,7 @@ python3 app.py
 | **`operator` / `editor`** (业务运维/开发) | • 接口单次调用与预览（Dry-Run）<br>• 发起/管理自己的批处理任务<br>• 使用 AI 智能体并持久化独立会话记忆<br>• 执行已授权的 Agent 运维技能 | **凭据自动脱敏保护**：cURL 脚本与响应中的有效签名（UserSig/TC3）由服务端自动抹除（`<redacted>`），从源头阻断权限越界与外泄。 |
 | **未授权 / 匿名访问** | • 仅限静态资产及文档中心浏览 | 在 `AUTH_ENABLED=true` 时，所有 `/api/` 路由严格返回 HTTP 401。 |
 
-### 3. 生产部署与单点登录（SSO）接入推荐
+### 4. 生产部署与单点登录（SSO）接入推荐
 
 TC Studio 前端为纯静态轻量单页应用（SPA），支持在请求头中自动携带 `Authorization: Bearer <token>`：
 * **Token 注入**：前端加载时会自动读取 `sessionStorage.getItem('tim_access_token')` 并附加到所有同源 `/api/` 请求中；
@@ -380,7 +406,7 @@ TC Studio 前端为纯静态轻量单页应用（SPA），支持在请求头中�
   [ TC Studio (FastAPI) ] ──── (OIDC JWKS 本地验签 + 角色判定 + 租户记忆隔离)
   ```
 
-### 4. 升级与租户安全注意事项
+### 5. 升级与租户安全注意事项
 
 1. **私有 Bot 资产迁移**：开启认证后，旧版本创建且 `owner_id` 为空的私有 Bot 不会自动认领给任何人（避免越权）。管理员可通过 `POST /api/agent/bots/{bot_id}/ownership` 显式分配给指定用户的 OIDC Subject。
 2. **云凭证配额隔离**：当前所有云操作默认使用激活环境配置的腾讯云 API 密钥。`operator` 控制“谁有权发起操作”，如需物理级租户费用与额度隔离，需为对应租户配置独立子账号（RAM Role）。

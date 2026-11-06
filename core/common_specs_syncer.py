@@ -414,6 +414,9 @@ class CommonSpecsManager:
 
     def __init__(self):
         self._lock = threading.Lock()
+        # Network synchronization must not hold the cache/read lock.  Keep a
+        # separate single-flight lock for concurrent explicit sync requests.
+        self._sync_lock = threading.Lock()
         self._specs_cache: dict[str, dict] = {}
 
     def get_specs(self, service: str = "live", force_reload: bool = False) -> dict:
@@ -440,7 +443,7 @@ class CommonSpecsManager:
 
     def sync_all(self, service: str = "live") -> dict:
         """全量同步 9 篇公共规范文档并结构化存储"""
-        with self._lock:
+        with self._sync_lock:
             print(f"[INFO] Starting Tencent Cloud API 3.0 Common Specs Sync for service={service}...")
             specs: Dict[str, Any] = {
                 "service": service,
@@ -503,7 +506,8 @@ class CommonSpecsManager:
             with open(cache_path, "w", encoding="utf-8") as f:
                 json.dump(specs, f, ensure_ascii=False, indent=2)
 
-            self._specs_cache[service] = specs
+            with self._lock:
+                self._specs_cache[service] = specs
             print(f"[SUCCESS] Tencent Cloud API 3.0 Common Specs successfully synced to {cache_path}!")
             return specs
 

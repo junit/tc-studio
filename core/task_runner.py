@@ -9,6 +9,7 @@ import os
 import queue
 import random
 import re
+import shutil
 import threading
 import time
 import uuid
@@ -23,9 +24,14 @@ from .agent.risk import is_high_risk_api
 
 STORAGE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "storage"))
 HISTORY_PATH = os.path.join(STORAGE_DIR, "history.json")
+RESULTS_DIR = os.path.join(STORAGE_DIR, "batch_results")
 _history_lock = threading.Lock()
 MAX_CACHED_TASKS = 50
 MAX_EVENTS_PER_TASK = 2000
+MAX_ITEMS_PER_TASK = 100_000
+MAX_INLINE_HISTORY_RESULTS = 1_000
+ORPHAN_RESULTS_MAX_AGE_SECONDS = 30 * 24 * 60 * 60
+ORPHAN_RESULTS_GC_INTERVAL_SECONDS = 24 * 60 * 60
 # Rate limiting is transient: retry a single item three times after its
 # initial request, with bounded exponential backoff and jitter.
 MAX_RATE_LIMIT_RETRIES = 3
@@ -86,6 +92,10 @@ def load_history() -> list[dict]:
 
 
 def save_history_item(batch_record: dict):
+    # Keep the history lock limited to the history file transaction.  Orphan
+    # cleanup performs another history read and directory scan, so running it
+    # while this lock is held would either require a reentrant lock or extend
+    # the critical section across slow filesystem operations.
     with _history_lock:
         try:
             os.makedirs(STORAGE_DIR, exist_ok=True)
@@ -100,8 +110,19 @@ def save_history_item(batch_record: dict):
                 history = []
         history.insert(0, batch_record)
         # 最多保留 50 次批处理历史
+        evicted = history[50:]
         history = history[:50]
         _atomic_dump_json(HISTORY_PATH, history, indent=2)
+        for record in evicted:
+            evicted_task_id = record.get("task_id") if isinstance(record, dict) else None
+            if evicted_task_id:
+                with suppress(OSError):
+                    os.remove(task_results_path(str(evicted_task_id)))
+
+    # Best-effort cleanup runs after releasing the history lock.  The periodic
+    # TaskRunner hook remains the long-running safety net.
+    with suppress(Exception):
+        cleanup_orphan_task_results()
 
 
 def delete_history_item(task_id: str) -> bool:
@@ -116,6 +137,8 @@ def delete_history_item(task_id: str) -> bool:
         new_history = [h for h in history if h.get("task_id") != task_id]
         if len(new_history) != len(history):
             _atomic_dump_json(HISTORY_PATH, new_history, indent=2)
+            with suppress(OSError):
+                os.remove(task_results_path(task_id))
             return True
         return False
 
@@ -123,7 +146,102 @@ def delete_history_item(task_id: str) -> bool:
 def clear_history() -> bool:
     with _history_lock:
         _atomic_dump_json(HISTORY_PATH, [], indent=2)
+        with suppress(OSError):
+            shutil.rmtree(RESULTS_DIR)
         return True
+
+
+def task_results_path(task_id: str) -> str:
+    safe_id = re.sub(r"[^A-Za-z0-9_-]", "_", str(task_id))
+    return os.path.join(RESULTS_DIR, f"task_{safe_id}.jsonl")
+
+
+def cleanup_orphan_task_results(max_age_seconds: int = ORPHAN_RESULTS_MAX_AGE_SECONDS) -> int:
+    """Remove stale JSONL result files no longer referenced by history.
+
+    A crash can leave a task result file behind before its summary reaches
+    ``history.json``.  Only files older than the retention window are eligible,
+    so an in-flight or recently completed task remains recoverable.
+    """
+    if not os.path.isdir(RESULTS_DIR):
+        return 0
+    try:
+        valid_ids = {
+            str(record.get("task_id"))
+            for record in load_history()
+            if isinstance(record, dict) and record.get("task_id")
+        }
+    except Exception:
+        valid_ids = set()
+    cutoff = time.time() - max(0, int(max_age_seconds))
+    removed = 0
+    try:
+        names = os.listdir(RESULTS_DIR)
+    except OSError:
+        return 0
+    for name in names:
+        if not name.startswith("task_") or not name.endswith(".jsonl"):
+            continue
+        task_id = name[5:-6]
+        if task_id in valid_ids:
+            continue
+        path = os.path.join(RESULTS_DIR, name)
+        try:
+            if not os.path.isfile(path) or os.path.getmtime(path) >= cutoff:
+                continue
+            os.remove(path)
+            removed += 1
+        except OSError:
+            continue
+    return removed
+
+
+def append_task_result(task_id: str, result: dict[str, Any]) -> str:
+    """Append one batch result without rewriting the global history file."""
+    os.makedirs(RESULTS_DIR, mode=0o700, exist_ok=True)
+    path = task_results_path(task_id)
+    with open(path, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(result, ensure_ascii=False, default=str, separators=(",", ":")))
+        handle.write("\n")
+        handle.flush()
+    with suppress(OSError):
+        os.chmod(path, 0o600)
+    return path
+
+
+def iter_task_results(task_id: str, offset: int = 0, limit: int | None = None):
+    path = task_results_path(task_id)
+    if not os.path.isfile(path):
+        return iter(())
+
+    def _iterator():
+        seen = 0
+        emitted = 0
+        with open(path, "r", encoding="utf-8") as handle:
+            for line in handle:
+                if seen < offset:
+                    seen += 1
+                    continue
+                if limit is not None and emitted >= limit:
+                    break
+                seen += 1
+                try:
+                    item = json.loads(line)
+                except (TypeError, ValueError):
+                    continue
+                if isinstance(item, dict):
+                    yield item
+                    emitted += 1
+
+    return _iterator()
+
+
+def count_task_results(task_id: str) -> int:
+    path = task_results_path(task_id)
+    if not os.path.isfile(path):
+        return 0
+    with open(path, "r", encoding="utf-8") as handle:
+        return sum(1 for line in handle if line.strip())
 
 
 class BatchTask:
@@ -214,6 +332,21 @@ class TaskRunner:
     def __init__(self):
         self.tasks: dict[str, BatchTask] = {}
         self._lock = threading.Lock()
+        self._last_orphan_gc = 0.0
+
+    def _maybe_cleanup_orphan_results(self) -> None:
+        """Run bounded orphan-result GC at most once per day per runner.
+
+        Module import performs an initial sweep; this periodic hook covers
+        long-lived processes where stale files can accumulate after a crash.
+        Cleanup is best-effort and never blocks task creation on an error.
+        """
+        now = time.time()
+        if now - self._last_orphan_gc < ORPHAN_RESULTS_GC_INTERVAL_SECONDS:
+            return
+        self._last_orphan_gc = now
+        with suppress(Exception):
+            cleanup_orphan_task_results()
 
     @staticmethod
     def _invoke_with_rate_limit_retry(client: UniversalCloudClient, api_meta: Any, payload: dict, stop_event: threading.Event | None = None) -> dict:
@@ -249,6 +382,10 @@ class TaskRunner:
         allow_high_risk: bool = False,
     ) -> BatchTask:
 
+        if len(items) > MAX_ITEMS_PER_TASK:
+            raise ValueError(f"批处理任务行数超过 {MAX_ITEMS_PER_TASK} 条安全上限")
+
+        self._maybe_cleanup_orphan_results()
         api_meta = registry.get_api(api_id)
         if not dry_run and api_meta and is_high_risk_api(api_id, api_meta) and not allow_high_risk:
             raise ValueError("高危批处理接口必须经过显式确认")
@@ -325,7 +462,14 @@ class TaskRunner:
         else:
             task.emit("complete", summary)
         try:
-            save_history_item({**summary, "results": task.results})
+            result_count = task.success + task.failed
+            record = {**summary, "result_count": result_count}
+            result_path = task_results_path(task.task_id)
+            if os.path.isfile(result_path):
+                record["results_path"] = result_path
+            if result_count <= MAX_INLINE_HISTORY_RESULTS:
+                record["results"] = task.results
+            save_history_item(record)
         except Exception as exc:
             print(f"[WARN] Failed to save batch history: {exc}")
 
@@ -406,6 +550,14 @@ class TaskRunner:
                     "_cost_ms": cost_ms,
                 }
                 task.results.append(result_item)
+                persisted = False
+                try:
+                    append_task_result(task.task_id, result_item)
+                    persisted = True
+                except (OSError, TypeError, ValueError):
+                    pass
+                if persisted and len(task.results) > MAX_INLINE_HISTORY_RESULTS:
+                    del task.results[:-MAX_INLINE_HISTORY_RESULTS]
                 task.emit("progress", {
                     "index": idx,
                     "total": task.total,
@@ -428,4 +580,5 @@ class TaskRunner:
         self._finalize_task(task, api_meta)
 
 
+cleanup_orphan_task_results()
 task_runner = TaskRunner()

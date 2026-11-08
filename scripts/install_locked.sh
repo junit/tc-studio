@@ -23,7 +23,7 @@ minimum = (3, 11)
 maximum = (3, 14)
 if sys.version_info < minimum or sys.version_info >= maximum:
     raise SystemExit(
-        "error: TIM requires Python >=3.11,<3.14; "
+        "error: TC Studio requires Python >=3.11,<3.14; "
         f"found {sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
     )
 print(

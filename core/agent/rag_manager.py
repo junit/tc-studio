@@ -20,6 +20,12 @@ except ImportError:  # pragma: no cover - Windows fallback keeps process-local s
     fcntl = None
 
 from .file_parser import MAX_PDF_PAGES, format_file_size, validate_zip_archive
+from core.namespace import (
+    CANONICAL_DATABASE_FILENAME,
+    LEGACY_DATABASE_FILENAME,
+    get_env,
+    select_canonical_or_legacy_path,
+)
 from core.persistence import (
     SqliteBotMetadataStore,
     database_path as resolve_database_path,
@@ -63,14 +69,24 @@ class RagManager:
         explicit_data_root = data_root is not None
         if not data_root:
             base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-            configured_data_dir = os.environ.get("TIM_DATA_DIR")
+            configured_data_dir = get_env("DATA_DIR")
             data_root = os.path.join(
                 configured_data_dir or os.path.join(base_dir, "data"),
                 "bots",
             )
         self.data_root = data_root
         database_target = (
-            os.path.join(os.path.dirname(os.path.abspath(self.data_root)), "tim.sqlite3")
+            select_canonical_or_legacy_path(
+                os.path.join(
+                    os.path.dirname(os.path.abspath(self.data_root)),
+                    CANONICAL_DATABASE_FILENAME,
+                ),
+                os.path.join(
+                    os.path.dirname(os.path.abspath(self.data_root)),
+                    LEGACY_DATABASE_FILENAME,
+                ),
+                label="RAG SQLite 主库",
+            )
             if explicit_data_root
             else resolve_database_path()
         )

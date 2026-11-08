@@ -41,6 +41,7 @@ from smolagents.models import (
 )
 
 from ..cloud_client import UniversalCloudClient
+from ..namespace import get_env
 from ..runtime_context import runtime_auth_scope, runtime_is_admin, runtime_user_id
 from .bot_manager import BotManager, bot_manager
 from .constants import (
@@ -968,15 +969,21 @@ class NsJailPythonExecutor(PythonExecutor):
     ):
         if os.name != "posix" or not sys.platform.startswith("linux"):
             raise RuntimeError("nsjail 执行器只支持 Linux 部署")
-        self.nsjail_path = os.environ.get("TIM_NSJAIL_BIN") or shutil.which("nsjail")
+        self.nsjail_path = get_env("NSJAIL_BIN") or shutil.which("nsjail")
         if not self.nsjail_path:
             raise RuntimeError("未找到 nsjail；生产环境拒绝回退到进程内执行器")
-        self.rootfs = os.environ.get("TIM_NSJAIL_ROOT")
+        self.rootfs = get_env("NSJAIL_ROOT")
         if not self.rootfs or not os.path.isdir(self.rootfs):
-            raise RuntimeError("TIM_NSJAIL_ROOT 未配置或目录不存在；拒绝启动 nsjail worker")
-        self.seccomp_policy = os.environ.get("TIM_NSJAIL_SECCOMP_POLICY")
+            raise RuntimeError(
+                "TC_STUDIO_NSJAIL_ROOT 未配置或目录不存在；"
+                "旧 TIM_NSJAIL_ROOT 仍兼容，拒绝启动 nsjail worker"
+            )
+        self.seccomp_policy = get_env("NSJAIL_SECCOMP_POLICY")
         if not self.seccomp_policy or not os.path.isfile(self.seccomp_policy):
-            raise RuntimeError("TIM_NSJAIL_SECCOMP_POLICY 未配置；拒绝启动无 seccomp 的 worker")
+            raise RuntimeError(
+                "TC_STUDIO_NSJAIL_SECCOMP_POLICY 未配置；"
+                "旧 TIM_NSJAIL_SECCOMP_POLICY 仍兼容，拒绝启动无 seccomp 的 worker"
+            )
         self.additional_authorized_imports = list(additional_authorized_imports)
         self.max_print_outputs_length = max_print_outputs_length
         self.timeout_seconds = timeout_seconds
@@ -1032,7 +1039,7 @@ class NsJailPythonExecutor(PythonExecutor):
         child, parent = socket.socketpair()
         child_fd = child.fileno()
         child.set_inheritable(True)
-        python_path = os.environ.get("TIM_NSJAIL_PYTHON", "/usr/bin/python3")
+        python_path = get_env("NSJAIL_PYTHON", default="/usr/bin/python3")
         time_limit = max(1, int(math.ceil(float(self.timeout_seconds or 30.0) + 5)))
         command = [
             self.nsjail_path,
@@ -1048,11 +1055,11 @@ class NsJailPythonExecutor(PythonExecutor):
             "--rlimit_cpu",
             str(max(1, int(math.ceil(float(self.timeout_seconds or 30.0))))),
             "--rlimit_as",
-            os.environ.get("TIM_NSJAIL_RLIMIT_AS_MB", "1024"),
+            get_env("NSJAIL_RLIMIT_AS_MB", default="1024"),
             "--rlimit_nofile",
-            os.environ.get("TIM_NSJAIL_RLIMIT_NOFILE", "256"),
+            get_env("NSJAIL_RLIMIT_NOFILE", default="256"),
             "--rlimit_nproc",
-            os.environ.get("TIM_NSJAIL_RLIMIT_NPROC", "32"),
+            get_env("NSJAIL_RLIMIT_NPROC", default="32"),
             "--tmpfsmount",
             "/tmp",
             "--seccomp_policy",
@@ -1225,15 +1232,25 @@ def _create_code_executor(
     nsjail deployment contract, so their explicitly controlled fallback uses
     the spawn/RPC executor and is reported as lacking OS-level isolation.
     """
-    mode = os.environ.get("TIM_CODE_EXECUTOR_MODE", "fork").strip().lower()
+    mode = (get_env("CODE_EXECUTOR_MODE", default="fork") or "fork").strip().lower()
     app_env = os.environ.get("APP_ENV", "development").strip().lower()
     production = app_env in {"production", "prod", "staging"}
     linux_host = os.name == "posix" and sys.platform.startswith("linux")
     if mode not in {"fork", "spawn", "nsjail"}:
-        raise RuntimeError("TIM_CODE_EXECUTOR_MODE 必须为 fork 或 nsjail；非 Linux 可额外使用 spawn")
-    allow_unconfined = os.environ.get("ALLOW_UNCONFINED_CODE_EXECUTOR", "").strip().lower() in {"1", "true", "yes", "on"}
+        raise RuntimeError(
+            "TC_STUDIO_CODE_EXECUTOR_MODE 必须为 fork 或 nsjail；"
+            "旧 TIM_CODE_EXECUTOR_MODE 仍兼容；非 Linux 可额外使用 spawn"
+        )
+    allow_unconfined = (
+        get_env("ALLOW_UNCONFINED_CODE_EXECUTOR", default="") or ""
+    ).strip().lower() in {"1", "true", "yes", "on"}
     if production and linux_host and mode != "nsjail" and not allow_unconfined:
-        raise RuntimeError("Linux 生产环境必须设置 TIM_CODE_EXECUTOR_MODE=nsjail，或显式设置 ALLOW_UNCONFINED_CODE_EXECUTOR=true")
+        raise RuntimeError(
+            "Linux 生产环境必须设置 TC_STUDIO_CODE_EXECUTOR_MODE=nsjail "
+            "（旧 TIM_CODE_EXECUTOR_MODE=nsjail 仍兼容），或显式设置 "
+            "TC_STUDIO_ALLOW_UNCONFINED_CODE_EXECUTOR=true "
+            "（旧 ALLOW_UNCONFINED_CODE_EXECUTOR 仍兼容）"
+        )
     if production and mode in {"fork", "spawn"} and (not linux_host or allow_unconfined):
         logging.getLogger(__name__).warning(
             "生产环境使用受控 spawn/RPC executor；该路径不提供 nsjail 的 OS 级隔离，"

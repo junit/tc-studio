@@ -30,13 +30,13 @@ def test_app_settings_are_shared_and_audited(tmp_path):
     ) == ["deletegroup", "shutdownlive"]
     assert second.get_high_risk_keywords() == ["deletegroup", "shutdownlive"]
 
-    setting = SqliteAppSettingsStore(str(data_dir / "tim.sqlite3")).get(
+    setting = SqliteAppSettingsStore(str(data_dir / "tc_studio.sqlite3")).get(
         "security.high_risk_keywords"
     )
     assert setting is not None
     assert setting["version"] == 1
 
-    connection = sqlite3.connect(data_dir / "tim.sqlite3")
+    connection = sqlite3.connect(data_dir / "tc_studio.sqlite3")
     try:
         audit = connection.execute(
             """

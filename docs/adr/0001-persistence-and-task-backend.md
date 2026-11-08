@@ -8,6 +8,11 @@
 
 这份 ADR 确定当前单机部署和未来 PostgreSQL + Redis 部署的共同数据边界。它不要求当前版本立即引入 Redis，也不把“所有文件都迁入 SQLite”作为目标。
 
+应用自身的运行时命名已经在 2026-11-08 由
+[ADR-0002：TC Studio 命名空间迁移与 TIM 兼容窗口](0002-tc-studio-namespace-compatibility.md)
+统一为 `TC_STUDIO_*`、`tc_studio.sqlite3` 和 `/var/lib/tc-studio`。本文中
+`TIM_*`、`tim.sqlite3` 和 `/var/lib/tim` 仅在描述旧部署、迁移源或历史方案时保留。
+
 ## 背景
 
 历史版本和当前运行期同时存在几种持久化方式。下面列出的 BOT/RAG JSON 路径是旧部署的迁移源或兼容回退源，不再是新的运行期结构化事实源：
@@ -73,7 +78,7 @@ Python 版本由 `pyproject.toml` 固定为 `>=3.11,<3.14`，`.python-version` �
 单机单进程和单机多进程阶段统一使用一个主数据库文件：
 
 ```text
-storage/tim.sqlite3
+storage/tc_studio.sqlite3
 ```
 
 现有单独的 `batch_idempotency.sqlite3` 应迁移为主数据库中的 `idempotency_keys` 表，避免一个系统同时维护多份 SQLite 事实库。
@@ -81,9 +86,12 @@ storage/tim.sqlite3
 数据库路径必须可配置，例如：
 
 ```text
-TIM_DATABASE_URL=sqlite:////var/lib/tim/tim.sqlite3
-TIM_BLOB_ROOT=/var/lib/tim/blobs
+TC_STUDIO_DATABASE_URL=sqlite:////var/lib/tc-studio/tc_studio.sqlite3
 ```
+
+旧的 `TIM_DATABASE_URL`、`TIM_SQLITE_PATH` 和其他 `TIM_*` 变量仍可读取，但
+`TC_STUDIO_*` 始终优先；默认位置只有 `storage/tim.sqlite3` 时继续使用旧库，
+新旧库同时存在时只使用 `storage/tc_studio.sqlite3`，不会自动合并。
 
 单机多进程允许使用 SQLite，但必须满足：
 
@@ -110,10 +118,11 @@ Redis 不是当前单机阶段的强制依赖。必须引入的是“共享、�
 
 截至 2026-11-07，已经落地第一阶段的存储骨架：
 
-- 新增 `core/persistence.py`，统一解析 `TIM_DATABASE_URL` / `TIM_SQLITE_PATH`。
-- 默认主库为 `storage/tim.sqlite3`。
-- 配置文件路径支持 `TIM_CONFIG_PATH`；生产单机可把带凭据的配置放在
-  `/var/lib/tim/config.json`，不必让运行期进程写代码发布目录。
+- 新增 `core/persistence.py`，统一解析 `TC_STUDIO_DATABASE_URL` /
+  `TC_STUDIO_SQLITE_PATH`，并兼容旧的 `TIM_DATABASE_URL` / `TIM_SQLITE_PATH`。
+- 默认主库为 `storage/tc_studio.sqlite3`；只发现旧的 `storage/tim.sqlite3` 时会继续使用旧库。
+- 配置文件路径支持 `TC_STUDIO_CONFIG_PATH`；生产单机可把带凭据的配置放在
+  `/var/lib/tc-studio/config.json`，不必让运行期进程写代码发布目录。
 - SQLite 启用 WAL、外键检查、忙等待和 `0700/0600` 权限尝试。
 - 创建了 `schema_migrations`、`idempotency_keys`、`batch_tasks`、`batch_task_tombstones`、
   `task_events`、`sync_jobs`、`app_settings`、`audit_events`、`orchestration_events`、
@@ -342,7 +351,7 @@ updated_at
 
 在继续扩大 SQLite 使用前，先处理以下问题：
 
-1. **统一数据库路径**：把 `IDEMPOTENCY_DB_PATH`、任务事实和未来新表统一到 `TIM_DATABASE_URL`。**已完成第一阶段。**
+1. **统一数据库路径**：把 `IDEMPOTENCY_DB_PATH`、任务事实和未来新表统一到 `TC_STUDIO_DATABASE_URL`。**已完成第一阶段，旧 `TIM_DATABASE_URL` 仍兼容读取。**
 2. **补幂等记录状态**：增加 `RESERVED`、`RUNNING`、`COMPLETED`、`FAILED`、`UNKNOWN` 和 `EXPIRED`。**已完成批处理主链路。**
 3. **补任务租约和心跳**：进程崩溃后可以判断是否接管。**批处理和同步任务均已完成租约、心跳和 `UNKNOWN` 判定；只自动恢复尚未开始执行的安全预留，不自动重放已进入执行阶段的外部副作用。**
 4. **修复预留后崩溃窗口**：不能只看到幂等键存在就返回“成功重放”。**已完成 `RESERVED` 任务恢复边界。**
@@ -362,14 +371,14 @@ updated_at
 ### Phase 0：定义边界与备份
 
 - 增加 `schema_migrations`。
-- 定义 `TIM_DATABASE_URL`、`TIM_BLOB_ROOT` 和 `TIM_TENANT_MODE`。
+- 定义 `TC_STUDIO_DATABASE_URL`、`TC_STUDIO_TENANT_MODE`，Blob 根目录由部署检查和文件层配置管理。
 - 导出当前 JSON、JSONL、RAG 元数据和文件清单。
 - 计算文件 SHA-256，记录迁移批次和源文件路径。
 - 迁移脚本必须可重复执行，不能覆盖已有用户数据。
 
 ### Phase 1：单机 SQLite 主库
 
-- 创建 `storage/tim.sqlite3`。
+- 创建 `storage/tc_studio.sqlite3`。
 - 先迁移 `batch_idempotency`、批处理历史、任务状态和同步任务。
 - 再迁移 BOT 元数据、会话、记忆、技能和 RAG 元数据。
 - 文件继续留在本地 Blob 目录，数据库只保存引用。
@@ -494,5 +503,6 @@ Redis 中的数据必须可以从 PostgreSQL 重建，不能把 Redis 当作唯�
 - [core/agent/rag_manager.py](../../core/agent/rag_manager.py)：RAG 文档、分块和原文件。
 - [core/config.py](../../core/config.py)：环境配置与敏感字段处理。
 - [app.py](../../app.py)：任务 API、SSE、暂停、继续、终止和导出接口。
-- [deploy/systemd/tim-api@.service](../../deploy/systemd/tim-api@.service)：单机多实例的
-  Linux 进程生命周期模板。
+- [deploy/systemd/tc-studio-api@.service](../../deploy/systemd/tc-studio-api@.service)：单机多实例的
+  Linux 进程生命周期模板；旧的 `tim-api@.service` 仅作为兼容入口保留。
+- [core/namespace.py](../../core/namespace.py)：TC Studio 新命名空间与旧 TIM 配置兼容读取。

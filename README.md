@@ -198,7 +198,8 @@ TC Studio 的智能体并非传统打字聊天的对话机器人，而是**以�
 │   ├── favicon.svg
 │   └── assets/                       # 编译后的极轻 JS/CSS 单包
 ├── storage/                          # 本地运行期存储
-│   ├── tim.sqlite3                   # 统一 SQLite 主库（运行期生成）
+│   ├── tc_studio.sqlite3             # 统一 SQLite 主库（运行期生成）
+│   ├── tim.sqlite3                   # 旧版主库（仅兼容发现，不与新库合并）
 │   ├── batch_results/                 # 大型批处理结果正文（JSONL/Blob）
 │   ├── docs/                         # 官方全量 427+ API 离线结构化文档库 (JSON)
 │   └── official_live_tree.json       # 官方在线同步目录树缓存
@@ -378,6 +379,7 @@ export APP_ENV=production
 export AUTH_ENABLED=true
 export AUTH_PROVIDER=oidc
 export OIDC_ISSUER_URL=https://sso.example.com/realms/ops
+# aud/client_id 是身份系统的外部契约，只有身份系统同步变更后才能改名
 export OIDC_AUDIENCE=tim-studio
 export OIDC_CLIENT_ID=tim-studio
 
@@ -396,17 +398,17 @@ Linux 生产、预发布环境必须使用 `nsjail`，并由部署提供最小 r
 
 ```bash
 export APP_ENV=production
-export TIM_CODE_EXECUTOR_MODE=nsjail
-export TIM_NSJAIL_BIN=/usr/local/bin/nsjail
-export TIM_NSJAIL_ROOT=/opt/tim/nsjail-rootfs
-export TIM_NSJAIL_PYTHON=/usr/bin/python3
-export TIM_NSJAIL_SECCOMP_POLICY=/opt/tim/nsjail-python.policy
+export TC_STUDIO_CODE_EXECUTOR_MODE=nsjail
+export TC_STUDIO_NSJAIL_BIN=/usr/local/bin/nsjail
+export TC_STUDIO_NSJAIL_ROOT=/opt/tc-studio/nsjail-rootfs
+export TC_STUDIO_NSJAIL_PYTHON=/usr/bin/python3
+export TC_STUDIO_NSJAIL_SECCOMP_POLICY=/opt/tc-studio/nsjail-python.policy
 python3 app.py
 ```
 
-nsjail worker 只接收工具名和 RPC 代理；云客户端、BotManager、AgentEngine 以及审批回调留在父进程。nsjail profile 应将应用代码与 Python 运行时以只读方式挂载，将 `/tmp` 设为临时文件系统，启用网络、PID/IPC/UTS 命名空间隔离，并设置 CPU、地址空间、文件描述符和墙钟时间上限。`TIM_NSJAIL_SECCOMP_POLICY` 是宿主机上的 Kafel 策略文件路径。未安装 nsjail、未配置 rootfs 或缺少 seccomp 策略时，生产请求会 fail-closed。
+nsjail worker 只接收工具名和 RPC 代理；云客户端、BotManager、AgentEngine 以及审批回调留在父进程。nsjail profile 应将应用代码与 Python 运行时以只读方式挂载，将 `/tmp` 设为临时文件系统，启用网络、PID/IPC/UTS 命名空间隔离，并设置 CPU、地址空间、文件描述符和墙钟时间上限。`TC_STUDIO_NSJAIL_SECCOMP_POLICY` 是宿主机上的 Kafel 策略文件路径。未安装 nsjail、未配置 rootfs 或缺少 seccomp 策略时，生产请求会 fail-closed；旧的 `TIM_NSJAIL_*` 变量仍可兼容读取。
 
-macOS/Windows 生产环境没有本项目支持的 nsjail 部署契约。此时应显式设置 `TIM_CODE_EXECUTOR_MODE=spawn`；历史配置 `fork` 也会被强制切换为 spawn + JSON RPC，并在启动时记录安全警告：子进程只拿工具名称和代理，真实工具调用留在父进程，超时、父死通知和进程树回收仍有效。该路径**不提供 nsjail 的操作系统级隔离**，没有 seccomp、namespace 或 rootfs 边界，不能宣称等同于沙箱；面向公网或高风险租户的生产部署应迁移到 Linux `nsjail`。
+macOS/Windows 生产环境没有本项目支持的 nsjail 部署契约。此时应显式设置 `TC_STUDIO_CODE_EXECUTOR_MODE=spawn`；历史配置 `fork` 也会被强制切换为 spawn + JSON RPC，并在启动时记录安全警告：子进程只拿工具名称和代理，真实工具调用留在父进程，超时、父死通知和进程树回收仍有效。该路径**不提供 nsjail 的操作系统级隔离**，没有 seccomp、namespace 或 rootfs 边界，不能宣称等同于沙箱；面向公网或高风险租户的生产部署应迁移到 Linux `nsjail`。旧的 `TIM_CODE_EXECUTOR_MODE` 仍可兼容读取。
 
 ### 3. RBAC 角色与权限矩阵
 
@@ -455,11 +457,20 @@ TC Studio 前端为纯静态轻量单页应用（SPA），支持在请求头中�
 
 持久化分层、SQLite 单机阶段边界、文件与数据库迁移范围，以及未来 PostgreSQL + Redis 的演进方案，见 [ADR-0001：持久化分层与任务后端演进](docs/adr/0001-persistence-and-task-backend.md)。
 
-当前单机阶段默认使用 `storage/tim.sqlite3` 作为统一 SQLite 主库，也可以通过 `TIM_DATABASE_URL=sqlite:////var/lib/tim/tim.sqlite3` 指定持久化路径；生产环境可通过 `TIM_CONFIG_PATH=/var/lib/tim/config.json` 把带凭据配置放在受限运行期目录。旧版 `storage/batch_idempotency.sqlite3` 会自动导入主库并保留源文件。
+当前单机阶段默认使用 `storage/tc_studio.sqlite3` 作为统一 SQLite 主库，也可以通过
+`TC_STUDIO_DATABASE_URL=sqlite:////var/lib/tc-studio/tc_studio.sqlite3` 指定持久化路径；
+生产环境可通过 `TC_STUDIO_CONFIG_PATH=/var/lib/tc-studio/config.json` 把带凭据配置放在
+受限运行期目录。旧版 `storage/batch_idempotency.sqlite3` 会自动导入主库并保留源文件。
+
+应用自有运行配置统一使用 `TC_STUDIO_*` 命名空间。旧的 `TIM_*` 变量仍按兼容优先级读取：
+新变量优先，旧变量仅在新变量缺失时生效；冲突时只记录变量名，不记录密钥值。默认位置
+只有 `storage/tim.sqlite3` 时，应用会继续使用旧库并提示迁移；新旧数据库同时存在时只使用
+`tc_studio.sqlite3`，不会自动合并或删除旧库。完整变量对照、数据库复制和回滚步骤见
+[TC Studio 命名空间迁移说明](docs/operations/tc-studio-namespace-migration.md)。
 
 BOT/RAG 和协同流水的结构化元数据已经 SQLite-first：BOT 定义、owner/visibility、长期记忆、会话摘要、会话消息、技能元数据、文件引用、RAG 文档、chunks、跨 BOT 协同事件都由 SQLite 保存和读取。新写入不会创建新的 `bot.json`、`memory.json`、`history.json`、`history.jsonl`、`session_summary.json`、技能 JSON、`docs.json`、`chunks.json` 或 `orchestrations.json`；旧 JSON/JSONL 只用于一次性迁移或没有 SQLite 行时的兼容回退。上传原件、RAG 原文档、技能 Python 源码和大型批处理结果仍在 Blob/文件层，SQLite 只保存归属、状态、哈希、大小、路径引用和索引。
 
-批处理任务事实、租约、事件、幂等状态和同步任务状态也已经进入主库。单机多进程必须共享同一个本地持久化磁盘、`TIM_CONFIG_PATH`、`TIM_DATA_DIR` 和 SQLite 文件；多主机部署再切换 PostgreSQL，并按实时调度需求引入 Redis。
+批处理任务事实、租约、事件、幂等状态和同步任务状态也已经进入主库。单机多进程必须共享同一个本地持久化磁盘、`TC_STUDIO_CONFIG_PATH`、`TC_STUDIO_DATA_DIR` 和 SQLite 文件；多主机部署再切换 PostgreSQL，并按实时调度需求引入 Redis。
 
 批处理状态、幂等键、SSE 回放、跨进程控制和历史清理语义见
 [批处理持久化 API 契约](docs/api/batch-task-persistence-contract.md)。
@@ -470,13 +481,13 @@ BOT/RAG 和协同流水的结构化元数据已经 SQLite-first：BOT 定义、o
 可直接使用以下脚本完成基本运维动作：
 
 ```bash
-PYTHONPATH=. python scripts/check_sqlite_deployment.py --database /var/lib/tim/tim.sqlite3 --blob-root /var/lib/tim/blobs --results-root /var/lib/tim/storage/batch_results --backup-root /var/lib/tim/backups --data-root /var/lib/tim/data --storage-root /var/lib/tim/storage --min-free-bytes 10737418240
-PYTHONPATH=. python scripts/backup_sqlite.py --database /var/lib/tim/tim.sqlite3
-PYTHONPATH=. python scripts/restore_sqlite.py /var/lib/tim/backups/tim-<timestamp>.sqlite3 --database /var/lib/tim/tim.sqlite3 --force
-PYTHONPATH=. python scripts/migrate_json_metadata_to_sqlite.py --data-root /var/lib/tim/data --database /var/lib/tim/tim.sqlite3
-PYTHONPATH=. python scripts/acceptance_sqlite_multiprocess.py --work-dir /var/lib/tim/acceptance/sqlite-multiprocess --timeout 60
-PYTHONPATH=. python scripts/acceptance_sqlite_multiprocess.py --work-dir /var/lib/tim/acceptance/sqlite-hard-faults --timeout 60 --hard-kill --file-faults --hard-kill-lease-seconds 5
-PYTHONPATH=. python scripts/acceptance_http_multiprocess.py --work-dir /var/lib/tim/acceptance/http-multiprocess --timeout 60
+PYTHONPATH=. python scripts/check_sqlite_deployment.py --database /var/lib/tc-studio/tc_studio.sqlite3 --blob-root /var/lib/tc-studio/blobs --results-root /var/lib/tc-studio/storage/batch_results --backup-root /var/lib/tc-studio/backups --data-root /var/lib/tc-studio/data --storage-root /var/lib/tc-studio/storage --min-free-bytes 10737418240
+PYTHONPATH=. python scripts/backup_sqlite.py --database /var/lib/tc-studio/tc_studio.sqlite3
+PYTHONPATH=. python scripts/restore_sqlite.py /var/lib/tc-studio/backups/tc-studio-<timestamp>.sqlite3 --database /var/lib/tc-studio/tc_studio.sqlite3 --force
+PYTHONPATH=. python scripts/migrate_json_metadata_to_sqlite.py --data-root /var/lib/tc-studio/data --database /var/lib/tc-studio/tc_studio.sqlite3
+PYTHONPATH=. python scripts/acceptance_sqlite_multiprocess.py --work-dir /var/lib/tc-studio/acceptance/sqlite-multiprocess --timeout 60
+PYTHONPATH=. python scripts/acceptance_sqlite_multiprocess.py --work-dir /var/lib/tc-studio/acceptance/sqlite-hard-faults --timeout 60 --hard-kill --file-faults --hard-kill-lease-seconds 5
+PYTHONPATH=. python scripts/acceptance_http_multiprocess.py --work-dir /var/lib/tc-studio/acceptance/http-multiprocess --timeout 60
 ```
 
 当前阶段不强制引入 Redis。Redis 只在多主机、多 Pod、跨实例队列或实时事件广播成为需求时加入；PostgreSQL 仍是未来事实数据库，Redis 不能替代它。

@@ -42,6 +42,7 @@ data/*
 storage/history.json
 storage/docs_cache/
 storage/tim.sqlite3*
+storage/tc_studio.sqlite3*
 storage/batch_idempotency.sqlite3*
 storage/batch_results/
 # Atomic JSON publication lock files generated beside cache snapshots.

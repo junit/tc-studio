@@ -21,6 +21,12 @@ except ImportError:  # pragma: no cover - Windows keeps the thread lock fallback
     fcntl = None
 
 from core.runtime_context import runtime_auth_scope, runtime_user_id
+from core.namespace import (
+    CANONICAL_DATABASE_FILENAME,
+    LEGACY_DATABASE_FILENAME,
+    get_env,
+    select_canonical_or_legacy_path,
+)
 from core.persistence import (
     SqliteAppSettingsStore,
     SqliteAuditStore,
@@ -129,11 +135,19 @@ class BotManager:
     def __init__(self, data_dir: str | None = None):
         base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
         explicit_data_dir = data_dir is not None
-        self.data_dir = data_dir or os.environ.get("TIM_DATA_DIR") or os.path.join(base_dir, "data")
+        self.data_dir = (
+            data_dir
+            or get_env("DATA_DIR", default=os.path.join(base_dir, "data"))
+            or os.path.join(base_dir, "data")
+        )
         self.bots_dir = os.path.join(self.data_dir, "bots")
         self.llm_config_path = os.path.join(self.data_dir, "llm_config.json")
         database_target = (
-            os.path.join(self.data_dir, "tim.sqlite3")
+            select_canonical_or_legacy_path(
+                os.path.join(self.data_dir, CANONICAL_DATABASE_FILENAME),
+                os.path.join(self.data_dir, LEGACY_DATABASE_FILENAME),
+                label="BOT SQLite 主库",
+            )
             if explicit_data_dir
             else resolve_database_path()
         )

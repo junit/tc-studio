@@ -1,4 +1,4 @@
-"""Create a verified, permission-restricted backup of TIM's SQLite database."""
+"""Create a verified, permission-restricted backup of TC Studio's SQLite database."""
 
 from __future__ import annotations
 
@@ -31,7 +31,7 @@ def create_backup(database: str | None, output: Path | None) -> Path:
         if output is None:
             backup_dir = source_path.parent / "backups"
             stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-            output = backup_dir / f"tim-{stamp}.sqlite3"
+            output = backup_dir / f"tc-studio-{stamp}.sqlite3"
         target = output.expanduser().resolve()
         target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(target.parent, 0o700)

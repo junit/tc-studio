@@ -19,12 +19,20 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator, Mapping
 
+from .namespace import (
+    CANONICAL_DATABASE_FILENAME,
+    LEGACY_DATABASE_FILENAME,
+    get_env,
+    select_canonical_or_legacy_path,
+)
+
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_STORAGE_DIR = PROJECT_ROOT / "storage"
-DEFAULT_DATABASE_PATH = DEFAULT_STORAGE_DIR / "tim.sqlite3"
-DATABASE_URL_ENV = "TIM_DATABASE_URL"
-SQLITE_PATH_ENV = "TIM_SQLITE_PATH"
+DEFAULT_DATABASE_PATH = DEFAULT_STORAGE_DIR / CANONICAL_DATABASE_FILENAME
+LEGACY_DEFAULT_DATABASE_PATH = DEFAULT_STORAGE_DIR / LEGACY_DATABASE_FILENAME
+DATABASE_URL_ENV = "TC_STUDIO_DATABASE_URL"
+SQLITE_PATH_ENV = "TC_STUDIO_SQLITE_PATH"
 SQLITE_BUSY_TIMEOUT_MS = 5_000
 SQLITE_JOURNAL_MODE_RETRIES = 20
 SQLITE_JOURNAL_MODE_RETRY_DELAY_SECONDS = 0.1
@@ -52,10 +60,14 @@ def database_path(database_url: str | None = None) -> str:
     raw = (
         database_url
         if database_url is not None
-        else os.getenv(DATABASE_URL_ENV) or os.getenv(SQLITE_PATH_ENV)
+        else get_env("DATABASE_URL") or get_env("SQLITE_PATH")
     )
     if raw is None or not str(raw).strip():
-        return str(DEFAULT_DATABASE_PATH)
+        return select_canonical_or_legacy_path(
+            DEFAULT_DATABASE_PATH,
+            LEGACY_DEFAULT_DATABASE_PATH,
+            label="SQLite 主库",
+        )
 
     value = str(raw).strip()
     if value.startswith("sqlite:///"):

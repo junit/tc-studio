@@ -1,4 +1,4 @@
-"""Run a real two-process acceptance probe for TIM's SQLite task backend.
+"""Run a real two-process acceptance probe for TC Studio's SQLite task backend.
 
 The probe starts independent Python interpreters against one SQLite file and
 one result directory.  It intentionally uses dry-run tasks, so it exercises
@@ -46,12 +46,12 @@ def _child_environment(
         if not current_python_path
         else project_path + os.pathsep + current_python_path
     )
-    environment["TIM_DATABASE_URL"] = f"sqlite:///{database}"
-    environment["TIM_SQLITE_PATH"] = str(database)
-    environment["TIM_CONFIG_PATH"] = str(database.with_name("config.json"))
-    environment["TIM_STORAGE_DIR"] = str(storage)
-    environment["TIM_RESULTS_DIR"] = str(results)
-    environment["TIM_HISTORY_PATH"] = str(history)
+    environment["TC_STUDIO_DATABASE_URL"] = f"sqlite:///{database}"
+    environment["TC_STUDIO_SQLITE_PATH"] = str(database)
+    environment["TC_STUDIO_CONFIG_PATH"] = str(database.with_name("config.json"))
+    environment["TC_STUDIO_STORAGE_DIR"] = str(storage)
+    environment["TC_STUDIO_RESULTS_DIR"] = str(results)
+    environment["TC_STUDIO_HISTORY_PATH"] = str(history)
     return environment
 
 
@@ -732,7 +732,7 @@ def _run_probe(
     hard_kill_lease_seconds: int = 5,
 ) -> dict[str, Any]:
     work_dir.mkdir(parents=True, exist_ok=True)
-    database = work_dir / "tim.sqlite3"
+    database = work_dir / "tc_studio.sqlite3"
     storage = work_dir / "storage"
     results = work_dir / "batch_results"
     history = storage / "history.json"
@@ -744,11 +744,11 @@ def _run_probe(
     )
     os.environ.update(
         {
-            "TIM_DATABASE_URL": f"sqlite:///{database}",
-            "TIM_SQLITE_PATH": str(database),
-            "TIM_STORAGE_DIR": str(storage),
-            "TIM_RESULTS_DIR": str(results),
-            "TIM_HISTORY_PATH": str(history),
+            "TC_STUDIO_DATABASE_URL": f"sqlite:///{database}",
+            "TC_STUDIO_SQLITE_PATH": str(database),
+            "TC_STUDIO_STORAGE_DIR": str(storage),
+            "TC_STUDIO_RESULTS_DIR": str(results),
+            "TC_STUDIO_HISTORY_PATH": str(history),
         }
     )
 

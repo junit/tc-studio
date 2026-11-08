@@ -1,6 +1,6 @@
 # SQLite 单机运行与验收手册
 
-本文档定义 TIM 当前支持的 SQLite 部署边界。它解决的是“单机可以稳定运行、进程重启后状态可恢复、备份可以验真”的问题，不把 SQLite 宣称成多主机数据库。
+本文档定义 TC Studio 当前支持的 SQLite 部署边界。它解决的是“单机可以稳定运行、进程重启后状态可恢复、备份可以验真”的问题，不把 SQLite 宣称成多主机数据库。
 
 ## 先说结论
 
@@ -15,11 +15,11 @@
 
 ## 目录与权限
 
-生产单机建议：
+新部署的生产单机建议：
 
 ```text
-/var/lib/tim/
-├── tim.sqlite3
+/var/lib/tc-studio/
+├── tc_studio.sqlite3
 ├── blobs/
 ├── backups/
 └── logs/
@@ -32,18 +32,17 @@
 ```bash
 export APP_ENV=production
 export AUTH_ENABLED=true
-export TIM_DATABASE_URL=sqlite:////var/lib/tim/tim.sqlite3
-export TIM_BLOB_ROOT=/var/lib/tim/blobs
-export TIM_CONFIG_PATH=/var/lib/tim/config.json
-export TIM_DATA_DIR=/var/lib/tim/data
-export TIM_STORAGE_DIR=/var/lib/tim/storage
-export TIM_RESULTS_DIR=/var/lib/tim/storage/batch_results
+export TC_STUDIO_DATABASE_URL=sqlite:////var/lib/tc-studio/tc_studio.sqlite3
+export TC_STUDIO_CONFIG_PATH=/var/lib/tc-studio/config.json
+export TC_STUDIO_DATA_DIR=/var/lib/tc-studio/data
+export TC_STUDIO_STORAGE_DIR=/var/lib/tc-studio/storage
+export TC_STUDIO_RESULTS_DIR=/var/lib/tc-studio/storage/batch_results
 # 仅兼容旧版本 history.json；运行期事实在 SQLite，不依赖此文件
-export TIM_HISTORY_PATH=/var/lib/tim/storage/history.json
+export TC_STUDIO_HISTORY_PATH=/var/lib/tc-studio/storage/history.json
 ```
 
-当前 BOT/RAG 的结构化元数据已经由 SQLite 管理。`TIM_BLOB_ROOT` 主要用于部署检查
-和 Blob 层迁移规划；上传原件、RAG 原文档、技能 Python 源码和大型导出仍由现有
+当前 BOT/RAG 的结构化元数据已经由 SQLite 管理。Blob 根目录通过启动检查命令的
+`--blob-root` 参数指定；上传原件、RAG 原文档、技能 Python 源码和大型导出仍由现有
 `data/`/`storage/` 文件层管理。旧 `bot.json`、`memory.json`、`history.json`、
 `history.jsonl`、`session_summary.json`、技能 JSON、`docs.json` 和 `chunks.json`
 只作为迁移源或兼容回退，新写入不会创建这些结构化文件。
@@ -51,15 +50,15 @@ export TIM_HISTORY_PATH=/var/lib/tim/storage/history.json
 `storage/history.json` 只保留在旧数据观察期内。首次读取时，缺少 SQLite 行的旧
 任务可以补录到 `batch_tasks`；已有 SQLite 行以数据库为准。删除任务会写入
 `batch_task_tombstones`，因此旧快照不能再次创建被删除的任务。确认观察期结束后，
-可以备份并归档这个文件，`TIM_HISTORY_PATH` 仅作为回滚兼容配置保留。
+可以备份并归档这个文件，`TC_STUDIO_HISTORY_PATH` 仅作为回滚兼容配置保留。
 
 高危接口规则存放在 SQLite 的 `app_settings`，修改会产生 `audit_events`。旧的
 `data/security_config.json` 只做一次导入。`data/llm_config.json` 可能包含 API Key，
 必须由应用和部署脚本保持 `0600`，父目录保持 `0700`；API Key 不进入普通 SQLite
 设置表。
 
-多进程部署必须让所有进程使用同一个 `TIM_DATABASE_URL`、`TIM_DATA_DIR`、
-`TIM_STORAGE_DIR` 和 Blob 根目录。SQLite 保存 BOT/RAG 元数据和任务事实，配置、
+多进程部署必须让所有进程使用同一个 `TC_STUDIO_DATABASE_URL`、`TC_STUDIO_DATA_DIR`、
+`TC_STUDIO_STORAGE_DIR` 和 Blob 根目录。SQLite 保存 BOT/RAG 元数据和任务事实，配置、
 原始文件、RAG 原文档、技能源码以及批处理结果也必须落在同一个本机持久化卷上；
 不能让不同进程各自使用容器内默认的 `data/` 目录。
 
@@ -67,33 +66,35 @@ export TIM_HISTORY_PATH=/var/lib/tim/storage/history.json
 
 ## Linux 多实例启动方式
 
-仓库提供了 [systemd 模板](../../deploy/systemd/tim-api@.service)。它把每个端口作为
+仓库提供了 [TC Studio systemd 模板](../../deploy/systemd/tc-studio-api@.service)。它把每个端口作为
 一个独立服务实例，默认使用 `KillMode=control-group`，这样停止或重启 API 时会回收
 同一服务组内的子进程；`UMask=0077`、`ProtectSystem=strict` 和 `ReadWritePaths`
-把运行期写入限制在 `/var/lib/tim`。
+把运行期写入限制在 `/var/lib/tc-studio`。旧的 `tim-api@.service` 和 `/var/lib/tim`
+仍作为兼容部署边界保留，迁移时不能与新服务同时写同一个数据库。
 
 部署方需要先创建固定应用用户、代码目录和共享运行期目录，并创建
-`/etc/tim/tim.env`（权限 `0600`）：
+`/etc/tc-studio/tc-studio.env`（权限 `0600`）：
 
 ```bash
-useradd --system --home-dir /opt/tim --shell /usr/sbin/nologin tim
-install -d -o tim -g tim -m 0755 /opt/tim
-install -d -o tim -g tim -m 0700 /var/lib/tim
-install -d -o tim -g tim -m 0700 /var/lib/tim/data
-install -d -o tim -g tim -m 0700 /var/lib/tim/storage
-install -d -o tim -g tim -m 0700 /var/lib/tim/blobs
-install -d -o tim -g tim -m 0700 /var/lib/tim/backups
-install -d -o tim -g tim -m 0700 /var/lib/tim/acceptance
-install -m 0600 /dev/null /etc/tim/tim.env
+useradd --system --home-dir /opt/tc-studio --shell /usr/sbin/nologin tc-studio
+install -d -o tc-studio -g tc-studio -m 0755 /opt/tc-studio
+install -d -o tc-studio -g tc-studio -m 0700 /var/lib/tc-studio
+install -d -o tc-studio -g tc-studio -m 0700 /var/lib/tc-studio/data
+install -d -o tc-studio -g tc-studio -m 0700 /var/lib/tc-studio/storage
+install -d -o tc-studio -g tc-studio -m 0700 /var/lib/tc-studio/blobs
+install -d -o tc-studio -g tc-studio -m 0700 /var/lib/tc-studio/backups
+install -d -o tc-studio -g tc-studio -m 0700 /var/lib/tc-studio/acceptance
+install -d -m 0755 /etc/tc-studio
+install -m 0600 /dev/null /etc/tc-studio/tc-studio.env
 ```
 
 如果已有代码目录中的 `config.json`，先复制到共享运行期目录并收紧权限：
 
 ```bash
-if [ -f /opt/tim/config.json ]; then
-  install -o tim -g tim -m 0600 /opt/tim/config.json /var/lib/tim/config.json
+if [ -f /opt/tc-studio/config.json ]; then
+  install -o tc-studio -g tc-studio -m 0600 /opt/tc-studio/config.json /var/lib/tc-studio/config.json
 else
-  install -o tim -g tim -m 0600 /dev/null /var/lib/tim/config.json
+  install -o tc-studio -g tc-studio -m 0600 /dev/null /var/lib/tc-studio/config.json
 fi
 ```
 
@@ -102,14 +103,13 @@ fi
 ```bash
 APP_ENV=production
 AUTH_ENABLED=true
-TIM_DATABASE_URL=sqlite:////var/lib/tim/tim.sqlite3
-TIM_BLOB_ROOT=/var/lib/tim/blobs
-TIM_CONFIG_PATH=/var/lib/tim/config.json
-TIM_DATA_DIR=/var/lib/tim/data
-TIM_STORAGE_DIR=/var/lib/tim/storage
-TIM_RESULTS_DIR=/var/lib/tim/storage/batch_results
+TC_STUDIO_DATABASE_URL=sqlite:////var/lib/tc-studio/tc_studio.sqlite3
+TC_STUDIO_CONFIG_PATH=/var/lib/tc-studio/config.json
+TC_STUDIO_DATA_DIR=/var/lib/tc-studio/data
+TC_STUDIO_STORAGE_DIR=/var/lib/tc-studio/storage
+TC_STUDIO_RESULTS_DIR=/var/lib/tc-studio/storage/batch_results
 # 兼容旧 history.json 的可选路径，不是运行期事实源
-TIM_HISTORY_PATH=/var/lib/tim/storage/history.json
+TC_STUDIO_HISTORY_PATH=/var/lib/tc-studio/storage/history.json
 ```
 
 本阶段把 OIDC/JWKS 验收后置，所以本手册的 Linux SQLite 探针会显式使用
@@ -120,16 +120,17 @@ OIDC 回归验收，不能把本次本地认证结果当成身份系统验收。
 将本模板安装后启动两个实例：
 
 ```bash
-install -m 0644 deploy/systemd/tim-api@.service /etc/systemd/system/tim-api@.service
+install -m 0644 deploy/systemd/tc-studio-api@.service /etc/systemd/system/tc-studio-api@.service
 systemctl daemon-reload
-systemctl enable --now tim-api@8100.service tim-api@8101.service
-systemctl status tim-api@8100.service tim-api@8101.service
+systemctl enable --now tc-studio-api@8100.service tc-studio-api@8101.service
+systemctl status tc-studio-api@8100.service tc-studio-api@8101.service
 ```
 
 反向代理只需把同一主机的两个后端加入 upstream，例如
 `127.0.0.1:8100` 和 `127.0.0.1:8101`。两个实例必须使用相同的
-`TIM_DATABASE_URL`、`TIM_CONFIG_PATH`、`TIM_DATA_DIR`、`TIM_STORAGE_DIR`、`TIM_RESULTS_DIR` 和
-`TIM_HISTORY_PATH`；不同数据根目录会让共享状态和幂等验收失去意义。
+`TC_STUDIO_DATABASE_URL`、`TC_STUDIO_CONFIG_PATH`、`TC_STUDIO_DATA_DIR`、
+`TC_STUDIO_STORAGE_DIR`、`TC_STUDIO_RESULTS_DIR` 和 `TC_STUDIO_HISTORY_PATH`；
+不同数据根目录会让共享状态和幂等验收失去意义。
 
 systemd 模板提供进程生命周期契约，但它不会替代发布前的 SQLite 检查和强故障验收。
 启用服务后，必须在目标主机重新执行本手册的启动检查、强杀探针和 HTTP 双实例探针。
@@ -140,12 +141,12 @@ systemd 模板提供进程生命周期契约，但它不会替代发布前的 SQ
 
 ```bash
 PYTHONPATH=. python scripts/check_sqlite_deployment.py \
-  --database /var/lib/tim/tim.sqlite3 \
-  --blob-root /var/lib/tim/blobs \
-  --results-root /var/lib/tim/storage/batch_results \
-  --backup-root /var/lib/tim/backups \
-  --data-root /var/lib/tim/data \
-  --storage-root /var/lib/tim/storage \
+  --database /var/lib/tc-studio/tc_studio.sqlite3 \
+  --blob-root /var/lib/tc-studio/blobs \
+  --results-root /var/lib/tc-studio/storage/batch_results \
+  --backup-root /var/lib/tc-studio/backups \
+  --data-root /var/lib/tc-studio/data \
+  --storage-root /var/lib/tc-studio/storage \
   --min-free-bytes 10737418240
 ```
 
@@ -156,9 +157,9 @@ PYTHONPATH=. python scripts/check_sqlite_deployment.py \
 - `foreign_keys` 为 `true`。
 - `integrity` 为 `ok`。
 - 数据库和父目录权限符合 `0600/0700`。
-- 如果存在 `tim.sqlite3-wal` 或 `tim.sqlite3-shm`，它们的权限也必须符合 `0600`。
+- 如果存在 `tc_studio.sqlite3-wal` 或 `tc_studio.sqlite3-shm`，它们的权限也必须符合 `0600`。
 - 结果目录、备份目录符合 `0700`；已有备份文件符合 `0600`。
-- `TIM_DATA_DIR` 和 `TIM_STORAGE_DIR` 符合 `0700`，并与 SQLite 位于同一台主机的本地存储。
+- `TC_STUDIO_DATA_DIR` 和 `TC_STUDIO_STORAGE_DIR` 符合 `0700`，并与 SQLite 位于同一台主机的本地存储。
 - 数据库和 Blob 不在网络文件系统。
 - SQLite 与 Blob 位于当前主机管理的同一存储边界。
 - SQLite 与结果目录位于当前主机管理的同一存储边界。
@@ -173,7 +174,7 @@ PYTHONPATH=. python scripts/check_sqlite_deployment.py \
 
 ```bash
 PYTHONPATH=. python scripts/acceptance_sqlite_multiprocess.py \
-  --work-dir /var/lib/tim/acceptance/sqlite-multiprocess \
+  --work-dir /var/lib/tc-studio/acceptance/sqlite-multiprocess \
   --timeout 60
 ```
 
@@ -199,7 +200,7 @@ OIDC 身份系统、容器强杀或多主机故障转移。
 
 ```bash
 PYTHONPATH=. python scripts/acceptance_sqlite_multiprocess.py \
-  --work-dir /var/lib/tim/acceptance/sqlite-hard-faults \
+  --work-dir /var/lib/tc-studio/acceptance/sqlite-hard-faults \
   --timeout 60 \
   --hard-kill \
   --file-faults \
@@ -212,7 +213,7 @@ PYTHONPATH=. python scripts/acceptance_sqlite_multiprocess.py \
 
 ```bash
 PYTHONPATH=. python scripts/acceptance_http_multiprocess.py \
-  --work-dir /var/lib/tim/acceptance/http-multiprocess \
+  --work-dir /var/lib/tc-studio/acceptance/http-multiprocess \
   --timeout 60
 ```
 
@@ -245,12 +246,12 @@ docker run --rm \
   python:3.13-slim \
   sh -lc '
     python -m pip install --disable-pip-version-check --require-hashes -r requirements.lock &&
-    useradd --create-home --uid 1000 tim-acceptance &&
-    mkdir -p /tmp/tim-acceptance &&
-    chown -R 1000:1000 /tmp/tim-acceptance &&
-    su -s /bin/sh tim-acceptance -c \
+    useradd --create-home --uid 1000 tc-studio-acceptance &&
+    mkdir -p /tmp/tc-studio-acceptance &&
+    chown -R 1000:1000 /tmp/tc-studio-acceptance &&
+    su -s /bin/sh tc-studio-acceptance -c \
       "PYTHONPATH=. python scripts/acceptance_sqlite_multiprocess.py \
-       --work-dir /tmp/tim-acceptance \
+       --work-dir /tmp/tc-studio-acceptance \
        --timeout 60 \
        --hard-kill \
        --file-faults \
@@ -259,7 +260,7 @@ docker run --rm \
 ```
 
 容器命令只证明 Linux 用户态下的真实独立进程、SQLite 锁和本地文件权限语义；
-发布前仍必须在实际 `/var/lib/tim` 挂载点执行启动检查和一次同样的探针。
+发布前仍必须在实际 `/var/lib/tc-studio` 挂载点执行启动检查和一次同样的探针。
 
 如果要在容器中运行全量回归，必须安装开发锁文件，并使用非 root 用户运行测试。
 否则 root 可以读取 `chmod 000` 的文件，导致文件权限测试出现环境假通过：
@@ -271,13 +272,13 @@ docker run --rm \
   python:3.13-slim \
   sh -lc '
     python -m pip install --disable-pip-version-check --require-hashes -r requirements-dev.lock &&
-    useradd --create-home --uid 1000 tim-test &&
-    test_root=$(mktemp -d /tmp/tim-test.XXXXXX) &&
+    useradd --create-home --uid 1000 tc-studio-test &&
+    test_root=$(mktemp -d /tmp/tc-studio-test.XXXXXX) &&
     mkdir -p "$test_root/repo" &&
     tar --exclude=.git --exclude=.venv --exclude=.pytest_cache --exclude=__pycache__ \
       -cf - -C /workspace . | tar -xf - -C "$test_root/repo" &&
-    chown -R tim-test:tim-test "$test_root" &&
-    su -s /bin/sh tim-test -c \
+    chown -R tc-studio-test:tc-studio-test "$test_root" &&
+    su -s /bin/sh tc-studio-test -c \
       "cd $test_root/repo && PYTHONPATH=. python -m pytest -q"
   '
 ```
@@ -292,18 +293,18 @@ docker run --rm \
 
 ```bash
 PYTHONPATH=. python scripts/backup_sqlite.py \
-  --database /var/lib/tim/tim.sqlite3 \
-  --output /var/lib/tim/backups/tim-before-release.sqlite3
+  --database /var/lib/tc-studio/tc_studio.sqlite3 \
+  --output /var/lib/tc-studio/backups/tc-studio-before-release.sqlite3
 ```
 
 备份脚本会执行完整性检查并将备份权限收紧到 `0600`。备份文件必须复制到独立介质或对象存储，并至少保留一份异机副本。
 
-恢复前应停止所有 TIM 进程，确认没有其他进程打开目标数据库，然后执行：
+恢复前应停止所有 TC Studio 进程（包括旧 TIM 兼容服务），确认没有其他进程打开目标数据库，然后执行：
 
 ```bash
 PYTHONPATH=. python scripts/restore_sqlite.py \
-  /var/lib/tim/backups/tim-before-release.sqlite3 \
-  --database /var/lib/tim/tim.sqlite3 \
+  /var/lib/tc-studio/backups/tc-studio-before-release.sqlite3 \
+  --database /var/lib/tc-studio/tc_studio.sqlite3 \
   --force
 ```
 
@@ -320,16 +321,16 @@ PYTHONPATH=. python scripts/restore_sqlite.py \
 
 ```bash
 PYTHONPATH=. python scripts/migrate_json_metadata_to_sqlite.py \
-  --data-root /var/lib/tim/data \
-  --database /var/lib/tim/tim.sqlite3
+  --data-root /var/lib/tc-studio/data \
+  --database /var/lib/tc-studio/tc_studio.sqlite3
 ```
 
 确认扫描报告中的数量、无异常文件后，先完成数据库备份，再执行追加导入：
 
 ```bash
 PYTHONPATH=. python scripts/migrate_json_metadata_to_sqlite.py \
-  --data-root /var/lib/tim/data \
-  --database /var/lib/tim/tim.sqlite3 \
+  --data-root /var/lib/tc-studio/data \
+  --database /var/lib/tc-studio/tc_studio.sqlite3 \
   --apply
 ```
 
@@ -362,9 +363,9 @@ PYTHONPATH=. python scripts/migrate_json_metadata_to_sqlite.py \
 
 ```bash
 PYTHONPATH=. python scripts/migrate_json_metadata_to_sqlite.py \
-  --data-root /var/lib/tim/data \
-  --database /var/lib/tim/tim.sqlite3 \
-  --partition-map /var/lib/tim/partition-map.json \
+  --data-root /var/lib/tc-studio/data \
+  --database /var/lib/tc-studio/tc_studio.sqlite3 \
+  --partition-map /var/lib/tc-studio/partition-map.json \
   --apply
 ```
 
@@ -433,10 +434,10 @@ python -m pip install --require-hashes -r requirements.lock
 
 ```bash
 uv lock --check
-UV_PROJECT_ENVIRONMENT=/tmp/tim-lock-a uv sync --locked --no-dev
-UV_PROJECT_ENVIRONMENT=/tmp/tim-lock-b uv sync --locked --no-dev
-uv pip freeze --python /tmp/tim-lock-a/bin/python
-uv pip freeze --python /tmp/tim-lock-b/bin/python
+UV_PROJECT_ENVIRONMENT=/tmp/tc-studio-lock-a uv sync --locked --no-dev
+UV_PROJECT_ENVIRONMENT=/tmp/tc-studio-lock-b uv sync --locked --no-dev
+uv pip freeze --python /tmp/tc-studio-lock-a/bin/python
+uv pip freeze --python /tmp/tc-studio-lock-b/bin/python
 ```
 
 `requirements.txt` 使用范围版本，只用于兼容安装和旧环境过渡，不能作为生产

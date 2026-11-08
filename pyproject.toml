@@ -1,7 +1,7 @@
 [project]
-name = "tim-studio"
+name = "tc-studio"
 version = "0.1.0"
-description = "Tencent Cloud TIM Studio backend"
+description = "TC Studio backend for Tencent Cloud multi-service APIs"
 requires-python = ">=3.11,<3.14"
 dependencies = [
     "fastapi>=0.110,<1",

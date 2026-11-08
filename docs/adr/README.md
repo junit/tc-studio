@@ -1,12 +1,13 @@
 # Architecture Decision Records
 
-本目录记录 TIM Studio/Nova 的重要架构决策。
+本目录记录 TC Studio（兼容旧 TIM Studio/Nova）的重要架构决策。
 
 ## 索引
 
 | ADR | 标题 | 状态 | 日期 |
 | --- | --- | --- | --- |
 | [0001](0001-persistence-and-task-backend.md) | 持久化分层与任务后端演进 | Accepted（分阶段实施） | 2026-11-07 |
+| [0002](0002-tc-studio-namespace-compatibility.md) | TC Studio 命名空间迁移与 TIM 兼容窗口 | Accepted | 2026-11-08 |
 
 ## 状态说明
 

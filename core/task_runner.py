@@ -29,18 +29,21 @@ from .persistence import (
 )
 from .registry import registry
 from .agent.risk import is_high_risk_api
+from .namespace import get_env
 
 _DEFAULT_STORAGE_DIR = os.path.abspath(
     os.path.join(os.path.dirname(__file__), "..", "storage")
 )
 STORAGE_DIR = os.path.abspath(
-    os.environ.get("TIM_STORAGE_DIR") or _DEFAULT_STORAGE_DIR
+    get_env("STORAGE_DIR", default=_DEFAULT_STORAGE_DIR) or _DEFAULT_STORAGE_DIR
 )
 HISTORY_PATH = os.path.abspath(
-    os.environ.get("TIM_HISTORY_PATH") or os.path.join(STORAGE_DIR, "history.json")
+    get_env("HISTORY_PATH", default=os.path.join(STORAGE_DIR, "history.json"))
+    or os.path.join(STORAGE_DIR, "history.json")
 )
 RESULTS_DIR = os.path.abspath(
-    os.environ.get("TIM_RESULTS_DIR") or os.path.join(STORAGE_DIR, "batch_results")
+    get_env("RESULTS_DIR", default=os.path.join(STORAGE_DIR, "batch_results"))
+    or os.path.join(STORAGE_DIR, "batch_results")
 )
 # Keep the old constant name as a compatibility seam for tests and downstream
 # callers. The default now points to the unified SQLite database; the legacy

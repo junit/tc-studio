@@ -1154,7 +1154,7 @@ wheels = [
 ]
 
 [[package]]
-name = "tim-studio"
+name = "tc-studio"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [

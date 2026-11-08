@@ -129,7 +129,7 @@ def _run_probe(work_dir: Path, timeout: float) -> dict[str, Any]:
     storage = work_dir / "storage"
     results = storage / "batch_results"
     data = work_dir / "data"
-    database = work_dir / "tim.sqlite3"
+    database = work_dir / "tc_studio.sqlite3"
     config = work_dir / "config.json"
     history = storage / "history.json"
     ports = [_free_port(), _free_port()]
@@ -148,13 +148,13 @@ def _run_probe(work_dir: Path, timeout: float) -> dict[str, Any]:
         {
             "APP_ENV": "development",
             "AUTH_ENABLED": "false",
-            "TIM_DATABASE_URL": f"sqlite:///{database}",
-            "TIM_SQLITE_PATH": str(database),
-            "TIM_CONFIG_PATH": str(config),
-            "TIM_STORAGE_DIR": str(storage),
-            "TIM_RESULTS_DIR": str(results),
-            "TIM_HISTORY_PATH": str(history),
-            "TIM_DATA_DIR": str(data),
+            "TC_STUDIO_DATABASE_URL": f"sqlite:///{database}",
+            "TC_STUDIO_SQLITE_PATH": str(database),
+            "TC_STUDIO_CONFIG_PATH": str(config),
+            "TC_STUDIO_STORAGE_DIR": str(storage),
+            "TC_STUDIO_RESULTS_DIR": str(results),
+            "TC_STUDIO_HISTORY_PATH": str(history),
+            "TC_STUDIO_DATA_DIR": str(data),
         }
     )
 

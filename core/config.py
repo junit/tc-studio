@@ -12,6 +12,8 @@ import threading
 import uuid
 from contextlib import contextmanager, suppress
 
+from .namespace import get_env
+
 try:
     import fcntl
 except ImportError:  # pragma: no cover - Windows fallback keeps process-local safety
@@ -21,7 +23,7 @@ _DEFAULT_CONFIG_PATH = os.path.abspath(
     os.path.join(os.path.dirname(__file__), "..", "config.json")
 )
 CONFIG_PATH = os.path.abspath(
-    os.environ.get("TIM_CONFIG_PATH") or _DEFAULT_CONFIG_PATH
+    get_env("CONFIG_PATH", default=_DEFAULT_CONFIG_PATH) or _DEFAULT_CONFIG_PATH
 )
 
 _config_lock = threading.RLock()

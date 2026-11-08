@@ -19,6 +19,12 @@ import zlib
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+from core.namespace import get_env
+
 
 def gen_user_sig(sdkappid: int, key: str, identifier: str, expire: int = 86400 * 7) -> str:
     """生成腾讯云 IM UserSig (TLSSigAPIv2)"""
@@ -126,10 +132,10 @@ def main():
         except Exception as e:
             print(f"[WARN] 加载配置文件失败: {e}")
 
-    sdkappid = args.sdkappid or config.get("sdkappid") or int(os.environ.get("TIM_SDKAPPID", 0))
-    secret_key = args.secret_key or config.get("secret_key") or os.environ.get("TIM_SECRET_KEY", "")
+    sdkappid = args.sdkappid or config.get("sdkappid") or int(get_env("SDKAPPID", default="0") or 0)
+    secret_key = args.secret_key or config.get("secret_key") or get_env("SECRET_KEY", default="") or ""
     admin_user = args.admin_user or config.get("admin_user", "administrator")
-    usersig = args.usersig or config.get("usersig") or os.environ.get("TIM_USERSIG", "")
+    usersig = args.usersig or config.get("usersig") or get_env("USERSIG", default="") or ""
     domain = args.domain or config.get("domain", "console.tim.qq.com")
     delay = args.delay if args.delay != 0.05 else config.get("delay_sec", 0.05)
 

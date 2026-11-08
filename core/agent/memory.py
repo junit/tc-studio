@@ -23,6 +23,11 @@ from pathlib import Path
 from typing import Any, cast
 
 from core.persistence import SqliteBotMetadataStore
+from core.namespace import (
+    CANONICAL_DATABASE_FILENAME,
+    LEGACY_DATABASE_FILENAME,
+    select_canonical_or_legacy_path,
+)
 
 from .constants import (
     DEFAULT_MESSAGE_CONTENT_MAX_CHARS,
@@ -182,7 +187,14 @@ class HierarchicalMemoryManager:
         # Direct unit-level callers do not have a BotManager object.  Infer
         # the isolated database next to the runtime directory so tests and
         # offline tools never touch the application's production database.
-        return SqliteBotMetadataStore(str(Path(bot_dir).parent / "tim.sqlite3"))
+        parent = Path(bot_dir).parent
+        return SqliteBotMetadataStore(
+            select_canonical_or_legacy_path(
+                parent / CANONICAL_DATABASE_FILENAME,
+                parent / LEGACY_DATABASE_FILENAME,
+                label="会话 SQLite 主库",
+            )
+        )
 
     @staticmethod
     def _metadata_scope(

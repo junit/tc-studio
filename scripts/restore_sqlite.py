@@ -1,4 +1,4 @@
-"""Restore a TIM SQLite backup into a new or explicitly approved database path."""
+"""Restore a TC Studio SQLite backup into an approved database path."""
 
 from __future__ import annotations
 

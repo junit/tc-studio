@@ -1,0 +1,27 @@
+[Unit]
+Description=TC Studio API instance on port %i
+After=network-online.target
+Wants=network-online.target
+RequiresMountsFor=/opt/tc-studio /var/lib/tc-studio
+
+[Service]
+Type=simple
+User=tc-studio
+Group=tc-studio
+WorkingDirectory=/opt/tc-studio
+EnvironmentFile=/etc/tc-studio/tc-studio.env
+ExecStart=/opt/tc-studio/.venv/bin/python -m uvicorn app:app --host 127.0.0.1 --port %i --log-level info
+Restart=on-failure
+RestartSec=3s
+KillMode=control-group
+TimeoutStopSec=30s
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/tc-studio
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

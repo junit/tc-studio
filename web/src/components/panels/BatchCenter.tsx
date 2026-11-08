@@ -958,7 +958,9 @@ export const BatchCenter: React.FC = () => {
                               size="sm"
                               onClick={(e) => {
                                 e.stopPropagation()
-                                pauseBatch()
+                                pauseBatch().catch((error: any) => {
+                                  showToast({ type: 'error', message: error.message || '暂停任务失败' })
+                                })
                               }}
                               className="h-7 gap-1 px-3 text-xs bg-amber-500/10 text-amber-700 dark:text-amber-300 hover:bg-amber-500/20 border border-amber-200 dark:border-amber-800 cursor-pointer"
                             >
@@ -971,7 +973,9 @@ export const BatchCenter: React.FC = () => {
                               size="sm"
                               onClick={(e) => {
                                 e.stopPropagation()
-                                resumeBatch()
+                                resumeBatch().catch((error: any) => {
+                                  showToast({ type: 'error', message: error.message || '继续任务失败' })
+                                })
                               }}
                               className="h-7 gap-1 px-3 text-xs bg-emerald-500/10 text-emerald-700 dark:text-emerald-300 hover:bg-emerald-500/20 border border-emerald-200 dark:border-emerald-800 cursor-pointer"
                             >

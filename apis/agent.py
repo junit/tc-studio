@@ -6,6 +6,7 @@
 import asyncio
 import base64
 import binascii
+import hashlib
 import ipaddress
 import json
 import logging
@@ -14,6 +15,7 @@ import os
 import re
 import socket
 import time
+import uuid
 import xml.etree.ElementTree as ET
 from contextlib import suppress
 from typing import Any, Dict, List, Optional
@@ -25,7 +27,7 @@ from fastapi.responses import FileResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 from starlette.concurrency import run_in_threadpool
 
-from core.agent.bot_manager import bot_manager
+from core.agent.bot_manager import BotIdConflict, bot_manager
 from core.agent.tools import MAX_SKILL_CODE_BYTES, _validate_skill_ast
 from core.auth import CurrentUser, current_user, require_admin, require_operator
 from core.agent.constants import SUPPORTED_PROVIDERS, BOT_PRESET_TEMPLATES, HIGH_RISK_API_KEYWORDS
@@ -47,6 +49,12 @@ def require_bot_access(bot_id: str, user: CurrentUser = Depends(current_user)) -
     bot = bot_manager.get_bot(bot_id)
     if not bot:
         raise HTTPException(status_code=404, detail="BOT 不存在")
+    if not bot_manager.bot_scope_matches(
+        bot,
+        issuer=user.issuer,
+        tenant_id=user.tenant_id,
+    ):
+        raise HTTPException(status_code=404, detail="BOT 不存在")
     if user.is_admin:
         return user
     if bot.visibility == "public":
@@ -59,6 +67,12 @@ def require_bot_definition_editor(bot_id: str, user: CurrentUser = Depends(curre
     bot = bot_manager.get_bot(bot_id)
     if not bot:
         raise HTTPException(status_code=404, detail="BOT 不存在")
+    if not bot_manager.bot_scope_matches(
+        bot,
+        issuer=user.issuer,
+        tenant_id=user.tenant_id,
+    ):
+        raise HTTPException(status_code=404, detail="BOT 不存在")
     if user.is_admin:
         return user
     if bot.visibility == "public":
@@ -66,6 +80,23 @@ def require_bot_definition_editor(bot_id: str, user: CurrentUser = Depends(curre
     if bot.owner_id == user.subject:
         return user
     raise HTTPException(status_code=403, detail="无权修改该 BOT")
+
+
+def require_scoped_admin(bot_id: str, user: CurrentUser = Depends(current_user)) -> CurrentUser:
+    """Require an administrator who belongs to the BOT's issuer/tenant scope."""
+    bot = bot_manager.get_bot(bot_id)
+    if not bot:
+        raise HTTPException(status_code=404, detail="BOT 不存在")
+    if not bot_manager.bot_scope_matches(
+        bot,
+        issuer=user.issuer,
+        tenant_id=user.tenant_id,
+    ):
+        raise HTTPException(status_code=404, detail="BOT 不存在")
+    if not user.is_admin:
+        raise HTTPException(status_code=403, detail="需要管理员权限")
+    return user
+
 
 MAX_AGENT_UPLOAD_BYTES = 50 * 1024 * 1024
 MAX_KNOWLEDGE_UPLOAD_BYTES = 20 * 1024 * 1024
@@ -84,6 +115,33 @@ MAX_ATTACHMENT_DATA_URL_LENGTH = 5 * 1024 * 1024
 # this separate from the general upload limit so sanitisation cannot allocate
 # an unbounded in-memory document.
 MAX_SAFE_SVG_BYTES = 5 * 1024 * 1024
+
+
+def _write_agent_audit(
+    user: CurrentUser | None,
+    *,
+    action: str,
+    bot_id: str,
+    outcome: str = "SUCCESS",
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    """Record bounded file/agent events through the active BOT database."""
+    try:
+        store = getattr(bot_manager, "audit_store", None)
+        if store is None:
+            return
+        store.append(
+            action=action,
+            resource_type="agent_bot",
+            resource_id=bot_id,
+            outcome=outcome,
+            actor_subject=user.subject if isinstance(user, CurrentUser) else "",
+            issuer=user.issuer if isinstance(user, CurrentUser) else "",
+            tenant_id=user.tenant_id if isinstance(user, CurrentUser) else "",
+            metadata=metadata or {},
+        )
+    except Exception as exc:  # noqa: BLE001 - audit failure must be observable
+        logger.warning("agent audit event write failed: %s", exc)
 
 
 _SVG_DANGEROUS_TAGS = {
@@ -608,6 +666,10 @@ class TransferBotOwnershipPayload(BaseModel):
     owner_id: str = Field(..., min_length=1, description="目标 OIDC subject")
 
 
+class LegacyStateMigrationPayload(BaseModel):
+    target_user_id: str = Field(..., min_length=1, max_length=256, description="明确的目标 OIDC subject")
+
+
 class GeneratePreviewPayload(BaseModel):
     name: str = Field(..., description="智能体名称")
     goal: Optional[str] = Field(default="", description="职责与业务目标")
@@ -746,9 +808,17 @@ class HighRiskKeywordsPayload(BaseModel):
 
 
 @router.post("/security/high-risk-keywords")
-def update_high_risk_keywords(payload: HighRiskKeywordsPayload, _user=Depends(require_admin)):
+def update_high_risk_keywords(
+    payload: HighRiskKeywordsPayload,
+    user: CurrentUser = Depends(require_admin),
+):
     """更新高危破坏性接口拦截关键词"""
-    updated = bot_manager.set_high_risk_keywords(payload.keywords)
+    updated = bot_manager.set_high_risk_keywords(
+        payload.keywords,
+        actor_subject=user.subject,
+        issuer=user.issuer,
+        tenant_id=user.tenant_id,
+    )
     return {
         "success": True,
         "keywords": updated
@@ -999,22 +1069,36 @@ def create_bot(payload: CreateBotPayload, user: CurrentUser = Depends(current_us
     if not target_id or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", str(target_id)):
         raise HTTPException(status_code=422, detail="BOT ID 只能包含字母、数字、下划线和连字符，长度为 1-64")
 
-    # 避免 ID 重名冲突
-    if bot_manager.get_bot(target_id):
-        target_id = f"{target_id}_{int(time.time()) % 1000}"
-
     # 持久化前强制校验自定义模型地址（SSRF 守卫 + 非管理员自带 Key）
     _validate_model_override_for_persistence(payload.model_override, user)
-    bot = bot_manager.create_bot(
-        bot_id=target_id,
-        name=payload.name,
-        avatar=target_avatar or "🤖",
-        description=target_desc or "",
-        base_prompt=target_prompt,
-        suggested_prompts=target_suggested_prompts,
-        model_override=payload.model_override,
-        owner_id=None if user.claims.get("mode") == "disabled" else user.subject,
-    )
+    requested_id = str(target_id)
+    bot = None
+    for attempt in range(8):
+        if attempt == 0:
+            candidate_id = requested_id
+        else:
+            suffix = uuid.uuid4().hex[:8]
+            candidate_id = f"{requested_id[:64 - len(suffix) - 1]}_{suffix}"
+        if bot_manager.get_bot(candidate_id):
+            continue
+        try:
+            bot = bot_manager.create_bot(
+                bot_id=candidate_id,
+                name=payload.name,
+                avatar=target_avatar or "🤖",
+                description=target_desc or "",
+                base_prompt=target_prompt,
+                suggested_prompts=target_suggested_prompts,
+                model_override=payload.model_override,
+                owner_id=None if user.claims.get("mode") == "disabled" else user.subject,
+                issuer=user.issuer,
+                tenant_id=user.tenant_id,
+            )
+            break
+        except BotIdConflict:
+            continue
+    if bot is None:
+        raise HTTPException(status_code=409, detail="BOT ID 创建冲突，请稍后重试")
     return {"success": True, "bot": _format_bot_response(bot)}
 
 
@@ -1096,8 +1180,12 @@ def refresh_bot_suggested_prompts(bot_id: str):
     return {"success": True, "suggested_prompts": prompts}
 
 
-@router.post("/bots/{bot_id}/ownership", dependencies=[Depends(require_admin)])
-def transfer_bot_ownership(bot_id: str, payload: TransferBotOwnershipPayload):
+@router.post("/bots/{bot_id}/ownership", dependencies=[Depends(require_scoped_admin)])
+def transfer_bot_ownership(
+    bot_id: str,
+    payload: TransferBotOwnershipPayload,
+    user: CurrentUser = Depends(current_user),
+):
     """管理员显式认领/转移历史 ownerless 私有 Bot；不根据请求者自动猜测归属。"""
     bot = bot_manager.get_bot(bot_id)
     if not bot:
@@ -1106,7 +1194,49 @@ def transfer_bot_ownership(bot_id: str, payload: TransferBotOwnershipPayload):
         raise HTTPException(status_code=400, detail="公共 BOT 无需设置 owner")
     bot.owner_id = payload.owner_id.strip()
     bot_manager.save_bot(bot)
+    _write_agent_audit(
+        user,
+        action="agent.bot.ownership_transfer",
+        bot_id=bot_id,
+        metadata={"owner_subject": bot.owner_id},
+    )
     return {"success": True, "bot": _format_bot_response(bot)}
+
+
+@router.post("/bots/{bot_id}/legacy-state/migrate", dependencies=[Depends(require_scoped_admin)])
+def migrate_bot_legacy_state(
+    bot_id: str,
+    payload: LegacyStateMigrationPayload,
+    user: CurrentUser = Depends(current_user),
+):
+    """管理员将无法自动归属的认证前 BOT 状态迁移给明确 subject。"""
+    bot = bot_manager.get_bot(bot_id)
+    if not bot:
+        raise HTTPException(status_code=404, detail="BOT 不存在")
+    try:
+        bot_manager.migrate_legacy_state(bot_id, payload.target_user_id.strip())
+    except ValueError as exc:
+        _write_agent_audit(
+            user,
+            action="agent.bot.legacy_state_migrate",
+            bot_id=bot_id,
+            outcome="REJECTED",
+            metadata={"target_user_id": payload.target_user_id.strip(), "reason": str(exc)[:256]},
+        )
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    _write_agent_audit(
+        user,
+        action="agent.bot.legacy_state_migrate",
+        bot_id=bot_id,
+        metadata={"target_user_id": payload.target_user_id.strip()},
+    )
+    return {
+        "success": True,
+        "bot_id": bot_id,
+        "target_user_id": payload.target_user_id.strip(),
+    }
+
+
 @router.put("/bots/{bot_id}", dependencies=[Depends(require_bot_definition_editor)])
 def update_bot(bot_id: str, payload: UpdateBotPayload, user: CurrentUser = Depends(current_user)):
     """更新智能体设定"""
@@ -1145,7 +1275,7 @@ def delete_bot(bot_id: str):
     """删除智能体并彻底清理相关数据与运行任务"""
     if bot_id == "default_assistant":
         raise HTTPException(status_code=400, detail="默认智能体受系统内置保护，无法删除")
-    agent_run_manager.stop_run(bot_id)
+    agent_run_manager.stop_all_runs(bot_id)
     ok = bot_manager.delete_bot(bot_id)
     if not ok:
         raise HTTPException(status_code=404, detail="智能体不存在")
@@ -1176,7 +1306,23 @@ def clear_bot_history(bot_id: str, delete_files: bool = Query(default=True), use
 @router.post("/bots/{bot_id}/files/cleanup", dependencies=[Depends(require_bot_access)])
 def cleanup_bot_files(bot_id: str, user: CurrentUser = Depends(current_user)):
     """主动扫描并清理未在历史消息中引用的孤儿文件"""
-    deleted = bot_manager.cleanup_unreferenced_files(bot_id, user_id=user.subject)
+    try:
+        deleted = bot_manager.cleanup_unreferenced_files(bot_id, user_id=user.subject)
+    except Exception as exc:
+        _write_agent_audit(
+            user,
+            action="agent.file.cleanup",
+            bot_id=bot_id,
+            outcome="FAILED",
+            metadata={"error_type": type(exc).__name__},
+        )
+        raise
+    _write_agent_audit(
+        user,
+        action="agent.file.cleanup",
+        bot_id=bot_id,
+        metadata={"deleted_count": int(deleted)},
+    )
     return {"success": True, "cleaned_count": deleted}
 
 
@@ -1244,13 +1390,20 @@ def _stream_run_sse(run: AgentRun):
 @router.get("/active-runs")
 def list_all_active_runs(user: CurrentUser = Depends(current_user)):
     """查询当前用户活跃运行状态，管理员也只返回自己的运行状态。"""
-    return {"active_runs": agent_run_manager.list_active_runs(user.subject)}
+    return {
+        "active_runs": agent_run_manager.list_active_runs(
+            user.subject,
+            user.issuer,
+            user.tenant_id,
+        )
+    }
 
 
 @router.post("/bots/{bot_id}/upload", dependencies=[Depends(require_bot_access)])
 async def upload_bot_file(
     bot_id: str,
-    file: UploadFile = File(...)
+    file: UploadFile = File(...),
+    user: CurrentUser = Depends(current_user),
 ):
     """
     上传文件/文档/图片附件给智能体处理
@@ -1271,37 +1424,116 @@ async def upload_bot_file(
     original_filename = file.filename or "uploaded_file"
     safe_name = os.path.basename(original_filename)
     safe_name = re.sub(r"[^\w\.\-\u4e00-\u9fa5]", "_", safe_name)
-    file_id = f"f_{int(time.time() * 1000)}"
+    # Millisecond timestamps collide across two API processes.  The opaque
+    # suffix keeps both the stored filename and the SQLite primary key unique
+    # during concurrent single-host uploads.
+    file_id = f"f_{int(time.time() * 1000)}_{uuid.uuid4().hex[:12]}"
     saved_name = f"{file_id}_{safe_name}"
     saved_path = os.path.abspath(os.path.join(uploads_dir, saved_name))
 
     content = await file.read(MAX_AGENT_UPLOAD_BYTES + 1)
     if len(content) > MAX_AGENT_UPLOAD_BYTES:
+        _write_agent_audit(
+            user,
+            action="agent.file.upload",
+            bot_id=bot_id,
+            outcome="REJECTED",
+            metadata={"file_id": file_id, "size_bytes": len(content), "reason": "size_limit"},
+        )
         raise HTTPException(status_code=413, detail="上传文件超过 50 MiB 限制")
-    # Serialize the count check with the write so concurrent uploads cannot
-    # all observe the same remaining slot.
-    with bot_manager._lock:
-        try:
-            existing_file_count = sum(
-                1 for entry in os.scandir(uploads_dir)
-                if entry.is_file(follow_symlinks=False)
-            )
-        except OSError as exc:
-            raise HTTPException(status_code=500, detail="读取文件上传目录失败") from exc
-        if existing_file_count >= MAX_AGENT_FILES_PER_BOT:
-            raise HTTPException(status_code=413, detail="该智能体文件数量已达到上限，请先清理旧文件")
-        try:
-            with open(saved_path, "wb") as f:
-                f.write(content)
-        except OSError as exc:
-            raise HTTPException(status_code=500, detail="文件保存失败") from exc
+
+    bot_scope = bot_manager._metadata_scope(bot_id, user_id=user.subject, bot=bot)
+    reserved = bot_manager.metadata_store.reserve_file_slot(
+        reservation_id=file_id,
+        bot_id=bot_id,
+        max_files=MAX_AGENT_FILES_PER_BOT,
+        **bot_scope,
+    )
+    if not reserved:
+        _write_agent_audit(
+            user,
+            action="agent.file.upload",
+            bot_id=bot_id,
+            outcome="REJECTED",
+            metadata={"file_id": file_id, "reason": "file_count_limit"},
+        )
+        raise HTTPException(status_code=413, detail="该智能体文件数量已达到上限，请先清理旧文件")
+
+    try:
+        with open(saved_path, "wb") as f:
+            f.write(content)
+    except OSError as exc:
+        bot_manager.metadata_store.release_file_slot(file_id, **bot_scope)
+        _write_agent_audit(
+            user,
+            action="agent.file.upload",
+            bot_id=bot_id,
+            outcome="FAILED",
+            metadata={"file_id": file_id, "reason": "file_write", "error_type": type(exc).__name__},
+        )
+        raise HTTPException(status_code=500, detail="文件保存失败") from exc
 
     try:
         parsed = await run_in_threadpool(parse_file_summary, saved_path, safe_name)
     except Exception as exc:
         with suppress(OSError):
             os.remove(saved_path)
+        bot_manager.metadata_store.release_file_slot(file_id, **bot_scope)
+        _write_agent_audit(
+            user,
+            action="agent.file.upload",
+            bot_id=bot_id,
+            outcome="FAILED",
+            metadata={"file_id": file_id, "reason": "parse", "error_type": type(exc).__name__},
+        )
         raise HTTPException(status_code=422, detail="文件解析失败") from exc
+    if parsed.get("error") == "pdf_page_limit":
+        with suppress(OSError):
+            os.remove(saved_path)
+        bot_manager.metadata_store.release_file_slot(file_id, **bot_scope)
+        _write_agent_audit(
+            user,
+            action="agent.file.upload",
+            bot_id=bot_id,
+            outcome="REJECTED",
+            metadata={"file_id": file_id, "reason": "pdf_page_limit"},
+        )
+        raise HTTPException(status_code=422, detail=parsed.get("error_detail", "PDF 页数超过安全上限"))
+    try:
+        content_sha256 = hashlib.sha256(content).hexdigest()
+        bot_manager.register_bot_file(
+            bot_id,
+            file_id=file_id,
+            original_name=safe_name,
+            stored_name=saved_name,
+            content_type=file.content_type,
+            size_bytes=len(content),
+            sha256=content_sha256,
+            user_id=user.subject,
+        )
+    except Exception as exc:
+        with suppress(OSError):
+            os.remove(saved_path)
+        bot_manager.metadata_store.release_file_slot(file_id, **bot_scope)
+        _write_agent_audit(
+            user,
+            action="agent.file.upload",
+            bot_id=bot_id,
+            outcome="FAILED",
+            metadata={"file_id": file_id, "reason": "metadata", "error_type": type(exc).__name__},
+        )
+        raise HTTPException(status_code=500, detail="文件元数据写入失败") from exc
+    _write_agent_audit(
+        user,
+        action="agent.file.upload",
+        bot_id=bot_id,
+        metadata={
+            "file_id": file_id,
+            "size_bytes": len(content),
+            "sha256": content_sha256,
+            "original_name": safe_name,
+        },
+    )
     file_url = f"/api/agent/bots/{bot_id}/files/{saved_name}"
 
     data_url = None
@@ -1350,7 +1582,33 @@ def get_bot_file(bot_id: str, filename: str, download: bool = Query(default=Fals
             return None
         return candidate if os.path.isfile(candidate) else None
 
-    file_path = confined_file_path(safe_filename)
+    file_path = None
+    bot_metadata = bot_manager.get_bot(bot_id)
+    file_scope = bot_manager._metadata_scope(bot_id, bot=bot_metadata)
+    metadata_record = bot_manager.metadata_store.find_file(
+        bot_id,
+        safe_filename,
+        **file_scope,
+    )
+    if metadata_record:
+        file_path = confined_file_path(str(metadata_record["stored_name"]))
+        if file_path is None:
+            raise HTTPException(status_code=404, detail="文件不存在或完整性校验失败")
+        try:
+            if int(metadata_record.get("size_bytes") or 0) != os.path.getsize(file_path):
+                raise HTTPException(status_code=404, detail="文件不存在或完整性校验失败")
+            expected_sha256 = str(metadata_record.get("sha256") or "")
+            if expected_sha256:
+                digest = hashlib.sha256()
+                with open(file_path, "rb") as verified_file:
+                    for chunk in iter(lambda: verified_file.read(1024 * 1024), b""):
+                        digest.update(chunk)
+                if digest.hexdigest() != expected_sha256:
+                    raise HTTPException(status_code=404, detail="文件不存在或完整性校验失败")
+        except OSError as exc:
+            raise HTTPException(status_code=404, detail="文件不存在或完整性校验失败") from exc
+    else:
+        file_path = confined_file_path(safe_filename)
 
     # 1. 尝试直接路径匹配
     if file_path is None:
@@ -1459,9 +1717,32 @@ def list_bot_files(bot_id: str, user: CurrentUser = Depends(current_user)):
 @router.delete("/bots/{bot_id}/files/{filename}", dependencies=[Depends(require_bot_access)])
 def delete_bot_file(bot_id: str, filename: str, user: CurrentUser = Depends(current_user)):
     """删除智能体文件中心里的单个文件"""
-    ok = bot_manager.delete_bot_file(bot_id, filename, user_id=user.subject)
+    try:
+        ok = bot_manager.delete_bot_file(bot_id, filename, user_id=user.subject)
+    except Exception as exc:
+        _write_agent_audit(
+            user,
+            action="agent.file.delete",
+            bot_id=bot_id,
+            outcome="FAILED",
+            metadata={"filename": os.path.basename(filename), "error_type": type(exc).__name__},
+        )
+        raise
     if not ok:
+        _write_agent_audit(
+            user,
+            action="agent.file.delete",
+            bot_id=bot_id,
+            outcome="REJECTED",
+            metadata={"filename": os.path.basename(filename), "reason": "not_found"},
+        )
         raise HTTPException(status_code=404, detail="文件不存在或删除失败")
+    _write_agent_audit(
+        user,
+        action="agent.file.delete",
+        bot_id=bot_id,
+        metadata={"filename": os.path.basename(filename)},
+    )
     return {"success": True}
 
 
@@ -1477,7 +1758,10 @@ def _unique_archive_name(clean_name: str, used_names: set[str]) -> str:
 
 
 @router.get("/bots/{bot_id}/files-export", dependencies=[Depends(require_bot_access)])
-def export_all_bot_files(bot_id: str):
+def export_all_bot_files(
+    bot_id: str,
+    user: CurrentUser = Depends(current_user),
+):
     """一键打包下载智能体所有产出物与文件（ZIP 压缩流）"""
     import tempfile
     import zipfile
@@ -1518,6 +1802,13 @@ def export_all_bot_files(bot_id: str):
         export_files.append((fn, fp, size))
         total_bytes += size
     if not export_files:
+        _write_agent_audit(
+            user,
+            action="agent.file.export",
+            bot_id=bot_id,
+            outcome="REJECTED",
+            metadata={"reason": "no_exportable_files"},
+        )
         raise HTTPException(status_code=404, detail="该智能体当前暂无可导出的普通文件")
 
     # Build the ZIP on disk so a large archive does not occupy one contiguous
@@ -1544,6 +1835,13 @@ def export_all_bot_files(bot_id: str):
             tmp.close()
         with suppress(OSError):
             os.remove(tmp_path)
+        _write_agent_audit(
+            user,
+            action="agent.file.export",
+            bot_id=bot_id,
+            outcome="FAILED",
+            metadata={"reason": "archive_build"},
+        )
         raise
     finally:
         with suppress(OSError):
@@ -1560,6 +1858,24 @@ def export_all_bot_files(bot_id: str):
                     if not chunk:
                         break
                     yield chunk
+            _write_agent_audit(
+                user,
+                action="agent.file.export",
+                bot_id=bot_id,
+                metadata={
+                    "file_count": len(export_files),
+                    "size_bytes": total_bytes,
+                },
+            )
+        except Exception as exc:
+            _write_agent_audit(
+                user,
+                action="agent.file.export",
+                bot_id=bot_id,
+                outcome="FAILED",
+                metadata={"error_type": type(exc).__name__},
+            )
+            raise
         finally:
             with suppress(OSError):
                 os.remove(tmp_path)
@@ -1576,7 +1892,12 @@ def export_all_bot_files(bot_id: str):
 @router.get("/bots/{bot_id}/active-run", dependencies=[Depends(require_bot_access)])
 def get_bot_active_run(bot_id: str, user: CurrentUser = Depends(current_user)):
     """查询指定智能体当前是否有正在进行的会话任务（用于页面刷新状态恢复）"""
-    run = agent_run_manager.get_active_run(bot_id, user.subject)
+    run = agent_run_manager.get_active_run(
+        bot_id,
+        user.subject,
+        user.issuer,
+        user.tenant_id,
+    )
     if not run:
         return {"has_active_run": False, "run": None}
     return {"has_active_run": True, "run": run.to_dict()}
@@ -1612,6 +1933,8 @@ async def chat_with_bot_stream(bot_id: str, payload: ChatPayload, user: CurrentU
         user_id=user.subject,
         is_admin=user.is_admin,
         is_operator=user.is_operator,
+        issuer=user.issuer,
+        tenant_id=user.tenant_id,
     )
     return _stream_run_sse(run)
 
@@ -1644,6 +1967,8 @@ async def regenerate_bot_stream(bot_id: str, user: CurrentUser = Depends(current
         user_id=user.subject,
         is_admin=user.is_admin,
         is_operator=user.is_operator,
+        issuer=user.issuer,
+        tenant_id=user.tenant_id,
     )
     return _stream_run_sse(run)
 
@@ -1660,7 +1985,12 @@ def truncate_bot_history(bot_id: str, payload: TruncateHistoryPayload, user: Cur
 @router.get("/bots/{bot_id}/chat/stream", dependencies=[Depends(require_bot_access)])
 async def resume_chat_stream(bot_id: str, user: CurrentUser = Depends(current_user)):
     """断线恢复流：重连当前正在进行中的会话流"""
-    run = agent_run_manager.get_active_run(bot_id, user.subject)
+    run = agent_run_manager.get_active_run(
+        bot_id,
+        user.subject,
+        user.issuer,
+        user.tenant_id,
+    )
     if not run:
         raise HTTPException(status_code=404, detail="当前无进行中的会话任务")
     return _stream_run_sse(run)
@@ -1669,14 +1999,26 @@ async def resume_chat_stream(bot_id: str, user: CurrentUser = Depends(current_us
 @router.post("/bots/{bot_id}/stop", dependencies=[Depends(require_bot_access)])
 def stop_bot_chat(bot_id: str, user: CurrentUser = Depends(current_user)):
     """中断当前正在执行的会话任务"""
-    stopped = agent_run_manager.stop_run(bot_id, user.subject)
+    stopped = agent_run_manager.stop_run(
+        bot_id,
+        user.subject,
+        user.issuer,
+        user.tenant_id,
+    )
     return {"success": stopped}
 
 
 @router.post("/bots/{bot_id}/approvals/{approval_id}", dependencies=[Depends(require_bot_access), Depends(require_operator)])
 def resolve_bot_approval(bot_id: str, approval_id: str, payload: ApprovalDecisionPayload, user: CurrentUser = Depends(require_operator)):
     """为指定智能体高危破坏性操作提交人机协同授权决策 (approve 或 reject)"""
-    ok = agent_run_manager.resolve_approval(bot_id, approval_id, payload.decision, user.subject)
+    ok = agent_run_manager.resolve_approval(
+        bot_id,
+        approval_id,
+        payload.decision,
+        user.subject,
+        user.issuer,
+        user.tenant_id,
+    )
     if not ok:
         raise HTTPException(status_code=404, detail="未找到对应的待审批高危操作或已超时关闭")
     return {"success": True, "approval_id": approval_id, "decision": payload.decision}
@@ -2253,6 +2595,11 @@ async def upload_bot_knowledge_doc(
     bot = bot_manager.get_bot(bot_id)
     if not bot:
         raise HTTPException(status_code=404, detail="BOT 不存在")
+    if bot.visibility == "public":
+        raise HTTPException(
+            status_code=403,
+            detail="公共 BOT 不允许挂载企业私有知识库，请改用私有 BOT",
+        )
 
     filename = file.filename or "unknown_doc.txt"
     extension = os.path.splitext(filename)[1].lower()

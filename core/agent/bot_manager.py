@@ -10,12 +10,26 @@ import time
 import uuid
 import weakref
 from collections import deque
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import unquote
 
-from core.runtime_context import runtime_user_id
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows keeps the thread lock fallback
+    fcntl = None
+
+from core.runtime_context import runtime_auth_scope, runtime_user_id
+from core.persistence import (
+    SqliteAppSettingsStore,
+    SqliteAuditStore,
+    SqliteBotMetadataStore,
+    SqliteOrchestrationStore,
+    _sanitize_audit_metadata,
+    database_path as resolve_database_path,
+)
+from core.file_storage import atomic_write_json
 
 from .constants import HIGH_RISK_API_KEYWORDS
 from .file_parser import format_file_size, get_file_category_and_type
@@ -34,6 +48,10 @@ MAX_HISTORY_METADATA_BYTES = 2 * 1024 * 1024
 MAX_HISTORY_TOTAL_BYTES = 32 * 1024 * 1024
 MAX_RUNTIME_FILES = 1000
 MAX_RUNTIME_TOTAL_FILE_BYTES = 512 * 1024 * 1024
+
+
+class BotIdConflict(ValueError):
+    """A concurrent creator already claimed the globally unique BOT ID."""
 
 
 def _truncate_history_text(value: Any, limit: int = MAX_HISTORY_MESSAGE_BYTES) -> str:
@@ -110,14 +128,32 @@ def _atomic_dump_json(filepath: str, data: Any, indent: int = 2, default: Any | 
 class BotManager:
     def __init__(self, data_dir: str | None = None):
         base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-        self.data_dir = data_dir or os.path.join(base_dir, "data")
+        explicit_data_dir = data_dir is not None
+        self.data_dir = data_dir or os.environ.get("TIM_DATA_DIR") or os.path.join(base_dir, "data")
         self.bots_dir = os.path.join(self.data_dir, "bots")
         self.llm_config_path = os.path.join(self.data_dir, "llm_config.json")
+        database_target = (
+            os.path.join(self.data_dir, "tim.sqlite3")
+            if explicit_data_dir
+            else resolve_database_path()
+        )
+        self.database_path = resolve_database_path(database_target)
+        self.metadata_store = SqliteBotMetadataStore(self.database_path)
+        self.settings_store = SqliteAppSettingsStore(self.database_path)
+        self.audit_store = SqliteAuditStore(self.database_path)
+        self.orchestration_store = SqliteOrchestrationStore(self.database_path)
         self._lock = threading.RLock()
         # Locks are per runtime path; weak values avoid retaining one lock for
         # every short-lived authenticated session forever.
         self._history_locks: weakref.WeakValueDictionary[str, threading.RLock] = weakref.WeakValueDictionary()
-        os.makedirs(self.bots_dir, exist_ok=True)  # pi-lens-ignore: unchecked-throwing-call-python -- persistence boundary
+        self._history_file_lock_state = threading.local()
+        os.makedirs(self.data_dir, mode=0o700, exist_ok=True)  # pi-lens-ignore: unchecked-throwing-call-python -- persistence boundary
+        os.chmod(self.data_dir, 0o700)
+        os.makedirs(self.bots_dir, mode=0o700, exist_ok=True)  # pi-lens-ignore: unchecked-throwing-call-python -- persistence boundary
+        os.chmod(self.bots_dir, 0o700)
+        if os.path.exists(self.llm_config_path):
+            with suppress(OSError):
+                os.chmod(self.llm_config_path, 0o600)
         self._ensure_default_bot()
 
     # -------------------------------------------------------------
@@ -126,6 +162,8 @@ class BotManager:
     def get_llm_config(self) -> LLMConfig:
         if os.path.exists(self.llm_config_path):
             try:
+                with suppress(OSError):
+                    os.chmod(self.llm_config_path, 0o600)
                 with open(self.llm_config_path, "r", encoding="utf-8") as f:
                     data = json.load(f)
                     return LLMConfig(**data)
@@ -135,7 +173,15 @@ class BotManager:
 
     def save_llm_config(self, config: LLMConfig):
         with self._lock:
-            _atomic_dump_json(self.llm_config_path, config.model_dump())
+            # The API key stays in a 0600 file, but the publication itself
+            # must still serialize across independent local processes.
+            atomic_write_json(
+                self.llm_config_path,
+                config.model_dump(),
+                mode=0o600,
+            )
+            with suppress(OSError):
+                os.chmod(self.llm_config_path, 0o600)
 
     def get_masked_llm_config(self) -> dict[str, Any]:
         cfg = self.get_llm_config().model_dump()
@@ -156,25 +202,85 @@ class BotManager:
     # 安全基线与高危操作审计规则
     # -------------------------------------------------------------
     def get_high_risk_keywords(self) -> list[str]:
-        """获取当前配置的高危接口关键词列表"""
+        """读取共享的高危接口规则，SQLite 是运行期事实源。"""
+        setting = self.settings_store.get("security.high_risk_keywords")
+        if setting is not None:
+            keywords = setting.get("value")
+            if isinstance(keywords, list) and keywords:
+                return list(
+                    dict.fromkeys(
+                        str(keyword).strip().lower()
+                        for keyword in keywords
+                        if str(keyword).strip()
+                    )
+                )
+
+        # 旧 JSON 只做一次兼容导入，不再作为后续多进程读取源。
         sec_path = os.path.join(self.data_dir, "security_config.json")
         if os.path.exists(sec_path):
             try:
+                with suppress(OSError):
+                    os.chmod(sec_path, 0o600)
                 with open(sec_path, "r", encoding="utf-8") as f:
                     data = json.load(f)
-                    kws = data.get("high_risk_keywords")
-                    if isinstance(kws, list) and kws:
-                        return [str(k).strip().lower() for k in kws if str(k).strip()]
+                kws = data.get("high_risk_keywords") if isinstance(data, dict) else None
+                if isinstance(kws, list) and kws:
+                    clean_kws = list(
+                        dict.fromkeys(
+                            str(keyword).strip().lower()
+                            for keyword in kws
+                            if str(keyword).strip()
+                        )
+                    )
+                    self.settings_store.set(
+                        "security.high_risk_keywords",
+                        clean_kws,
+                        updated_by="legacy-security-config",
+                    )
+                    return clean_kws
             except Exception:
                 pass
         return list(HIGH_RISK_API_KEYWORDS)
 
-    def set_high_risk_keywords(self, keywords: list[str]) -> list[str]:
-        """保存自定义高危接口关键词列表"""
+    def set_high_risk_keywords(
+        self,
+        keywords: list[str],
+        *,
+        actor_subject: str = "",
+        issuer: str = "",
+        tenant_id: str = "",
+    ) -> list[str]:
+        """事务化保存共享高危接口规则并记录审计事件。"""
         with self._lock:
-            sec_path = os.path.join(self.data_dir, "security_config.json")
-            clean_kws = list(dict.fromkeys([str(k).strip().lower() for k in keywords if str(k).strip()]))
-            _atomic_dump_json(sec_path, {"high_risk_keywords": clean_kws})
+            clean_kws = list(
+                dict.fromkeys(
+                    str(keyword).strip().lower()
+                    for keyword in keywords
+                    if str(keyword).strip()
+                )
+            )
+            setting = self.settings_store.set(
+                "security.high_risk_keywords",
+                clean_kws,
+                # The current rule is process-wide/global. The authenticated
+                # scope is recorded in the audit event; it must not make the
+                # rule invisible to the unscoped enforcement path.
+                issuer="",
+                tenant_id="",
+                updated_by=actor_subject,
+            )
+            self.audit_store.append(
+                action="security.high_risk_keywords.update",
+                resource_type="app_setting",
+                resource_id="security.high_risk_keywords",
+                actor_subject=actor_subject,
+                issuer=issuer,
+                tenant_id=tenant_id,
+                metadata={
+                    "version": setting["version"],
+                    "keyword_count": len(clean_kws),
+                },
+            )
             return clean_kws
 
     # -------------------------------------------------------------
@@ -185,13 +291,105 @@ class BotManager:
         clean_id = re.sub(r"[^a-zA-Z0-9_\-]", "_", bot_id)
         return os.path.join(self.bots_dir, clean_id)
 
+    def _metadata_scope(
+        self,
+        bot_id: str,
+        user_id: str | None = None,
+        bot: BotConfig | None = None,
+    ) -> dict[str, str]:
+        """Resolve the SQLite scope for the current BOT and identity."""
+        bot = bot or self.get_bot(bot_id)
+        effective_user_id = runtime_user_id.get() if user_id is None else str(user_id)
+        if bot and bot.visibility == "public":
+            owner_subject = "" if effective_user_id == "local" else effective_user_id
+            active_scope = runtime_auth_scope.get()
+            return {
+                "issuer": active_scope.issuer,
+                "tenant_id": active_scope.tenant_id,
+                "owner_subject": owner_subject,
+            }
+        if not bot:
+            return {"issuer": "", "tenant_id": "", "owner_subject": ""}
+        active_scope = runtime_auth_scope.get()
+        bot_issuer = str(getattr(bot, "issuer", "") or "")
+        bot_tenant = str(getattr(bot, "tenant_id", "") or "")
+        if (
+            (bot_issuer or bot_tenant)
+            and (
+                active_scope.issuer != bot_issuer
+                or active_scope.tenant_id != bot_tenant
+            )
+        ):
+            # Keep internal callers fail-closed even when an API dependency
+            # was bypassed: a different tenant must resolve an empty scope.
+            return {
+                "issuer": active_scope.issuer,
+                "tenant_id": active_scope.tenant_id,
+                "owner_subject": (
+                    "" if effective_user_id == "local" else effective_user_id
+                ),
+            }
+        return {
+            "issuer": bot_issuer,
+            "tenant_id": bot_tenant,
+            "owner_subject": str(bot.owner_id or ""),
+        }
+
+    @staticmethod
+    def bot_scope_matches(
+        bot: BotConfig,
+        *,
+        issuer: str = "",
+        tenant_id: str = "",
+    ) -> bool:
+        """Return whether a BOT definition belongs to the authenticated scope."""
+        bot_issuer = str(getattr(bot, "issuer", "") or "")
+        bot_tenant = str(getattr(bot, "tenant_id", "") or "")
+        # Built-in public BOTs created before tenant scoping are global
+        # definitions. Their mutable state remains requester-partitioned.
+        if bot.visibility == "public" and not bot_issuer and not bot_tenant:
+            return True
+        return bot_issuer == str(issuer or "") and bot_tenant == str(tenant_id or "")
+
+    def _legacy_bot_data(self, bot_id: str) -> dict[str, Any] | None:
+        bot_json = os.path.join(self._bot_dir(bot_id), "bot.json")
+        if not os.path.isfile(bot_json):
+            return None
+        try:
+            with open(bot_json, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, dict) or not data.get("id"):
+                return None
+            safe_data = _sanitize_audit_metadata(data)
+            # A JSON read is a one-way compatibility import.  Once the row
+            # exists, future reads never consult this file again.
+            self.metadata_store.upsert_bot(
+                {
+                    "bot_id": str(safe_data["id"]),
+                    "issuer": str(safe_data.get("issuer") or ""),
+                    "tenant_id": str(safe_data.get("tenant_id") or ""),
+                    "owner_subject": safe_data.get("owner_id"),
+                    "visibility": safe_data.get("visibility") or "private",
+                    "definition": safe_data,
+                    "created_at": safe_data.get("created_at"),
+                    "updated_at": safe_data.get("updated_at"),
+                }
+            )
+            return safe_data
+        except Exception:
+            return None
+
     def _runtime_dir(self, bot_id: str, user_id: str | None = None) -> str:
         """Return per-user mutable state directory for public Bots."""
         bot_dir = self._bot_dir(bot_id)
         bot = self.get_bot(bot_id)
-        effective_user_id = user_id or runtime_user_id.get()
+        effective_user_id = runtime_user_id.get() if user_id is None else str(user_id)
         if bot and bot.visibility == "public" and effective_user_id != "local":
-            partition = hashlib.sha256(effective_user_id.encode("utf-8")).hexdigest()[:24]
+            active_scope = runtime_auth_scope.get()
+            identity = "\0".join(
+                (active_scope.issuer, active_scope.tenant_id, effective_user_id)
+            )
+            partition = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
             return os.path.join(bot_dir, "users", partition)
         return bot_dir
 
@@ -214,6 +412,39 @@ class BotManager:
                 lock = threading.RLock()
                 self._history_locks[key] = lock
             return lock
+
+    @contextmanager
+    def _history_storage_lock(self, bot_id: str, user_id: str | None = None):
+        """Serialize one history stream across threads and OS processes."""
+        runtime_dir = os.path.abspath(self._runtime_dir(bot_id, user_id))
+        os.makedirs(runtime_dir, mode=0o700, exist_ok=True)
+        with suppress(OSError):
+            os.chmod(runtime_dir, 0o700)
+
+        thread_lock = self._history_session_lock(bot_id, user_id)
+        lock_key = runtime_dir
+        held = getattr(self._history_file_lock_state, "held", set())
+        with thread_lock:
+            if lock_key in held or fcntl is None:
+                yield
+                return
+
+            lock_path = os.path.join(runtime_dir, ".history.lock")
+            with open(lock_path, "a+", encoding="utf-8") as lock_file:
+                with suppress(OSError):
+                    os.chmod(lock_path, 0o600)
+                try:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+                except OSError as exc:
+                    raise RuntimeError(f"无法获取历史文件锁: {lock_path}") from exc
+                held.add(lock_key)
+                self._history_file_lock_state.held = held
+                try:
+                    yield
+                finally:
+                    held.discard(lock_key)
+                    with suppress(OSError):
+                        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
     def _rebuild_history_index_unlocked(self, jsonl_path: str, index_path: str | None = None) -> None:
         index_path = index_path or f"{jsonl_path}.idx"
@@ -465,21 +696,118 @@ class BotManager:
                 return {"history": [], "total": 0, "has_more": False}
         return {"history": page, "total": total, "has_more": start > 0}
 
+    def _read_legacy_history_unlocked(
+        self,
+        bot_id: str,
+        limit: int,
+        before_id: str | None = None,
+        user_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Read a legacy snapshot without making it the live write target."""
+        jsonl_path = self._history_jsonl_path(bot_id, user_id)
+        if os.path.isfile(jsonl_path):
+            return self._read_history_jsonl_unlocked(jsonl_path, limit, before_id)
+
+        hist_path = self._history_path(bot_id, user_id)
+        if not os.path.isfile(hist_path):
+            return {"history": [], "total": 0, "has_more": False}
+        try:
+            if os.path.getsize(hist_path) > MAX_HISTORY_TOTAL_BYTES:
+                return {
+                    "history": [],
+                    "total": 0,
+                    "has_more": False,
+                    "truncated": True,
+                }
+            with open(hist_path, "r", encoding="utf-8") as f:
+                raw_history = json.load(f)
+        except Exception:
+            return {"history": [], "total": 0, "has_more": False}
+        if not isinstance(raw_history, list):
+            return {"history": [], "total": 0, "has_more": False}
+        history = [item for item in raw_history if isinstance(item, dict)]
+        total = len(history)
+        page_limit = max(1, int(limit))
+        if before_id:
+            target = next(
+                (index for index, item in enumerate(history) if item.get("id") == before_id),
+                -1,
+            )
+            if target <= 0:
+                return {"history": [], "total": total, "has_more": False}
+            start = max(0, target - page_limit)
+            return {
+                "history": history[start:target],
+                "total": total,
+                "has_more": start > 0,
+            }
+        start = max(0, total - page_limit)
+        return {
+            "history": history[start:],
+            "total": total,
+            "has_more": start > 0,
+        }
+
+    def _migrate_legacy_history_if_needed(
+        self,
+        bot_id: str,
+        *,
+        user_id: str | None = None,
+    ) -> dict[str, str]:
+        bot = self.get_bot(bot_id)
+        scope = self._metadata_scope(bot_id, user_id=user_id, bot=bot)
+        current = self.metadata_store.read_conversation(
+            bot_id=bot_id,
+            limit=1,
+            **scope,
+        )
+        if current.get("storage_exists"):
+            return scope
+
+        legacy = self._read_legacy_history_unlocked(
+            bot_id,
+            limit=5000,
+            user_id=user_id,
+        )
+        messages = legacy.get("history") or []
+        if messages:
+            self.metadata_store.replace_conversation(
+                session_id=self.metadata_store.session_id(bot_id, **scope),
+                bot_id=bot_id,
+                messages=messages,
+                **scope,
+            )
+        return scope
+
     def _uploads_dir(self, bot_id: str, user_id: str | None = None) -> str:
         return os.path.join(self._runtime_dir(bot_id, user_id), "uploads")
 
     def ensure_legacy_state(self, bot_id: str, user_id: str | None = None) -> None:
-        """Lazily inherit pre-auth public BOT state into the user's partition.
+        """Keep pre-auth public BOT state quarantined.
 
-        Before authentication was enabled, public BOT history and uploaded files
-        lived directly under the BOT directory.  Authenticated requests use an
-        isolated ``users/<hash>`` directory, so copy the legacy state on first
-        access.  The legacy directory is never used as a live fallback and is
-        left intact, making this operation idempotent and preserving local-mode
-        compatibility.
+        The old root directory may contain data created before user
+        authentication existed.  Its owner cannot be proven from the files, so
+        authenticated requests must never copy it into a user's partition.
+        This compatibility hook intentionally does nothing; local mode still
+        reads the legacy root through ``_runtime_dir``.
         """
+        return
+
+    def migrate_legacy_state(self, bot_id: str, target_user_id: str) -> None:
+        """Explicitly migrate legacy state for an administrator-led operation.
+
+        Regular request paths never call this method.  A future administrative
+        migration workflow must provide the concrete destination subject so the
+        old data is assigned deliberately rather than inherited by every user.
+        """
+        if not target_user_id or target_user_id == "local":
+            raise ValueError("迁移旧版 BOT 数据必须指定明确的用户 subject")
+        self._migrate_legacy_state_to_user(bot_id, target_user_id)
+
+    def _migrate_legacy_state_to_user(self, bot_id: str, user_id: str | None = None) -> None:
+        """Copy quarantined pre-auth state only for an explicit destination."""
         bot = self.get_bot(bot_id)
-        effective_user_id = user_id or runtime_user_id.get()
+        effective_user_id = runtime_user_id.get() if user_id is None else str(user_id)
         if not bot or bot.visibility != "public" or effective_user_id == "local":
             return
 
@@ -489,12 +817,15 @@ class BotManager:
             return
 
         legacy_history = os.path.join(bot_dir, "history.json")
-        target_history = os.path.join(partition_dir, "history.json")
         legacy_memory = os.path.join(bot_dir, "memory.json")
-        target_memory = os.path.join(partition_dir, "memory.json")
         legacy_uploads = os.path.join(bot_dir, "uploads")
         target_uploads = os.path.join(partition_dir, "uploads")
         migration_marker = os.path.join(partition_dir, ".legacy_state_migrated")
+        scope = self._metadata_scope(
+            bot_id,
+            user_id=effective_user_id,
+            bot=bot,
+        )
 
         with self._lock:
             if os.path.exists(migration_marker):
@@ -507,10 +838,10 @@ class BotManager:
             if not legacy_state_exists:
                 return
 
-            # A target history file is treated as an explicit user state (even
-            # when it contains []).  Never overwrite or merge it with legacy
-            # messages after that point.
-            if os.path.isfile(legacy_history) and not os.path.exists(target_history):
+            # The explicit migration target is now a SQLite scope.  Do not
+            # create new history.json/memory.json files for the target user;
+            # those files were the old structured metadata format.
+            if os.path.isfile(legacy_history):
                 try:
                     with open(legacy_history, "r", encoding="utf-8") as f:
                         history = json.load(f)
@@ -523,27 +854,47 @@ class BotManager:
                             bounded["content"] = _truncate_history_text(bounded.get("content"))
                             bounded["metadata"] = _bound_history_metadata(bounded.get("metadata"))
                             bounded_history.append(bounded)
-                        _atomic_dump_json(target_history, _trim_history_to_budget(bounded_history), default=str)
+                        bounded_history = _trim_history_to_budget(bounded_history)
+                        target_history = self.metadata_store.read_conversation(
+                            bot_id=bot_id,
+                            limit=1,
+                            **scope,
+                        )
+                        if bounded_history and not target_history.get("storage_exists"):
+                            self.metadata_store.replace_conversation(
+                                session_id=self.metadata_store.session_id(
+                                    bot_id,
+                                    **scope,
+                                ),
+                                bot_id=bot_id,
+                                messages=bounded_history,
+                                **scope,
+                            )
                 except (OSError, ValueError, TypeError):
                     # A corrupt legacy file must not make an authenticated BOT
                     # unusable; the normal empty-history path will recover.
                     pass
 
-            # Long-term facts were also stored in the legacy runtime directory.
-            # Preserve a valid snapshot for each user without merging later
-            # user-specific updates into another user's partition.
-            if os.path.isfile(legacy_memory) and not os.path.exists(target_memory):
+            if os.path.isfile(legacy_memory):
                 try:
                     with open(legacy_memory, "r", encoding="utf-8") as f:
                         memories = json.load(f)
                     if isinstance(memories, list):
-                        _atomic_dump_json(target_memory, memories, default=str)
+                        if not self.metadata_store.has_memory_scope(bot_id, **scope):
+                            for item in memories:
+                                if isinstance(item, dict):
+                                    self.metadata_store.upsert_memory(
+                                        bot_id=bot_id,
+                                        memory=item,
+                                        **scope,
+                                    )
                 except (OSError, ValueError, TypeError):
                     pass
 
             if os.path.isdir(legacy_uploads):
                 try:
                     os.makedirs(target_uploads, exist_ok=True)
+                    os.chmod(target_uploads, 0o700)
                     copied_count = 0
                     copied_bytes = 0
                     for filename in os.listdir(legacy_uploads):
@@ -554,19 +905,52 @@ class BotManager:
                         if os.path.islink(source) or not os.path.isfile(source):
                             continue
                         if os.path.exists(target):
-                            continue
+                            copied_size = os.path.getsize(target)
+                        else:
+                            try:
+                                source_size = os.path.getsize(source)
+                            except OSError:
+                                continue
+                            if copied_count >= MAX_RUNTIME_FILES or copied_bytes + source_size > MAX_RUNTIME_TOTAL_FILE_BYTES:
+                                break
+                            try:
+                                shutil.copy2(source, target)
+                                copied_count += 1
+                                copied_bytes += source_size
+                            except OSError:
+                                continue
+                            copied_size = source_size
                         try:
-                            source_size = os.path.getsize(source)
+                            digest = hashlib.sha256()
+                            with open(target, "rb") as target_file:
+                                for chunk in iter(lambda: target_file.read(1024 * 1024), b""):
+                                    digest.update(chunk)
+                            stat = os.stat(target)
                         except OSError:
                             continue
-                        if copied_count >= MAX_RUNTIME_FILES or copied_bytes + source_size > MAX_RUNTIME_TOTAL_FILE_BYTES:
-                            break
-                        try:
-                            shutil.copy2(source, target)
-                            copied_count += 1
-                            copied_bytes += source_size
-                        except OSError:
-                            continue
+                        file_id = hashlib.sha256(
+                            (
+                                f"{bot_id}|{scope['issuer']}|{scope['tenant_id']}|"
+                                f"{scope['owner_subject']}|{filename}|{digest.hexdigest()}"
+                            ).encode("utf-8")
+                        ).hexdigest()[:32]
+                        relative_target = os.path.relpath(target, self.data_dir).replace(
+                            os.sep,
+                            "/",
+                        )
+                        self.metadata_store.upsert_file(
+                            {
+                                "file_id": file_id,
+                                "bot_id": bot_id,
+                                "blob_uri": f"local://{relative_target}",
+                                "original_name": re.sub(r"^f_\d+_", "", filename),
+                                "stored_name": filename,
+                                "content_type": None,
+                                "size_bytes": int(stat.st_size or copied_size),
+                                "sha256": digest.hexdigest(),
+                                **scope,
+                            }
+                        )
                 except OSError:
                     pass
 
@@ -595,101 +979,111 @@ class BotManager:
             "批量拉取活跃群组最近 20 条消息并导出 Excel 分析报表"
         ]
 
-        if not os.path.exists(path):
-            self.create_bot(
-                bot_id=default_id,
-                name=default_name,
-                avatar="🤖",
-                description=default_desc,
-                base_prompt=default_prompt,
-                suggested_prompts=default_prompts,
-                visibility="public",
-            )
+        if not self.get_bot(default_id):
+            try:
+                self.create_bot(
+                    bot_id=default_id,
+                    name=default_name,
+                    avatar="🤖",
+                    description=default_desc,
+                    base_prompt=default_prompt,
+                    suggested_prompts=default_prompts,
+                    visibility="public",
+                )
+            except BotIdConflict:
+                pass
         else:
-            # 升级已有 default_assistant 的描述与人设，平滑扩展多云业务，保留已有历史与记忆
-            bot_json = os.path.join(path, "bot.json")
-            if os.path.exists(bot_json):
-                try:
-                    with open(bot_json, "r", encoding="utf-8") as f:
-                        data = json.load(f)
-                    data["visibility"] = "public"
-                    if "166" in data.get("description", "") or "261" in data.get("description", "") or "IM (Instant Messaging)" in data.get("base_prompt", ""):
-                        data["name"] = default_name
-                        data["description"] = default_desc
-                        data["base_prompt"] = default_prompt
-                        data["suggested_prompts"] = default_prompts
-                    _atomic_dump_json(bot_json, data)
-                except Exception:
-                    pass
+            # 升级已有 default_assistant 的描述与人设，平滑扩展多云业务，
+            # 统一通过 SQLite 保存定义，旧 bot.json 只作为迁移源。
+            existing = self.get_bot(default_id)
+            if existing:
+                existing.visibility = "public"
+                if (
+                    "166" in existing.description
+                    or "261" in existing.description
+                    or "IM (Instant Messaging)" in existing.base_prompt
+                ):
+                    existing.name = default_name
+                    existing.description = default_desc
+                    existing.base_prompt = default_prompt
+                    existing.suggested_prompts = default_prompts
+                self.save_bot(existing)
 
         # 确保云直播专属巡检官内置就绪
         live_id = "css_live_operator"
         live_path = self._bot_dir(live_id)
-        if not os.path.exists(live_path):
-            self.create_bot(
-                bot_id=live_id,
-                name="云直播流媒体巡检官",
-                avatar="📡",
-                description="专精腾讯云直播 CSS 流状态巡检、混流布局配置、断流禁推熔断与音视频推拉流诊断",
-                base_prompt=(
-                    "你是一个专精腾讯云直播 (CSS) 核心业务与流媒体运维的专业智能体。\n"
-                    "你熟练掌握腾讯云直播 API 3.0 体系（包括流状态查询、推断流监控、录制转码规则、混流模版、鉴权防盗链及安全熔断）。\n"
-                    "在处理推断流与混流任务时，编写紧凑高效的 Python 代码直接调用 `live_call(action, payload)` 或 `cloud_call`，提取 Response 中的核心流媒体指标。\n"
-                    "对涉及断流 (DropLiveStream)、封禁推流 (ForbidLiveStream) 的操作，严格遵守防线原则，确保流名、域名与解禁时间精确无误。"
-                ),
-                suggested_prompts=[
-                    "巡检指定域名的所有在线直播流及其实时帧率",
-                    "对指定的异常推流执行 DropLiveStream 立即断流",
-                    "生成一套主辅画面画中画的通用混流参数 (CreateCommonMixStream)",
-                    "导出本月直播录制与转码规则配置清单"
-                ],
-                visibility="public",
-            )
+        if not self.get_bot(live_id):
+            try:
+                self.create_bot(
+                    bot_id=live_id,
+                    name="云直播流媒体巡检官",
+                    avatar="📡",
+                    description="专精腾讯云直播 CSS 流状态巡检、混流布局配置、断流禁推熔断与音视频推拉流诊断",
+                    base_prompt=(
+                        "你是一个专精腾讯云直播 (CSS) 核心业务与流媒体运维的专业智能体。\n"
+                        "你熟练掌握腾讯云直播 API 3.0 体系（包括流状态查询、推断流监控、录制转码规则、混流模版、鉴权防盗链及安全熔断）。\n"
+                        "在处理推断流与混流任务时，编写紧凑高效的 Python 代码直接调用 `live_call(action, payload)` 或 `cloud_call`，提取 Response 中的核心流媒体指标。\n"
+                        "对涉及断流 (DropLiveStream)、封禁推流 (ForbidLiveStream) 的操作，严格遵守防线原则，确保流名、域名与解禁时间精确无误。"
+                    ),
+                    suggested_prompts=[
+                        "巡检指定域名的所有在线直播流及其实时帧率",
+                        "对指定的异常推流执行 DropLiveStream 立即断流",
+                        "生成一套主辅画面画中画的通用混流参数 (CreateCommonMixStream)",
+                        "导出本月直播录制与转码规则配置清单"
+                    ],
+                    visibility="public",
+                )
+            except BotIdConflict:
+                pass
 
     def list_bots(self, user_id: str | None = None) -> list[dict[str, Any]]:
+        # Import old definitions only when the SQLite row is absent.  This
+        # keeps a pre-migration deployment usable without making JSON the live
+        # source after the first read.
+        if os.path.isdir(self.bots_dir):
+            for entry in os.listdir(self.bots_dir):  # pi-lens-ignore: unchecked-throwing-call-python -- persistence boundary
+                if self.metadata_store.get_bot(entry) is None:
+                    self._legacy_bot_data(entry)
+
         result = []
-        if not os.path.exists(self.bots_dir):
-            return result
-
-        for entry in os.listdir(self.bots_dir):  # pi-lens-ignore: unchecked-throwing-call-python -- persistence boundary
-            bot_path = os.path.join(self.bots_dir, entry)
-            bot_json = os.path.join(bot_path, "bot.json")
-            if os.path.isdir(bot_path) and os.path.exists(bot_json):
-                try:
-                    with open(bot_json, "r", encoding="utf-8") as f:
-                        data = json.load(f)
-                        # 统计资产数量
-                        self.ensure_legacy_state(entry, user_id)
-                        runtime_dir = self._runtime_dir(entry, user_id)
-                        skills_dir = os.path.join(bot_path, "skills")
-                        skills_count = len([f for f in os.listdir(skills_dir) if f.endswith(".json")]) if os.path.exists(skills_dir) else 0
-                        mem_path = os.path.join(runtime_dir, "memory.json")
-                        mem_count = 0
-                        if os.path.exists(mem_path):
-                            with open(mem_path, "r", encoding="utf-8") as mf:
-                                mem_count = len(json.load(mf))
-                        data["skills_count"] = skills_count
-                        data["memories_count"] = mem_count
-                        data["guidelines_count"] = len(data.get("learned_guidelines", []))
-
-                        uploads_dir = os.path.join(runtime_dir, "uploads")
-                        files_count = len([f for f in os.listdir(uploads_dir) if os.path.isfile(os.path.join(uploads_dir, f))]) if os.path.exists(uploads_dir) else 0
-                        data["files_count"] = files_count
-
-                        # 读取最近一条聊天记录 (微信/WhatsApp 风格会话列表摘要)
-                        last_message = None
-                        hist = self.get_history(entry, limit=1, user_id=user_id)
-                        if hist:
-                            last_item = hist[-1]
-                            last_message = {
-                                "role": last_item.get("role", "assistant"),
-                                "content": last_item.get("content", ""),
-                                "timestamp": last_item.get("timestamp", "")
-                            }
-                        data["last_message"] = last_message
-                        result.append(data)
-                except Exception:
+        active_scope = runtime_auth_scope.get()
+        for data in self.metadata_store.list_bots():
+            try:
+                entry = str(data.get("id") or "")
+                bot = BotConfig(**data)
+                if not self.bot_scope_matches(
+                    bot,
+                    issuer=active_scope.issuer,
+                    tenant_id=active_scope.tenant_id,
+                ):
                     continue
+                scope = self._metadata_scope(entry, user_id=user_id, bot=bot)
+                data = bot.model_dump()
+                data["skills_count"] = len(
+                    self.metadata_store.list_skills(entry, **scope)
+                )
+                data["memories_count"] = len(
+                    self.metadata_store.list_memories(entry, **scope)
+                )
+                data["guidelines_count"] = len(bot.learned_guidelines)
+                data["files_count"] = len(
+                    self.metadata_store.list_files(entry, **scope)
+                )
+
+                # 读取最近一条聊天记录 (微信/WhatsApp 风格会话列表摘要)
+                last_message = None
+                hist = self.get_history(entry, limit=1, user_id=user_id)
+                if hist:
+                    last_item = hist[-1]
+                    last_message = {
+                        "role": last_item.get("role", "assistant"),
+                        "content": last_item.get("content", ""),
+                        "timestamp": last_item.get("timestamp", "")
+                    }
+                data["last_message"] = last_message
+                result.append(data)
+            except Exception:
+                continue
 
         # 排序：默认智能体置顶，其余按最后聊天/更新时间倒序
         def get_sort_key(b):
@@ -868,12 +1262,12 @@ class BotManager:
         return fallback_prompts
 
     def get_bot(self, bot_id: str) -> BotConfig | None:
-        bot_json = os.path.join(self._bot_dir(bot_id), "bot.json")
-        if not os.path.exists(bot_json):
+        data = self.metadata_store.get_bot(bot_id)
+        if data is None:
+            data = self._legacy_bot_data(bot_id)
+        if not isinstance(data, dict):
             return None
         try:
-            with open(bot_json, "r", encoding="utf-8") as f:
-                data = json.load(f)
             if "base_prompt" in data:
                 cleaned = self.clean_prompt_text(data["base_prompt"])
                 if cleaned != data["base_prompt"]:
@@ -896,6 +1290,8 @@ class BotManager:
         model_override: dict | None = None,
         owner_id: str | None = None,
         visibility: str = "private",
+        issuer: str | None = None,
+        tenant_id: str | None = None,
     ) -> BotConfig:
         b_dir = self._bot_dir(bot_id)
         os.makedirs(b_dir, exist_ok=True)  # pi-lens-ignore: unchecked-throwing-call-python -- persistence boundary
@@ -905,6 +1301,7 @@ class BotManager:
         if not suggested_prompts:
             suggested_prompts = self.infer_suggested_prompts(name, description, cleaned_base_prompt)
 
+        active_scope = runtime_auth_scope.get()
         bot = BotConfig(
             id=bot_id,
             name=name,
@@ -914,16 +1311,28 @@ class BotManager:
             suggested_prompts=suggested_prompts,
             model_override=model_override,
             owner_id=owner_id,
+            issuer=active_scope.issuer if issuer is None else str(issuer or ""),
+            tenant_id=active_scope.tenant_id if tenant_id is None else str(tenant_id or ""),
             visibility=visibility,
         )
-        self.save_bot(bot)
-        # 初始化空记忆与历史
-        mem_path = os.path.join(b_dir, "memory.json")
-        if not os.path.exists(mem_path):
-            _atomic_dump_json(mem_path, [])
-        hist_path = os.path.join(b_dir, "history.json")
-        if not os.path.exists(hist_path):
-            _atomic_dump_json(hist_path, [])
+        with self._lock:
+            b_dir = self._bot_dir(bot.id)
+            os.makedirs(b_dir, exist_ok=True)  # pi-lens-ignore: unchecked-throwing-call-python -- persistence boundary
+            bot.updated_at = now_iso()
+            inserted = self.metadata_store.insert_bot(
+                {
+                    "bot_id": bot.id,
+                    "owner_subject": bot.owner_id,
+                    "issuer": bot.issuer,
+                    "tenant_id": bot.tenant_id,
+                    "visibility": bot.visibility,
+                    "definition": bot.model_dump(),
+                    "created_at": bot.created_at,
+                    "updated_at": bot.updated_at,
+                }
+            )
+            if not inserted:
+                raise BotIdConflict(f"BOT ID 已被其他创建请求占用: {bot.id}")
         return bot
 
     def save_bot(self, bot: BotConfig):
@@ -931,13 +1340,25 @@ class BotManager:
             b_dir = self._bot_dir(bot.id)
             os.makedirs(b_dir, exist_ok=True)  # pi-lens-ignore: unchecked-throwing-call-python -- persistence boundary
             bot.updated_at = now_iso()
-            _atomic_dump_json(os.path.join(b_dir, "bot.json"), bot.model_dump())
+            self.metadata_store.upsert_bot(
+                {
+                    "bot_id": bot.id,
+                    "owner_subject": bot.owner_id,
+                    "issuer": bot.issuer,
+                    "tenant_id": bot.tenant_id,
+                    "visibility": bot.visibility,
+                    "definition": bot.model_dump(),
+                    "created_at": bot.created_at,
+                    "updated_at": bot.updated_at,
+                }
+            )
 
     def delete_bot(self, bot_id: str) -> bool:
         if bot_id == "default_assistant":
             return False  # 保护默认 BOT
         with self._lock:
             b_dir = self._bot_dir(bot_id)
+            deleted = self.metadata_store.delete_bot(bot_id)
             if os.path.exists(b_dir):
                 shutil.rmtree(b_dir)  # pi-lens-ignore: unchecked-throwing-call-python -- persistence boundary
                 try:
@@ -946,7 +1367,7 @@ class BotManager:
                 except Exception:
                     pass
                 return True
-            return False
+            return deleted
 
     def generate_bot_profile(self, name: str, goal: str = "") -> dict[str, Any]:
         """根据用户输入的 BOT 名字和目标，智能生成 BOT ID、图标和专业提示词"""
@@ -1126,51 +1547,84 @@ class BotManager:
     # 长期事实记忆系统 (Memory System)
     # -------------------------------------------------------------
     def list_memories(self, bot_id: str) -> list[MemoryItem]:
-        # Ensure pre-auth public BOT memory is inherited before the first read.
-        # This keeps the memory panel consistent with history/files migration.
-        self.ensure_legacy_state(bot_id)
-        mem_path = os.path.join(self._runtime_dir(bot_id), "memory.json")
-        if not os.path.exists(mem_path):
+        bot = self.get_bot(bot_id)
+        if not bot:
             return []
+        scope = self._metadata_scope(bot_id, bot=bot)
+        rows = self.metadata_store.list_memories(bot_id, **scope)
+        if not rows and not self.metadata_store.has_memory_scope(bot_id, **scope):
+            # Compatibility fallback is permitted only when SQLite has no
+            # rows for this scope.  Import once so subsequent reads are
+            # SQLite-only.
+            legacy_path = os.path.join(self._runtime_dir(bot_id), "memory.json")
+            if os.path.isfile(legacy_path):
+                try:
+                    with open(legacy_path, "r", encoding="utf-8") as f:
+                        raw = json.load(f)
+                    if isinstance(raw, list):
+                        for item in raw:
+                            if isinstance(item, dict):
+                                self.metadata_store.upsert_memory(
+                                    bot_id=bot_id,
+                                    memory=item,
+                                    **scope,
+                                )
+                        rows = self.metadata_store.list_memories(bot_id, **scope)
+                except Exception:
+                    rows = []
         try:
-            with open(mem_path, "r", encoding="utf-8") as f:
-                raw = json.load(f)
-                return [MemoryItem(**item) for item in raw]
+            return [MemoryItem(**item) for item in rows]
         except Exception:
             return []
 
     def save_memory(self, bot_id: str, key: str, content: str) -> MemoryItem:
         with self._lock:
-            memories = self.list_memories(bot_id)
+            bot = self.get_bot(bot_id)
+            if not bot:
+                raise ValueError("BOT 不存在")
+            scope = self._metadata_scope(bot_id, bot=bot)
             now_str = now_iso()
-            found = False
-            target_item: MemoryItem | None = None
-            for m in memories:
-                if m.key == key:
-                    m.content = content
-                    m.updated_at = now_str
-                    target_item = m
-                    found = True
-                    break
-            if not found:
-                target_item = MemoryItem(key=key, content=content, created_at=now_str, updated_at=now_str)
-                memories.append(target_item)
-
-            mem_path = os.path.join(self._runtime_dir(bot_id), "memory.json")
-            _atomic_dump_json(mem_path, [m.model_dump() for m in memories])
-            if target_item is None:
-                raise RuntimeError("memory item was not created")
+            existing = next(
+                (
+                    item
+                    for item in self.metadata_store.list_memories(bot_id, **scope)
+                    if str(item.get("key")) == str(key)
+                ),
+                None,
+            )
+            target_item = MemoryItem(
+                key=key,
+                content=content,
+                created_at=str(existing.get("created_at") if existing else now_str),
+                updated_at=now_str,
+            )
+            self.metadata_store.upsert_memory(
+                bot_id=bot_id,
+                memory=target_item.model_dump(),
+                **scope,
+            )
+            with suppress(OSError):
+                os.remove(os.path.join(self._runtime_dir(bot_id), "memory.json"))
             return target_item
 
     def delete_memory(self, bot_id: str, key: str) -> bool:
         with self._lock:
-            memories = self.list_memories(bot_id)
-            filtered = [m for m in memories if m.key != key]
-            if len(filtered) < len(memories):
-                mem_path = os.path.join(self._runtime_dir(bot_id), "memory.json")
-                _atomic_dump_json(mem_path, [m.model_dump() for m in filtered])
-                return True
-            return False
+            bot = self.get_bot(bot_id)
+            if not bot:
+                return False
+            # Force the one-time compatibility import before deleting.  The
+            # SQLite tombstone then prevents a leftover legacy JSON snapshot
+            # from recreating the fact on a later read.
+            self.list_memories(bot_id)
+            removed = self.metadata_store.delete_memory(
+                bot_id,
+                key,
+                **self._metadata_scope(bot_id, bot=bot),
+            )
+            if removed:
+                with suppress(OSError):
+                    os.remove(os.path.join(self._runtime_dir(bot_id), "memory.json"))
+            return removed
 
     # -------------------------------------------------------------
     # 技能自沉淀系统 (Self-Evolving Skills)
@@ -1181,45 +1635,106 @@ class BotManager:
         return s_dir
 
     def list_skills(self, bot_id: str) -> list[SkillItem]:
-        s_dir = self._skills_dir(bot_id)
-        result = []
-        for file in os.listdir(s_dir):  # pi-lens-ignore: unchecked-throwing-call-python -- persistence boundary
-            if file.endswith(".json"):
+        bot = self.get_bot(bot_id)
+        if not bot:
+            return []
+        scope = self._metadata_scope(bot_id, bot=bot)
+        rows = self.metadata_store.list_skills(bot_id, **scope)
+        if not rows:
+            # One-time compatibility import for old skill metadata.  Source
+            # Python remains in the file layer and is never copied into SQL.
+            s_dir = self._skills_dir(bot_id)
+            for file in os.listdir(s_dir):  # pi-lens-ignore: unchecked-throwing-call-python -- persistence boundary
+                if not file.endswith(".json"):
+                    continue
                 try:
                     with open(os.path.join(s_dir, file), "r", encoding="utf-8") as f:
                         meta = json.load(f)
-                    py_file = os.path.join(s_dir, f"{meta.get('name')}.py")
+                    name = str(meta.get("name") or "")
+                    py_file = os.path.join(s_dir, f"{name}.py")
                     code = ""
-                    if os.path.exists(py_file):
+                    if os.path.isfile(py_file):
                         with open(py_file, "r", encoding="utf-8") as pf:
                             code = pf.read()
-                    meta["code"] = code
-                    result.append(SkillItem(**meta))
+                    self.metadata_store.upsert_skill(
+                        bot_id=bot_id,
+                        skill=meta,
+                        code_uri=f"local://data/bots/{bot_id}/skills/{name}.py",
+                        code_sha256=hashlib.sha256(code.encode("utf-8")).hexdigest() if code else None,
+                        **scope,
+                    )
                 except Exception:
                     continue
+            rows = self.metadata_store.list_skills(bot_id, **scope)
+        result = []
+        s_dir = self._skills_dir(bot_id)
+        for meta in rows:
+            try:
+                name = str(meta.get("name") or "")
+                py_file = os.path.join(s_dir, f"{name}.py")
+                code = ""
+                if os.path.isfile(py_file):
+                    with open(py_file, "r", encoding="utf-8") as pf:
+                        code = pf.read()
+                meta["code"] = code
+                self._populate_skill_integrity(meta, code, py_file)
+                result.append(SkillItem(**meta))
+            except Exception:
+                continue
         return result
 
+    @staticmethod
+    def _populate_skill_integrity(
+        metadata: dict[str, Any],
+        code: str,
+        code_path: str,
+    ) -> None:
+        expected = str(metadata.get("code_sha256") or "").strip().lower()
+        if not os.path.isfile(code_path):
+            metadata["integrity_status"] = "missing"
+            metadata["integrity_error"] = "技能源码文件不存在"
+            return
+        if not expected:
+            metadata["integrity_status"] = "unknown"
+            metadata["integrity_error"] = "技能元数据缺少源码哈希"
+            return
+        actual = hashlib.sha256(code.encode("utf-8")).hexdigest().lower()
+        if actual != expected:
+            metadata["integrity_status"] = "mismatch"
+            metadata["integrity_error"] = "技能源码哈希不匹配"
+            return
+        metadata["integrity_status"] = "verified"
+        metadata["integrity_error"] = None
+
     def get_skill(self, bot_id: str, name: str) -> SkillItem | None:
+        bot = self.get_bot(bot_id)
+        if not bot:
+            return None
         s_dir = self._skills_dir(bot_id)
         clean_name = re.sub(r"[^a-zA-Z0-9_]", "_", name)
-        meta_file = os.path.join(s_dir, f"{clean_name}.json")
         py_file = os.path.join(s_dir, f"{clean_name}.py")
-        if not os.path.exists(meta_file):
+        scope = self._metadata_scope(bot_id, bot=bot)
+        meta = self.metadata_store.get_skill(bot_id, clean_name, **scope)
+        if meta is None:
+            self.list_skills(bot_id)
+            meta = self.metadata_store.get_skill(bot_id, clean_name, **scope)
+        if meta is None:
             return None
-        with open(meta_file, "r", encoding="utf-8") as f:  # pi-lens-ignore: unchecked-throwing-call-python -- persistence boundary
-            meta = json.load(f)  # pi-lens-ignore: unchecked-throwing-call-python -- persistence boundary
         code = ""
         if os.path.exists(py_file):
             with open(py_file, "r", encoding="utf-8") as pf:  # pi-lens-ignore: unchecked-throwing-call-python -- persistence boundary
                 code = pf.read()
         meta["code"] = code
+        self._populate_skill_integrity(meta, code, py_file)
         return SkillItem(**meta)
 
     def save_skill(self, bot_id: str, name: str, description: str, code: str, input_schema: dict | None = None) -> SkillItem:
         with self._lock:
+            bot = self.get_bot(bot_id)
+            if not bot:
+                raise ValueError("BOT 不存在")
             s_dir = self._skills_dir(bot_id)
             clean_name = re.sub(r"[^a-zA-Z0-9_]", "_", name)
-            meta_file = os.path.join(s_dir, f"{clean_name}.json")
             py_file = os.path.join(s_dir, f"{clean_name}.py")
 
             skill = SkillItem(
@@ -1227,28 +1742,51 @@ class BotManager:
                 description=description,
                 code=code,
                 input_schema=input_schema or {},
-                created_at=now_iso()
+                created_at=now_iso(),
+                integrity_status="verified",
             )
-            with open(py_file, "w", encoding="utf-8") as f:  # pi-lens-ignore: unchecked-throwing-call-python -- persistence boundary
-                f.write(code)
-            _atomic_dump_json(meta_file, {
-                "name": skill.name,
-                "description": skill.description,
-                "input_schema": skill.input_schema,
-                "created_at": skill.created_at
-            })
+            temp_path = f"{py_file}.{os.getpid()}.{threading.get_ident()}.tmp"
+            try:
+                fd = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                with os.fdopen(fd, "w", encoding="utf-8") as f:  # pi-lens-ignore: unchecked-throwing-call-python -- persistence boundary
+                    f.write(code)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.chmod(temp_path, 0o600)
+                os.replace(temp_path, py_file)
+                self.metadata_store.upsert_skill(
+                    bot_id=bot_id,
+                    skill={
+                        "name": skill.name,
+                        "description": skill.description,
+                        "input_schema": skill.input_schema,
+                        "created_at": skill.created_at,
+                    },
+                    code_uri=f"local://data/bots/{bot_id}/skills/{clean_name}.py",
+                    code_sha256=hashlib.sha256(code.encode("utf-8")).hexdigest(),
+                    **self._metadata_scope(bot_id, bot=bot),
+                )
+            except Exception:
+                with suppress(OSError):
+                    os.remove(temp_path)
+                raise
             return skill
 
     def delete_skill(self, bot_id: str, name: str) -> bool:
         with self._lock:
+            bot = self.get_bot(bot_id)
+            if not bot:
+                return False
             s_dir = self._skills_dir(bot_id)
             clean_name = re.sub(r"[^a-zA-Z0-9_]", "_", name)
-            meta_file = os.path.join(s_dir, f"{clean_name}.json")
             py_file = os.path.join(s_dir, f"{clean_name}.py")
-            removed = False
-            if os.path.exists(meta_file):
-                os.remove(meta_file)  # pi-lens-ignore: unchecked-throwing-call-python -- persistence boundary
-                removed = True
+            removed = self.metadata_store.delete_skill(
+                bot_id,
+                clean_name,
+                **self._metadata_scope(bot_id, bot=bot),
+            )
+            with suppress(OSError):
+                os.remove(os.path.join(s_dir, f"{clean_name}.json"))
             if os.path.exists(py_file):
                 os.remove(py_file)  # pi-lens-ignore: unchecked-throwing-call-python -- persistence boundary
                 removed = True
@@ -1263,92 +1801,70 @@ class BotManager:
 
     def get_history_paged(self, bot_id: str, limit: int = 50, before_id: str | None = None, user_id: str | None = None) -> dict[str, Any]:
         """分页获取会话历史，返回 history, total 以及 has_more 状态供前端无限滚动"""
-        with self._lock:
-            self.ensure_legacy_state(bot_id, user_id)
-            jsonl_path = self._migrate_history_to_jsonl_unlocked(bot_id, user_id)
-        with self._history_session_lock(bot_id, user_id):
-            if os.path.exists(jsonl_path):
-                return self._read_history_jsonl_unlocked(jsonl_path, limit, before_id)
-        with self._lock:
-            hist_path = self._history_path(bot_id, user_id)
-            if not os.path.exists(hist_path):
-                return {"history": [], "total": 0, "has_more": False}
-            try:
-                if os.path.getsize(hist_path) > MAX_HISTORY_TOTAL_BYTES:
-                    # Do not json.load an unbounded legacy/corrupt file.  The
-                    # operator can archive or repair it offline before retrying.
-                    return {"history": [], "total": 0, "has_more": False, "truncated": True}
-                with open(hist_path, "r", encoding="utf-8") as f:
-                    history = json.load(f)
-            except Exception:
-                return {"history": [], "total": 0, "has_more": False}
-
-            total = len(history)
-            if before_id:
-                idx = next((i for i, m in enumerate(history) if m.get("id") == before_id), -1)
-                if idx > 0:
-                    start_idx = max(0, idx - limit)
-                    return {
-                        "history": history[start_idx:idx],
-                        "total": total,
-                        "has_more": start_idx > 0
-                    }
-                return {"history": [], "total": total, "has_more": False}
-            else:
-                start_idx = max(0, total - limit)
-                return {
-                    "history": history[start_idx:],
-                    "total": total,
-                    "has_more": start_idx > 0
-                }
+        with self._history_storage_lock(bot_id, user_id):
+            with self._lock:
+                self.ensure_legacy_state(bot_id, user_id)
+                scope = self._migrate_legacy_history_if_needed(
+                    bot_id,
+                    user_id=user_id,
+                )
+                stored = self.metadata_store.read_conversation(
+                    bot_id=bot_id,
+                    limit=limit,
+                    before_id=before_id,
+                    **scope,
+                )
+                if stored.get("storage_exists"):
+                    return stored
+                # No SQLite session and no legacy rows: return an empty
+                # compatibility result.  New writes create the session row.
+                return self._read_legacy_history_unlocked(
+                    bot_id,
+                    limit,
+                    before_id,
+                    user_id,
+                )
 
     def append_history(self, bot_id: str, role: str, content: str, metadata: dict | None = None, user_id: str | None = None):
-        with self._lock:
-            self.ensure_legacy_state(bot_id, user_id)
-            jsonl_path = self._migrate_history_to_jsonl_unlocked(bot_id, user_id)
-            msg = {
-                "id": f"msg-{int(time.time() * 1000)}-{uuid.uuid4().hex[:6]}",
-                "role": role,
-                "content": _truncate_history_text(content),
-                "metadata": _bound_history_metadata(metadata),
-                "timestamp": now_iso()
-            }
-        with self._history_session_lock(bot_id, user_id):
-            parent = os.path.dirname(jsonl_path)
-            os.makedirs(parent, mode=0o700, exist_ok=True)
-            if not os.path.exists(jsonl_path):
-                with open(jsonl_path, "ab"):
-                    pass
-                os.chmod(jsonl_path, 0o600)
-            self._load_history_index_unlocked(jsonl_path)
-            encoded = (json.dumps(msg, ensure_ascii=False, default=str, separators=(",", ":")) + "\n").encode("utf-8")
-            with open(jsonl_path, "ab") as stream:
-                offset = stream.tell()
-                stream.write(encoded)
-                stream.flush()
-                os.fsync(stream.fileno())
-            os.chmod(jsonl_path, 0o600)
-            index_path = self._history_index_path(bot_id, user_id)
-            with open(index_path, "a", encoding="utf-8") as index:
-                index.write(json.dumps({"id": msg["id"], "offset": offset, "end": offset + len(encoded)}, ensure_ascii=False))
-                index.write("\n")
-                index.flush()
-                os.fsync(index.fileno())
-            os.chmod(index_path, 0o600)
-            if os.path.getsize(jsonl_path) > MAX_HISTORY_TOTAL_BYTES:
-                self._compact_history_jsonl_unlocked(jsonl_path)
+        with self._history_storage_lock(bot_id, user_id):
+            with self._lock:
+                self.ensure_legacy_state(bot_id, user_id)
+                scope = self._migrate_legacy_history_if_needed(
+                    bot_id,
+                    user_id=user_id,
+                )
+                msg = {
+                    "id": f"msg-{int(time.time() * 1000)}-{uuid.uuid4().hex[:6]}",
+                    "role": role,
+                    "content": _truncate_history_text(content),
+                    "metadata": _bound_history_metadata(metadata),
+                    "timestamp": now_iso()
+                }
+                self.metadata_store.append_message(
+                    bot_id=bot_id,
+                    message=msg,
+                    **scope,
+                )
 
     def clear_history(self, bot_id: str, delete_files: bool = True, user_id: str | None = None):
-        with self._lock:
-            self.ensure_legacy_state(bot_id, user_id)
-            hist_path = self._history_path(bot_id, user_id)
-            jsonl_path = self._history_jsonl_path(bot_id, user_id)
-            _atomic_dump_json(hist_path, [])
-        with self._history_session_lock(bot_id, user_id):
-            with suppress(OSError):
-                os.remove(jsonl_path)
-            with suppress(OSError):
-                os.remove(self._history_index_path(bot_id, user_id))
+        with self._history_storage_lock(bot_id, user_id):
+            with self._lock:
+                self.ensure_legacy_state(bot_id, user_id)
+                scope = self._migrate_legacy_history_if_needed(
+                    bot_id,
+                    user_id=user_id,
+                )
+                self.metadata_store.clear_conversation(
+                    bot_id=bot_id,
+                    **scope,
+                )
+                for legacy_path in (
+                    self._history_path(bot_id, user_id),
+                    self._history_jsonl_path(bot_id, user_id),
+                    self._history_index_path(bot_id, user_id),
+                ):
+                    with suppress(OSError):
+                        os.remove(legacy_path)
             try:
                 from .engine import agent_engine
                 agent_engine.clear_sandbox(bot_id, user_id)
@@ -1356,7 +1872,11 @@ class BotManager:
                 pass
             try:
                 from .memory import memory_manager
-                memory_manager.clear_session_memory(bot_id, self._runtime_dir(bot_id, user_id))
+                memory_manager.clear_session_memory(
+                    bot_id,
+                    self._runtime_dir(bot_id, user_id),
+                    manager=self,
+                )
             except Exception:
                 pass
             if delete_files:
@@ -1369,6 +1889,10 @@ class BotManager:
                                 os.remove(fp)
                         except Exception:
                             pass
+                self.metadata_store.delete_files_for_scope(
+                    bot_id,
+                    **scope,
+                )
 
     @staticmethod
     def _collect_referenced_filenames(history: list[dict[str, Any]]) -> set[str]:
@@ -1422,11 +1946,18 @@ class BotManager:
         a 24-hour grace period so cleanup cannot race an in-flight response or
         a client that has not persisted its history yet.
         """
-        with self._lock:
-            self.ensure_legacy_state(bot_id, user_id)
-            uploads_dir = self._uploads_dir(bot_id, user_id)
-            if not os.path.exists(uploads_dir):
-                return 0
+        with self._history_storage_lock(bot_id, user_id):
+            with self._lock:
+                self.ensure_legacy_state(bot_id, user_id)
+                uploads_dir = self._uploads_dir(bot_id, user_id)
+                bot = self.get_bot(bot_id)
+                file_scope = self._metadata_scope(
+                    bot_id,
+                    user_id=user_id,
+                    bot=bot,
+                )
+                if not os.path.exists(uploads_dir):
+                    return 0
 
             referenced_filenames: set[str] = set()
             try:
@@ -1449,6 +1980,11 @@ class BotManager:
                             continue
                         if os.path.isfile(file_full_path):
                             os.remove(file_full_path)
+                            self.metadata_store.delete_file(
+                                bot_id,
+                                fn,
+                                **file_scope,
+                            )
                             deleted_count += 1
                     except Exception:
                         pass
@@ -1484,46 +2020,66 @@ class BotManager:
 
     def pop_last_assistant_message(self, bot_id: str, user_id: str | None = None) -> dict[str, Any] | None:
         """移除最后一条助手消息（用于触发重新生成）"""
-        with self._lock:
-            self.ensure_legacy_state(bot_id, user_id)
-            jsonl_path = self._migrate_history_to_jsonl_unlocked(bot_id, user_id)
-        with self._history_session_lock(bot_id, user_id):
-            if not os.path.exists(jsonl_path):
-                return None
-            try:
-                entries = self._load_history_index_unlocked(jsonl_path)
-                history = self._read_history_page_from_index_unlocked(jsonl_path, entries, 0, len(entries))
-                if history and history[-1].get("role") == "assistant":
-                    popped = history.pop()
-                    self._replace_history_jsonl_unlocked(jsonl_path, history)
-                    return popped
-            except Exception:
-                pass
-            return None
+        with self._history_storage_lock(bot_id, user_id):
+            with self._lock:
+                self.ensure_legacy_state(bot_id, user_id)
+                scope = self._migrate_legacy_history_if_needed(
+                    bot_id,
+                    user_id=user_id,
+                )
+                return self.metadata_store.pop_last_assistant(
+                    bot_id=bot_id,
+                    **scope,
+                )
 
     def truncate_history(self, bot_id: str, keep_up_to_message_id: str, user_id: str | None = None) -> bool:
         """截断历史记录至指定消息 ID（保留该消息及之前的内容，丢弃后续内容）"""
-        with self._lock:
-            self.ensure_legacy_state(bot_id, user_id)
-            jsonl_path = self._migrate_history_to_jsonl_unlocked(bot_id, user_id)
-        with self._history_session_lock(bot_id, user_id):
-            if not os.path.exists(jsonl_path):
-                return False
-            try:
-                entries = self._load_history_index_unlocked(jsonl_path)
-                history = self._read_history_page_from_index_unlocked(jsonl_path, entries, 0, len(entries))
-                idx = next((i for i, m in enumerate(history) if m.get("id") == keep_up_to_message_id), -1)
-                if idx >= 0:
-                    truncated = history[: idx + 1]
-                    self._replace_history_jsonl_unlocked(jsonl_path, truncated)
-                    return True
-            except Exception:
-                pass
-            return False
+        with self._history_storage_lock(bot_id, user_id):
+            with self._lock:
+                self.ensure_legacy_state(bot_id, user_id)
+                scope = self._migrate_legacy_history_if_needed(
+                    bot_id,
+                    user_id=user_id,
+                )
+                return self.metadata_store.truncate_conversation(
+                    bot_id=bot_id,
+                    message_id=keep_up_to_message_id,
+                    **scope,
+                )
 
     # -------------------------------------------------------------
     # 产出物与文件管理中心 (Artifact / File Hub)
     # -------------------------------------------------------------
+    def register_bot_file(
+        self,
+        bot_id: str,
+        *,
+        file_id: str,
+        original_name: str,
+        stored_name: str,
+        content_type: str | None,
+        size_bytes: int,
+        sha256: str | None,
+        user_id: str | None = None,
+    ) -> None:
+        bot = self.get_bot(bot_id)
+        if not bot:
+            raise ValueError("BOT 不存在")
+        scope = self._metadata_scope(bot_id, user_id=user_id, bot=bot)
+        self.metadata_store.upsert_file(
+            {
+                "file_id": file_id,
+                "bot_id": bot_id,
+                "blob_uri": f"local://data/bots/{bot_id}/uploads/{stored_name}",
+                "original_name": original_name,
+                "stored_name": stored_name,
+                "content_type": content_type,
+                "size_bytes": int(size_bytes),
+                "sha256": sha256,
+                **scope,
+            }
+        )
+
     def list_bot_files(self, bot_id: str, user_id: str | None = None) -> list[dict[str, Any]]:
         """查询指定智能体所有的上传与产出文件，带有大小、时间与引用状态"""
         with self._lock:
@@ -1541,22 +2097,53 @@ class BotManager:
                 pass
 
             file_list = []
-            for fn in os.listdir(uploads_dir):  # pi-lens-ignore: unchecked-throwing-call-python -- persistence boundary
+            bot = self.get_bot(bot_id)
+            scope = self._metadata_scope(bot_id, user_id=user_id, bot=bot)
+            metadata_rows = self.metadata_store.list_files(bot_id, **scope)
+            if metadata_rows:
+                candidates = [
+                    (
+                        str(row["stored_name"]),
+                        str(row["original_name"] or row["stored_name"]),
+                        int(row["size_bytes"] or 0),
+                        str(row["created_at"]),
+                    )
+                    for row in metadata_rows
+                ]
+            else:
+                # Legacy fallback is used only before a file row exists.  New
+                # uploads always register a row before returning to the user.
+                candidates = []
+                for fn in os.listdir(uploads_dir):  # pi-lens-ignore: unchecked-throwing-call-python -- persistence boundary
+                    fp = os.path.join(uploads_dir, fn)
+                    if os.path.isfile(fp):
+                        try:
+                            stat = os.stat(fp)
+                            candidates.append(
+                                (
+                                    fn,
+                                    re.sub(r"^f_\d+_", "", fn),
+                                    stat.st_size,
+                                    datetime.fromtimestamp(stat.st_mtime, tz=UTC).isoformat(),
+                                )
+                            )
+                        except OSError:
+                            continue
+
+            for fn, original_name, recorded_size, recorded_created in candidates:
                 fp = os.path.join(uploads_dir, fn)
                 if not os.path.isfile(fp):
                     continue
                 try:
                     stat = os.stat(fp)
-                    size = stat.st_size
-                    mtime = stat.st_mtime
-                    created_iso = datetime.fromtimestamp(mtime, tz=UTC).isoformat()
+                    size = stat.st_size or recorded_size
+                    created_iso = recorded_created or datetime.fromtimestamp(stat.st_mtime, tz=UTC).isoformat()
                     cat, ftype = get_file_category_and_type(fn)
-                    orig_name = re.sub(r"^f_\d+_", "", fn)
                     is_ref = fn in referenced_filenames or any(fn.endswith(f"_{ref}") for ref in referenced_filenames)
 
                     file_list.append({
                         "name": fn,
-                        "original_name": orig_name,
+                        "original_name": original_name,
                         "size": size,
                         "size_formatted": format_file_size(size),
                         "category": cat,
@@ -1579,6 +2166,28 @@ class BotManager:
             bot_dir = self._runtime_dir(bot_id, user_id)
             safe_name = os.path.basename(filename)
             uploads_dir = os.path.join(bot_dir, "uploads")
+            bot = self.get_bot(bot_id)
+            scope = self._metadata_scope(bot_id, user_id=user_id, bot=bot)
+            stored_record = self.metadata_store.find_file(
+                bot_id,
+                safe_name,
+                **scope,
+            )
+            if stored_record:
+                target_name = os.path.basename(str(stored_record["stored_name"]))
+                target = os.path.join(uploads_dir, target_name)
+                if os.path.isfile(target):
+                    try:
+                        os.remove(target)
+                    except OSError:
+                        return False
+                    self.metadata_store.delete_file(
+                        bot_id,
+                        target_name,
+                        **scope,
+                    )
+                    return True
+                return False
             fp = os.path.join(uploads_dir, safe_name)
             if os.path.exists(fp) and os.path.isfile(fp):
                 try:
@@ -1606,35 +2215,37 @@ class BotManager:
         return os.path.join(self.data_dir, "orchestrations.json")
 
     def record_orchestration(self, record: dict[str, Any]):
-        """记录一条多智能体协同调用事件"""
+        """记录一条多智能体协同调用事件到 SQLite。"""
         with self._lock:
-            path = self._orchestrations_path()
-            events = []
-            if os.path.exists(path):
-                try:
-                    with open(path, "r", encoding="utf-8") as f:
-                        events = json.load(f)
-                except Exception:
-                    events = []
-            events.insert(0, record)
-            # 保留最近 500 次协同记录
-            events = events[:500]
-            _atomic_dump_json(path, events)
+            owner_subject = str(
+                record.get("owner_id")
+                or runtime_user_id.get()
+                or ""
+            )
+            normalized_record = dict(record)
+            if owner_subject and not normalized_record.get("owner_id"):
+                normalized_record["owner_id"] = owner_subject
+            self.orchestration_store.import_legacy_file(self._orchestrations_path())
+            active_scope = runtime_auth_scope.get()
+            self.orchestration_store.append(
+                normalized_record,
+                issuer=active_scope.issuer,
+                tenant_id=active_scope.tenant_id,
+                owner_subject=owner_subject,
+            )
 
     def get_orchestrations(self, limit: int = 50, user_id: str | None = None, is_admin: bool = False) -> list[dict[str, Any]]:
         """获取最近的多智能体协同流水；非管理员仅返回自己的事件。"""
         with self._lock:
-            path = self._orchestrations_path()
-            if os.path.exists(path):
-                try:
-                    with open(path, "r", encoding="utf-8") as f:
-                        events = json.load(f)
-                    if not is_admin and user_id:
-                        events = [event for event in events if event.get("owner_id") == user_id]
-                    return events[:limit]
-                except Exception:
-                    return []
-            return []
+            self.orchestration_store.import_legacy_file(self._orchestrations_path())
+            active_scope = runtime_auth_scope.get()
+            return self.orchestration_store.list_recent(
+                issuer=active_scope.issuer,
+                tenant_id=active_scope.tenant_id,
+                owner_subject=user_id,
+                is_admin=is_admin,
+                limit=limit,
+            )
 
     def get_orchestration_topology(self) -> dict[str, Any]:
         """
@@ -1660,7 +2271,7 @@ class BotManager:
             bot_map = {n["id"]: n for n in nodes}
 
             # 聚合调用关系
-            events = self.get_orchestrations(limit=200)
+            events = self.get_orchestrations(limit=200, is_admin=True)
             edge_map: dict[str, dict[str, Any]] = {}
 
             for ev in events:

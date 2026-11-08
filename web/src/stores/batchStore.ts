@@ -60,6 +60,7 @@ interface BatchState {
   activePresetId: string | null
   guidance: BatchGuidance | null
   highRiskConfirmed: boolean
+  idempotencyKey: string | null
   failedItems: any[]
 
   setApiId: (id: string) => void
@@ -112,16 +113,19 @@ export const useBatchStore = create<BatchState>((set, get) => ({
   activePresetId: null,
   guidance: null,
   highRiskConfirmed: false,
+  idempotencyKey: null,
   failedItems: [],
 
   setApiId: (id: string) => {
-    set({ apiId: id, activePresetId: null, highRiskConfirmed: false })
+    set({ apiId: id, activePresetId: null, highRiskConfirmed: false, idempotencyKey: null })
     get().fetchGuidance(id)
   },
-  setDelaySec: (sec: number) => set({ delaySec: sec }),
-  setDryRun: (dry: boolean) => set({ isDryRun: dry, highRiskConfirmed: false }),
-  setHighRiskConfirmed: (confirmed: boolean) => set({ highRiskConfirmed: confirmed }),
-  toggleDryRun: () => set((state) => ({ isDryRun: !state.isDryRun })),
+  setDelaySec: (sec: number) => set({ delaySec: sec, idempotencyKey: null }),
+  setDryRun: (dry: boolean) => set({ isDryRun: dry, highRiskConfirmed: false, idempotencyKey: null }),
+  setHighRiskConfirmed: (confirmed: boolean) =>
+    set({ highRiskConfirmed: confirmed, idempotencyKey: null }),
+  toggleDryRun: () =>
+    set((state) => ({ isDryRun: !state.isDryRun, idempotencyKey: null })),
   setItems: (items: any[], fileName: string) =>
     set({
       items,
@@ -130,6 +134,7 @@ export const useBatchStore = create<BatchState>((set, get) => ({
       // retry or history restore changes that target and requires a fresh
       // acknowledgement before a destructive batch can be submitted.
       highRiskConfirmed: false,
+      idempotencyKey: null,
       failedItems: [],
       progress: { current: 0, total: items.length, percent: 0, success: 0, failed: 0 },
     }),
@@ -139,6 +144,7 @@ export const useBatchStore = create<BatchState>((set, get) => ({
       items: [],
       fileName: '',
       highRiskConfirmed: false,
+      idempotencyKey: null,
       failedItems: [],
       progress: { current: 0, total: 0, percent: 0, success: 0, failed: 0 },
     }),
@@ -240,9 +246,15 @@ export const useBatchStore = create<BatchState>((set, get) => ({
       return
     }
 
+    const idempotencyKey =
+      get().idempotencyKey ||
+      (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+        ? crypto.randomUUID()
+        : `${Date.now()}-${Math.random().toString(36).slice(2)}`)
     set({
       isRunning: true,
       isPaused: false,
+      idempotencyKey,
       failedItems: [],
       progress: { current: 0, total: items.length, percent: 0, success: 0, failed: 0 },
     })
@@ -254,7 +266,7 @@ export const useBatchStore = create<BatchState>((set, get) => ({
     try {
       const res = await fetch('/api/batch/create', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', 'Idempotency-Key': idempotencyKey },
         body: JSON.stringify({
           api_id: apiId,
           items,
@@ -266,7 +278,7 @@ export const useBatchStore = create<BatchState>((set, get) => ({
       })
       const json = await res.json()
       if (json.status === 'success') {
-        set({ activeTaskId: json.task_id })
+        set({ activeTaskId: json.task_id, idempotencyKey: null })
         get().connectSSE(json.task_id)
       } else {
         alert(json.detail || '创建批处理任务失败')
@@ -371,7 +383,11 @@ export const useBatchStore = create<BatchState>((set, get) => ({
   pauseBatch: async () => {
     const { activeTaskId } = get()
     if (!activeTaskId) return
-    await fetch(`/api/batch/${activeTaskId}/pause`, { method: 'POST' })
+    const response = await fetch(`/api/batch/${activeTaskId}/pause`, { method: 'POST', headers: authHeaders() })
+    const result = await response.json().catch(() => ({}))
+    if (!response.ok || result.status !== 'success') {
+      throw new Error(result.detail || `暂停任务失败 (${response.status})`)
+    }
     set({ isPaused: true })
     get().addLog('WARN', '批量任务已暂停')
   },
@@ -379,7 +395,11 @@ export const useBatchStore = create<BatchState>((set, get) => ({
   resumeBatch: async () => {
     const { activeTaskId } = get()
     if (!activeTaskId) return
-    await fetch(`/api/batch/${activeTaskId}/resume`, { method: 'POST' })
+    const response = await fetch(`/api/batch/${activeTaskId}/resume`, { method: 'POST', headers: authHeaders() })
+    const result = await response.json().catch(() => ({}))
+    if (!response.ok || result.status !== 'success') {
+      throw new Error(result.detail || `继续任务失败 (${response.status})`)
+    }
     set({ isPaused: false })
     get().addLog('INFO', '批量任务继续执行')
   },

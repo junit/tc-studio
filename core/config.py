@@ -5,6 +5,7 @@
 """
 
 import json
+import math
 import os
 import tempfile
 import threading
@@ -16,7 +17,12 @@ try:
 except ImportError:  # pragma: no cover - Windows fallback keeps process-local safety
     fcntl = None
 
-CONFIG_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "config.json"))
+_DEFAULT_CONFIG_PATH = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "config.json")
+)
+CONFIG_PATH = os.path.abspath(
+    os.environ.get("TIM_CONFIG_PATH") or _DEFAULT_CONFIG_PATH
+)
 
 _config_lock = threading.RLock()
 _config_file_lock_state = threading.local()
@@ -88,8 +94,26 @@ DEFAULT_ENV = {
     "delay_sec": 0.05,
 }
 
+MAX_DELAY_SEC = 24 * 60 * 60
+
 
 SECRET_FIELDS = ["secret_key", "tc_secret_key", "live_push_key", "live_play_key"]
+
+
+def validate_delay_sec(value, *, default: float | None = None) -> float:
+    """Validate the inter-request delay used by configuration and batch jobs."""
+    candidate = default if value is None and default is not None else value
+    if isinstance(candidate, bool):
+        raise ValueError("delay_sec 必须是有限数值")
+    try:
+        delay = float(candidate)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("delay_sec 必须是有限数值") from exc
+    if not math.isfinite(delay):
+        raise ValueError("delay_sec 不允许 NaN 或 Infinity")
+    if delay < 0 or delay > MAX_DELAY_SEC:
+        raise ValueError(f"delay_sec 必须在 0 到 {MAX_DELAY_SEC} 秒之间")
+    return delay
 
 
 def is_field_sensitive(field_name: str) -> bool:
@@ -146,7 +170,10 @@ def load_config() -> dict:
         if "domain" in raw and raw["domain"]:
             initial_env["domain"] = raw["domain"]
         if "delay_sec" in raw:
-            initial_env["delay_sec"] = raw["delay_sec"]
+            initial_env["delay_sec"] = validate_delay_sec(
+                raw["delay_sec"],
+                default=DEFAULT_ENV["delay_sec"],
+            )
         environments = [initial_env]
 
     active_id = raw.get("active_env_id")
@@ -164,6 +191,10 @@ def load_config() -> dict:
     for k, v in DEFAULT_ENV.items():
         if k not in cfg:
             cfg[k] = v
+    cfg["delay_sec"] = validate_delay_sec(
+        cfg.get("delay_sec"),
+        default=DEFAULT_ENV["delay_sec"],
+    )
     return cfg
 
 
@@ -200,6 +231,16 @@ def _write_config_unlocked(new_config: dict) -> dict:
 def save_config(new_config: dict) -> dict:
     """持久化保存配置：进程锁 + 跨进程文件锁 + 原子替换。"""
     with _config_transaction():
+        environments = new_config.get("environments", [])
+        if not isinstance(environments, list):
+            raise ValueError("environments 必须是列表")
+        for environment in environments:
+            if not isinstance(environment, dict):
+                raise ValueError("环境配置必须是对象")
+            environment["delay_sec"] = validate_delay_sec(
+                environment.get("delay_sec"),
+                default=DEFAULT_ENV["delay_sec"],
+            )
         return _write_config_unlocked(new_config)
 
 
@@ -264,6 +305,10 @@ def save_environment(env_data: dict) -> dict:
 
         if existing_idx >= 0:
             existing_env = cfg["environments"][existing_idx]
+            env_data["delay_sec"] = validate_delay_sec(
+                env_data.get("delay_sec", existing_env.get("delay_sec")),
+                default=DEFAULT_ENV["delay_sec"],
+            )
             all_sec_keys = {k for k in list(existing_env.keys()) + list(env_data.keys()) if is_field_sensitive(k)}
             for sec_field in all_sec_keys:
                 submitted_val = str(env_data.get(sec_field) or "").strip()
@@ -277,6 +322,10 @@ def save_environment(env_data: dict) -> dict:
                 **env_data,
             }
         else:
+            env_data["delay_sec"] = validate_delay_sec(
+                env_data.get("delay_sec"),
+                default=DEFAULT_ENV["delay_sec"],
+            )
             for key in list(env_data.keys()):
                 if is_field_sensitive(key):
                     submitted_val = str(env_data.get(key) or "").strip()

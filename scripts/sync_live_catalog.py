@@ -15,10 +15,16 @@ import time
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
+from core.file_storage import atomic_write_json
+
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 OUTPUT_PATH = os.path.join(BASE_DIR, "core", "live_full_catalog.json")
 CACHE_DIR = os.path.join(BASE_DIR, "storage", "docs_cache", "live")
-os.makedirs(CACHE_DIR, exist_ok=True)
+os.makedirs(CACHE_DIR, mode=0o700, exist_ok=True)
+try:
+    os.chmod(CACHE_DIR, 0o700)
+except OSError:
+    pass
 
 HEADERS = {
     "User-Agent": (
@@ -62,8 +68,7 @@ def fetch_doc_detail(doc_id: str, max_retries: int = 3) -> dict:
                 data = json.loads(raw.decode("utf-8"))
                 content = data.get("data", {}).get("content", {})
                 if content:
-                    with open(cache_file, "w", encoding="utf-8") as f:
-                        json.dump(content, f, ensure_ascii=False)
+                    atomic_write_json(cache_file, content, mode=0o600)
                 return content
         except Exception as e:
             if attempt < max_retries - 1:
@@ -226,8 +231,7 @@ def sync_all_live_apis():
 
     print(f"✅ 全量 {len(catalog)} 项云直播 API 参数抓取完成，耗时 {round(time.time() - t0, 2)} 秒！")
 
-    with open(OUTPUT_PATH, "w", encoding="utf-8") as f:
-        json.dump(catalog, f, ensure_ascii=False, indent=2)
+    atomic_write_json(OUTPUT_PATH, catalog, mode=0o644)
 
     print(f"🎉 已成功保存至 {OUTPUT_PATH}")
     return catalog

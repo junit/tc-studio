@@ -17,7 +17,13 @@ from contextlib import suppress
 from typing import Any, Dict, List, Optional
 
 from .constants import MAX_CACHED_RUNS, RUN_TTL_SECONDS
-from ..runtime_context import runtime_is_admin, runtime_is_operator, runtime_user_id
+from ..runtime_context import (
+    AuthScope,
+    runtime_auth_scope,
+    runtime_is_admin,
+    runtime_is_operator,
+    runtime_user_id,
+)
 
 MAX_EVENTS_PER_RUN = 2000
 
@@ -55,7 +61,9 @@ class AgentRun:
         skip_user_append: bool = False,
         user_id: str = "local",
         is_admin: bool = True,
-        is_operator: bool = True
+        is_operator: bool = True,
+        issuer: str = "",
+        tenant_id: str = "",
     ):
         self.run_id = run_id
         self.bot_id = bot_id
@@ -63,6 +71,8 @@ class AgentRun:
         self.attachments = attachments or []
         self.skip_user_append = skip_user_append
         self.user_id = user_id
+        self.issuer = str(issuer or "")
+        self.tenant_id = str(tenant_id or "")
         self.is_admin = is_admin
         self.is_operator = is_operator
         now_ts = int(time.time() * 1000)
@@ -305,13 +315,31 @@ class AgentRunManager:
     """全局会话运行管理器（具备防内存泄漏的自动淘汰机制）"""
     def __init__(self, max_cached_runs: int = MAX_CACHED_RUNS, run_ttl_seconds: int = RUN_TTL_SECONDS):
         self.runs: Dict[str, AgentRun] = {}
-        self.active_bot_runs: Dict[str, str] = {}  # bot_id -> active run_id
+        self.active_bot_runs: Dict[str, str] = {}  # scoped bot/user key -> active run_id
         self.max_cached_runs = max_cached_runs
         self.run_ttl_seconds = run_ttl_seconds
         self._lock = threading.Lock()
 
-    def _run_key(self, bot_id: str, user_id: str | None = None) -> str:
-        return f"{bot_id}:{user_id or runtime_user_id.get()}"
+    def _run_key(
+        self,
+        bot_id: str,
+        user_id: str | None = None,
+        issuer: str | None = None,
+        tenant_id: str | None = None,
+    ) -> str:
+        active_scope = runtime_auth_scope.get()
+        effective_user = user_id or active_scope.subject or runtime_user_id.get()
+        effective_issuer = active_scope.issuer if issuer is None else str(issuer or "")
+        effective_tenant = active_scope.tenant_id if tenant_id is None else str(tenant_id or "")
+        if not effective_issuer and not effective_tenant:
+            # Preserve the old key for local mode and existing integrations.
+            return f"{bot_id}:{effective_user}"
+        import hashlib
+
+        identity = "\0".join(
+            (str(bot_id), effective_issuer, effective_tenant, effective_user)
+        )
+        return f"{bot_id}:scope:{hashlib.sha256(identity.encode('utf-8')).hexdigest()[:24]}"
 
     def _evict_stale_runs_unlocked(self):
         now = time.time()
@@ -340,9 +368,17 @@ class AgentRunManager:
             for rid, _ in finished_runs[:excess_count]:
                 self.runs.pop(rid, None)
 
-    def get_active_run(self, bot_id: str, user_id: str | None = None) -> Optional[AgentRun]:
+    def get_active_run(
+        self,
+        bot_id: str,
+        user_id: str | None = None,
+        issuer: str | None = None,
+        tenant_id: str | None = None,
+    ) -> Optional[AgentRun]:
         with self._lock:
-            run_id = self.active_bot_runs.get(self._run_key(bot_id, user_id))
+            run_id = self.active_bot_runs.get(
+                self._run_key(bot_id, user_id, issuer, tenant_id)
+            )
             if not run_id:
                 return None
             run = self.runs.get(run_id)
@@ -350,13 +386,27 @@ class AgentRunManager:
                 return run
             return None
 
-    def list_active_runs(self, user_id: str | None = None) -> Dict[str, Dict[str, Any]]:
+    def list_active_runs(
+        self,
+        user_id: str | None = None,
+        issuer: str | None = None,
+        tenant_id: str | None = None,
+    ) -> Dict[str, Dict[str, Any]]:
         """获取所有当前正在运行中的智能体任务快照简述"""
         result = {}
+        active_scope = runtime_auth_scope.get()
+        effective_issuer = active_scope.issuer if issuer is None else str(issuer or "")
+        effective_tenant = active_scope.tenant_id if tenant_id is None else str(tenant_id or "")
         with self._lock:
             for _run_key, run_id in list(self.active_bot_runs.items()):
                 run = self.runs.get(run_id)
-                if run and run.status == "running" and (user_id is None or run.user_id == user_id):
+                if (
+                    run
+                    and run.status == "running"
+                    and (user_id is None or run.user_id == user_id)
+                    and run.issuer == effective_issuer
+                    and run.tenant_id == effective_tenant
+                ):
                     elapsed = (run.end_time or time.time()) - run.start_time
                     result[run.bot_id] = {
                         "run_id": run.run_id,
@@ -370,23 +420,57 @@ class AgentRunManager:
                     }
         return result
 
-    def resolve_approval(self, bot_id: str, approval_id: str, decision: str, user_id: str | None = None) -> bool:
+    def resolve_approval(
+        self,
+        bot_id: str,
+        approval_id: str,
+        decision: str,
+        user_id: str | None = None,
+        issuer: str | None = None,
+        tenant_id: str | None = None,
+    ) -> bool:
         """为指定智能体当前的挂起操作提交决策"""
-        run = self.get_active_run(bot_id, user_id)
+        run = self.get_active_run(bot_id, user_id, issuer, tenant_id)
         if run:
             return run.resolve_approval(approval_id, decision)
         return False
 
-    def stop_run(self, bot_id: str, user_id: str | None = None) -> bool:
+    def stop_run(
+        self,
+        bot_id: str,
+        user_id: str | None = None,
+        issuer: str | None = None,
+        tenant_id: str | None = None,
+    ) -> bool:
         """停止指定智能体的当前任务"""
-        run = self.get_active_run(bot_id, user_id)
+        run = self.get_active_run(bot_id, user_id, issuer, tenant_id)
         if run:
             run.request_stop()
             with self._lock:
-                if self.active_bot_runs.get(self._run_key(bot_id, user_id)) == run.run_id:
-                    self.active_bot_runs.pop(self._run_key(bot_id, user_id), None)
+                run_key = self._run_key(bot_id, user_id, issuer, tenant_id)
+                if self.active_bot_runs.get(run_key) == run.run_id:
+                    self.active_bot_runs.pop(run_key, None)
             return True
         return False
+
+    def stop_all_runs(self, bot_id: str) -> int:
+        """Stop every active run for a BOT before its definition is deleted."""
+        stopped = 0
+        with self._lock:
+            active_run_ids = {
+                run_id
+                for key, run_id in self.active_bot_runs.items()
+                if str(key).startswith(f"{bot_id}:")
+            }
+            for run_id in active_run_ids:
+                run = self.runs.get(run_id)
+                if run and run.status == "running":
+                    run.request_stop()
+                    stopped += 1
+            for key, run_id in list(self.active_bot_runs.items()):
+                if run_id in active_run_ids:
+                    self.active_bot_runs.pop(key, None)
+        return stopped
 
     def start_run(
         self,
@@ -399,12 +483,16 @@ class AgentRunManager:
         skip_user_append: bool = False,
         user_id: str = "local",
         is_admin: bool = True,
-        is_operator: bool = True
+        is_operator: bool = True,
+        issuer: str = "",
+        tenant_id: str = "",
     ) -> AgentRun:
         """启动新的后台执行任务（若已有运行中的任务先中止旧任务）"""
         with self._lock:
             self._evict_stale_runs_unlocked()
-            old_run_id = self.active_bot_runs.get(self._run_key(bot_id, user_id))
+            old_run_id = self.active_bot_runs.get(
+                self._run_key(bot_id, user_id, issuer, tenant_id)
+            )
             if old_run_id and old_run_id in self.runs:
                 old_run = self.runs[old_run_id]
                 if old_run.status == "running":
@@ -421,9 +509,13 @@ class AgentRunManager:
                 user_id=user_id,
                 is_admin=is_admin,
                 is_operator=is_operator,
+                issuer=issuer,
+                tenant_id=tenant_id,
             )
             self.runs[run_id] = run
-            self.active_bot_runs[self._run_key(bot_id, user_id)] = run_id
+            self.active_bot_runs[
+                self._run_key(bot_id, user_id, issuer, tenant_id)
+            ] = run_id
 
         worker = threading.Thread(
             target=self._execute_run_worker,
@@ -437,6 +529,13 @@ class AgentRunManager:
     def _execute_run_worker(self, run: AgentRun, engine, bot_manager):
         """后台独立工作线程：执行 agent_engine 并持续分发事件"""
         token = runtime_user_id.set(run.user_id)
+        scope_token = runtime_auth_scope.set(
+            AuthScope(
+                issuer=run.issuer,
+                tenant_id=run.tenant_id,
+                subject=run.user_id,
+            )
+        )
         admin_token = runtime_is_admin.set(run.is_admin)
         operator_token = runtime_is_operator.set(run.is_operator)
         try:
@@ -462,12 +561,18 @@ class AgentRunManager:
             runtime_is_admin.reset(admin_token)
             runtime_is_operator.reset(operator_token)
             runtime_user_id.reset(token)
+            runtime_auth_scope.reset(scope_token)
             if run.status == "running":
                 run.status = "done"
                 run.stream_status = "done"
                 run.dispatch_event("done", {"status": "done"})
             with self._lock:
-                run_key = self._run_key(run.bot_id, run.user_id)
+                run_key = self._run_key(
+                    run.bot_id,
+                    run.user_id,
+                    run.issuer,
+                    run.tenant_id,
+                )
                 if self.active_bot_runs.get(run_key) == run.run_id:
                     self.active_bot_runs.pop(run_key, None)
                 self._evict_stale_runs_unlocked()

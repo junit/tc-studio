@@ -8,7 +8,9 @@ import json
 import os
 import queue
 import re
+import sqlite3
 import threading
+import time
 import zipfile
 from typing import Any
 
@@ -17,7 +19,7 @@ from fastapi import Depends, FastAPI, File, Header, HTTPException, Query, Upload
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from starlette.concurrency import run_in_threadpool
 
 from apis.agent import router as agent_router
@@ -37,6 +39,7 @@ from core.config import (
     load_config,
     save_environment,
     switch_environment,
+    validate_delay_sec,
 )
 from core.doc_syncer import doc_sync_manager
 from core.live_util import (
@@ -46,15 +49,20 @@ from core.live_util import (
 from core.registry import registry
 from core.agent.risk import is_high_risk_api, matching_confirmation_paths
 from core.task_runner import (
+    IdempotencyConflict,
+    InvalidIdempotencyKey,
+    batch_request_fingerprint,
     clear_history,
     count_task_results,
     delete_history_item,
     iter_task_results,
     load_history,
     save_history_item,
+    task_result_consistency,
     task_results_path,
     task_runner,
 )
+from core.persistence import SqliteAuditStore
 from core.sync_task_manager import sync_task_manager
 from core.tree_syncer import fetch_official_hydration_tree, sync_catalog_from_live_tree
 
@@ -85,6 +93,32 @@ app.include_router(agent_router)
 # their file-write/reload critical section serialized even though they have
 # separate task types and can be submitted by different operators.
 _catalog_sync_lock = threading.Lock()
+_audit_store = SqliteAuditStore()
+
+
+def _write_audit(
+    user: CurrentUser | None,
+    *,
+    action: str,
+    resource_type: str,
+    resource_id: str | None = None,
+    outcome: str = "SUCCESS",
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    """Write a bounded, redacted security event without request secrets."""
+    try:
+        _audit_store.append(
+            action=action,
+            resource_type=resource_type,
+            resource_id=resource_id,
+            outcome=outcome,
+            actor_subject=user.subject if isinstance(user, CurrentUser) else "",
+            issuer=user.issuer if isinstance(user, CurrentUser) else "",
+            tenant_id=user.tenant_id if isinstance(user, CurrentUser) else "",
+            metadata=metadata or {},
+        )
+    except Exception as exc:  # noqa: BLE001 - audit failure must be observable
+        print(f"[WARN] audit event write failed: {exc}")
 
 
 def _safe_csv_cell(value: Any) -> Any:
@@ -104,7 +138,20 @@ def require_batch_task(task_id: str, user: CurrentUser = Depends(current_user)):
         if history_match is None:
             raise HTTPException(status_code=404, detail="Task not found")
 
-    owner_id = task.owner_id if task is not None else (history_match or {}).get("owner_id")
+    scoped_record = (
+        {
+            "issuer": getattr(task, "issuer", ""),
+            "tenant_id": getattr(task, "tenant_id", ""),
+            "owner_id": getattr(task, "owner_id", None),
+        }
+        if task is not None
+        else (history_match or {})
+    )
+    record_issuer = str(scoped_record.get("issuer") or "")
+    record_tenant = str(scoped_record.get("tenant_id") or "")
+    if record_issuer != user.issuer or record_tenant != user.tenant_id:
+        raise HTTPException(status_code=403, detail="无权访问该批处理任务")
+    owner_id = scoped_record.get("owner_id")
     if user.is_admin:
         return task or history_match
     if not user.is_operator or not owner_id or owner_id != user.subject:
@@ -174,6 +221,11 @@ class EnvironmentItem(BaseModel):
     live_play_key: str | None = ""
     delay_sec: float = 0.05
 
+    @field_validator("delay_sec", mode="before")
+    @classmethod
+    def validate_delay(cls, value):
+        return validate_delay_sec(value)
+
 
 class SwitchEnvRequest(BaseModel):
     env_id: str
@@ -190,30 +242,82 @@ def api_get_environments(_user=Depends(require_operator)):
 
 
 @app.post("/api/environments/switch")
-def api_switch_environment(req: SwitchEnvRequest, _user=Depends(require_admin)):
+def api_switch_environment(
+    req: SwitchEnvRequest,
+    user: CurrentUser = Depends(require_admin),
+):
     try:
         data = switch_environment(req.env_id)
+        _write_audit(
+            user,
+            action="credential.environment_switch",
+            resource_type="environment",
+            resource_id=req.env_id,
+        )
         return {"status": "success", "data": data}
     except Exception as exc:
+        _write_audit(
+            user,
+            action="credential.environment_switch",
+            resource_type="environment",
+            resource_id=req.env_id,
+            outcome="REJECTED",
+            metadata={"reason": str(exc)[:256]},
+        )
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.post("/api/environments/save")
-def api_save_environment(req: EnvironmentItem, _user=Depends(require_admin)):
+def api_save_environment(
+    req: EnvironmentItem,
+    user: CurrentUser = Depends(require_admin),
+):
     try:
         data = save_environment(req.dict())
         saved_env = data.get("saved_env") or {}
+        _write_audit(
+            user,
+            action="credential.environment_save",
+            resource_type="environment",
+            resource_id=req.id or data.get("saved_id"),
+            metadata={"environment_name": req.name},
+        )
         return {"status": "success", "data": saved_env, "payload": data}
     except Exception as exc:
+        _write_audit(
+            user,
+            action="credential.environment_save",
+            resource_type="environment",
+            resource_id=req.id,
+            outcome="REJECTED",
+            metadata={"reason": str(exc)[:256]},
+        )
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.delete("/api/environments/{env_id}")
-def api_delete_environment(env_id: str, _user=Depends(require_admin)):
+def api_delete_environment(
+    env_id: str,
+    user: CurrentUser = Depends(require_admin),
+):
     try:
         data = delete_environment(env_id)
+        _write_audit(
+            user,
+            action="credential.environment_delete",
+            resource_type="environment",
+            resource_id=env_id,
+        )
         return {"status": "success", "data": data}
     except Exception as exc:
+        _write_audit(
+            user,
+            action="credential.environment_delete",
+            resource_type="environment",
+            resource_id=env_id,
+            outcome="REJECTED",
+            metadata={"reason": str(exc)[:256]},
+        )
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
@@ -223,6 +327,11 @@ class ConfigUpdate(BaseModel):
     admin_user: str = "administrator"
     domain: str = "console.tim.qq.com"
     delay_sec: float = 0.05
+
+    @field_validator("delay_sec", mode="before")
+    @classmethod
+    def validate_delay(cls, value):
+        return validate_delay_sec(value)
 
 
 @app.get("/api/config")
@@ -242,7 +351,10 @@ def get_config(_user=Depends(require_admin)):
 
 
 @app.post("/api/config")
-def update_config(body: ConfigUpdate, _user=Depends(require_admin)):
+def update_config(
+    body: ConfigUpdate,
+    user: CurrentUser = Depends(require_admin),
+):
     cfg = load_config()
     active_env_id = cfg.get("active_env_id", "env_default")
     env_data = {
@@ -254,6 +366,13 @@ def update_config(body: ConfigUpdate, _user=Depends(require_admin)):
         "delay_sec": body.delay_sec,
     }
     saved_payload = save_environment(env_data)
+    _write_audit(
+        user,
+        action="credential.config_update",
+        resource_type="environment",
+        resource_id=active_env_id,
+        metadata={"sdkappid": body.sdkappid},
+    )
     return {"status": "success", "data": saved_payload["active_env"]}
 
 
@@ -380,6 +499,14 @@ class ApiInvokeRequest(BaseModel):
 def invoke_single_api(api_id: str, req: ApiInvokeRequest, user: CurrentUser = Depends(require_operator)):
     api_meta = registry.get_api(api_id)
     if not api_meta:
+        _write_audit(
+            user,
+            action="api.invoke",
+            resource_type="api",
+            resource_id=api_id,
+            outcome="REJECTED",
+            metadata={"reason": "api_not_registered"},
+        )
         raise HTTPException(status_code=404, detail=f"API {api_id} 未注册")
 
     client = UniversalCloudClient()
@@ -395,6 +522,14 @@ def invoke_single_api(api_id: str, req: ApiInvokeRequest, user: CurrentUser = De
             if str(path).strip()
         }
         if not req.confirm_high_risk or not (approved & matching_confirmation_paths(api_id, api_meta)):
+            _write_audit(
+                user,
+                action="api.high_risk_confirmation",
+                resource_type="api",
+                resource_id=api_id,
+                outcome="REJECTED",
+                metadata={"dry_run": bool(req.dry_run), "reason": "confirmation_missing_or_mismatched"},
+            )
             raise HTTPException(
                 status_code=428,
                 detail="高危接口需要显式二次确认：confirm_high_risk=true 且 approved_high_risk_paths 包含该接口的 canonical ID 或 command",
@@ -407,6 +542,13 @@ def invoke_single_api(api_id: str, req: ApiInvokeRequest, user: CurrentUser = De
 
     # 预览模式：执行入参校验与请求报文结构生成，不发网络请求
     if req.dry_run:
+        _write_audit(
+            user,
+            action="api.invoke",
+            resource_type="api",
+            resource_id=api_id,
+            metadata={"dry_run": True},
+        )
         return {
             "status": "success",
             "dry_run": True,
@@ -434,6 +576,17 @@ def invoke_single_api(api_id: str, req: ApiInvokeRequest, user: CurrentUser = De
         }
 
     resp = client.invoke_api(api_meta, payload)
+    _write_audit(
+        user,
+        action="api.invoke",
+        resource_type="api",
+        resource_id=api_id,
+        outcome="SUCCESS" if resp.get("ActionStatus") == "OK" else "FAILED",
+        metadata={
+            "dry_run": False,
+            "error_code": resp.get("ErrorCode"),
+        },
+    )
     return {
         "status": "success",
         "dry_run": False,
@@ -540,8 +693,17 @@ def sync_official_tree(
         "docs_tree",
         _run_docs_tree_sync,
         owner_id=user.subject,
+        issuer=user.issuer,
+        tenant_id=user.tenant_id,
         is_admin=user.is_admin,
         idempotency_key=idempotency_key,
+    )
+    _write_audit(
+        user,
+        action="sync.docs_tree.start",
+        resource_type="sync_job",
+        resource_id=result.get("task_id"),
+        metadata={"status": result.get("status")},
     )
     return _sync_task_response(result)
 
@@ -556,7 +718,12 @@ def get_official_tree_sync_status(
         task_id = None
     try:
         status = sync_task_manager.get_status(
-            "docs_tree", task_id, owner_id=user.subject, is_admin=user.is_admin
+            "docs_tree",
+            task_id,
+            owner_id=user.subject,
+            issuer=user.issuer,
+            tenant_id=user.tenant_id,
+            is_admin=user.is_admin,
         )
     except PermissionError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
@@ -578,8 +745,17 @@ def sync_official_live_catalog(
         "live_catalog",
         _run_live_catalog_sync,
         owner_id=user.subject,
+        issuer=user.issuer,
+        tenant_id=user.tenant_id,
         is_admin=user.is_admin,
         idempotency_key=idempotency_key,
+    )
+    _write_audit(
+        user,
+        action="sync.live_catalog.start",
+        resource_type="sync_job",
+        resource_id=result.get("task_id"),
+        metadata={"status": result.get("status")},
     )
     return _sync_task_response(result)
 
@@ -594,7 +770,12 @@ def get_official_live_catalog_sync_status(
         task_id = None
     try:
         status = sync_task_manager.get_status(
-            "live_catalog", task_id, owner_id=user.subject, is_admin=user.is_admin
+            "live_catalog",
+            task_id,
+            owner_id=user.subject,
+            issuer=user.issuer,
+            tenant_id=user.tenant_id,
+            is_admin=user.is_admin,
         )
     except PermissionError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
@@ -870,6 +1051,13 @@ class CreateBatchRequest(BaseModel):
     confirm_high_risk: bool = False
     approved_high_risk_paths: list[str] = Field(default_factory=list)
 
+    @field_validator("delay_sec", mode="before")
+    @classmethod
+    def validate_delay(cls, value):
+        if value is None:
+            return None
+        return validate_delay_sec(value)
+
     @model_validator(mode="after")
     def bound_input_size(self):
         total = 0
@@ -881,12 +1069,23 @@ class CreateBatchRequest(BaseModel):
 
 
 @app.post("/api/batch/create", dependencies=[Depends(require_operator)])
-def create_batch_task(req: CreateBatchRequest, user: CurrentUser = Depends(current_user)):
+def create_batch_task(
+    req: CreateBatchRequest,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+    user: CurrentUser = Depends(current_user),
+):
     if not req.items:
         raise HTTPException(status_code=400, detail="任务列表不能为空")
     delay_sec = req.delay_sec if req.delay_sec is not None else 0.05
     api_meta = registry.get_api(req.api_id)
     if not api_meta:
+        _write_audit(
+            user,
+            action="batch.create",
+            resource_type="batch_task",
+            outcome="REJECTED",
+            metadata={"api_id": req.api_id, "reason": "api_not_registered"},
+        )
         raise HTTPException(status_code=404, detail=f"API {req.api_id} 未注册")
     if not req.dry_run and is_high_risk_api(req.api_id, api_meta):
         approved = {
@@ -895,6 +1094,18 @@ def create_batch_task(req: CreateBatchRequest, user: CurrentUser = Depends(curre
             if str(path).strip()
         }
         if not req.confirm_high_risk or not (approved & matching_confirmation_paths(req.api_id, api_meta)):
+            _write_audit(
+                user,
+                action="batch.high_risk_confirmation",
+                resource_type="api",
+                resource_id=req.api_id,
+                outcome="REJECTED",
+                metadata={
+                    "item_count": len(req.items),
+                    "dry_run": bool(req.dry_run),
+                    "reason": "confirmation_missing_or_mismatched",
+                },
+            )
             raise HTTPException(
                 status_code=428,
                 detail="批量高危接口需要显式二次确认：confirm_high_risk=true 且 approved_high_risk_paths 包含该接口的 canonical ID 或 command",
@@ -903,6 +1114,15 @@ def create_batch_task(req: CreateBatchRequest, user: CurrentUser = Depends(curre
     min_delay = float(get_api_batch_guidance(req.api_id).get("min_delay") or 0.0)
     if delay_sec < min_delay:
         raise HTTPException(status_code=422, detail=f"该接口最小执行间隔为 {min_delay:g} 秒")
+    allow_high_risk = bool(req.confirm_high_risk and not req.dry_run)
+    request_fingerprint = batch_request_fingerprint(
+        req.api_id,
+        req.items,
+        delay_sec,
+        bool(req.dry_run),
+        allow_high_risk,
+        approved_high_risk_paths=req.approved_high_risk_paths,
+    )
     try:
         task = task_runner.create_task(
             req.api_id,
@@ -910,18 +1130,126 @@ def create_batch_task(req: CreateBatchRequest, user: CurrentUser = Depends(curre
             delay_sec=delay_sec,
             dry_run=bool(req.dry_run),
             owner_id=user.subject,
-            allow_high_risk=bool(req.confirm_high_risk and not req.dry_run),
+            issuer=user.issuer,
+            tenant_id=user.tenant_id,
+            allow_high_risk=allow_high_risk,
+            idempotency_key=idempotency_key,
+            request_fingerprint=request_fingerprint,
         )
-        if not task_runner.start_task(task.task_id):
+        # A same-key retry may be recovering a RESERVED task left by a worker
+        # crash before its first thread was started.  Let the runner claim
+        # that durable reservation atomically; active/terminal replays remain
+        # no-ops.
+        if not task_runner.start_task(task.task_id, recover_reserved=True):
             raise HTTPException(status_code=409, detail="批处理任务已启动或已终止")
+    except IdempotencyConflict as exc:
+        _write_audit(
+            user,
+            action="batch.idempotency_conflict",
+            resource_type="batch_task",
+            outcome="REJECTED",
+            metadata={"api_id": req.api_id, "reason": "request_fingerprint_mismatch"},
+        )
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except InvalidIdempotencyKey as exc:
+        _write_audit(
+            user,
+            action="batch.create",
+            resource_type="batch_task",
+            outcome="REJECTED",
+            metadata={"api_id": req.api_id, "reason": "invalid_idempotency_key"},
+        )
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     except ValueError as exc:
+        _write_audit(
+            user,
+            action="batch.create",
+            resource_type="batch_task",
+            outcome="REJECTED",
+            metadata={"api_id": req.api_id, "reason": str(exc)[:256]},
+        )
         raise HTTPException(status_code=429, detail=str(exc)) from exc
+    except (sqlite3.Error, OSError) as exc:
+        _write_audit(
+            user,
+            action="batch.create",
+            resource_type="batch_task",
+            outcome="FAILED",
+            metadata={
+                "api_id": req.api_id,
+                "reason": "local_persistence_unavailable",
+                "error_type": type(exc).__name__,
+            },
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="本地任务持久化暂不可用，请检查 SQLite 权限、磁盘空间和本地文件系统",
+        ) from exc
+    _write_audit(
+        user,
+        action="batch.create",
+        resource_type="batch_task",
+        resource_id=task.task_id,
+        metadata={
+            "api_id": task.api_id,
+            "item_count": task.total,
+            "dry_run": bool(req.dry_run),
+            "idempotent_replay": bool(task.idempotent_replay),
+            "high_risk_confirmed": bool(allow_high_risk),
+        },
+    )
     return {
         "status": "success",
         "task_id": task.task_id,
         "total": task.total,
         "api_id": task.api_id,
-        "dry_run": req.dry_run or False
+        "dry_run": req.dry_run or False,
+        "idempotent_replay": bool(task.idempotent_replay),
+    }
+
+
+@app.get("/api/batch/{task_id}", dependencies=[Depends(require_batch_task)])
+def get_batch_task_status(task_id: str):
+    record = task_runner.get_task_record(task_id)
+    if record is not None:
+        return {
+            "status": "success",
+            "data": {
+                "task_id": record["task_id"],
+                "api_id": record["api_id"],
+                "owner_id": record.get("owner_subject") or None,
+                "status": record["status"],
+                "current": int(record.get("current_index") or 0),
+                "total": int(record.get("total") or 0),
+                "success": int(record.get("success_count") or 0),
+                "failed": int(record.get("failed_count") or 0),
+                "error": record.get("error_message"),
+                "created_at": record.get("created_at"),
+                "started_at": record.get("started_at"),
+                "finished_at": record.get("finished_at"),
+                "updated_at": record.get("updated_at"),
+            },
+        }
+    task = task_runner.get_task(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return {
+        "status": "success",
+        "data": {
+            "task_id": task.task_id,
+            "api_id": task.api_id,
+            "owner_id": task.owner_id,
+            "status": task.status,
+            "current": task.current,
+            "total": task.total,
+            "success": task.success,
+            "failed": task.failed,
+            "error": None,
+            "created_at": task.start_time,
+            "started_at": task.start_time,
+            "finished_at": task.end_time,
+            "updated_at": task.end_time or task.start_time,
+        },
     }
 
 
@@ -930,6 +1258,51 @@ def stream_batch_events(task_id: str):
     task = task_runner.get_task(task_id)
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
+
+    if getattr(task, "persistent", False):
+        def persistent_event_generator():
+            last_sequence = -1
+            terminal_status = {"COMPLETED", "CANCELLED", "FAILED", "UNKNOWN"}
+            terminal_events = {"complete", "error"}
+            while True:
+                events = task_runner.list_task_events(
+                    task_id,
+                    after_sequence=last_sequence,
+                )
+                if events:
+                    for sequence, evt in events:
+                        last_sequence = sequence
+                        yield f"data: {json.dumps(evt, ensure_ascii=False)}\n\n"
+                        if evt.get("type") in terminal_events:
+                            return
+
+                record = task_runner.get_task_record(task_id)
+                if record is None:
+                    return
+                if str(record.get("status")) in terminal_status:
+                    # A terminal row without an event can happen if a worker
+                    # died between the two commits.  Do not keep a client
+                    # connected forever; the task detail endpoint remains the
+                    # source of truth for that incomplete event stream.
+                    trailing = task_runner.list_task_events(
+                        task_id,
+                        after_sequence=last_sequence,
+                    )
+                    if not trailing:
+                        return
+                    continue
+                yield ": keep-alive\n\n"
+                time.sleep(1.0)
+
+        return StreamingResponse(
+            persistent_event_generator(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
 
     sub_queue, history_events = task.register_subscriber()
 
@@ -946,7 +1319,7 @@ def stream_batch_events(task_id: str):
                 return
 
             # 2. 持续等待新事件。终态不能截断队列里尚未发出的事件。
-            terminal_status = {"COMPLETED", "CANCELLED", "FAILED"}
+            terminal_status = {"COMPLETED", "CANCELLED", "FAILED", "UNKNOWN"}
             terminal_events = {"complete", "error"}
             while True:
                 try:
@@ -982,29 +1355,95 @@ def stream_batch_events(task_id: str):
 
 
 @app.post("/api/batch/{task_id}/pause", dependencies=[Depends(require_batch_task)])
-def pause_task(task_id: str):
+def pause_task(
+    task_id: str,
+    user: CurrentUser = Depends(current_user),
+):
     task = task_runner.get_task(task_id)
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
+    if getattr(task, "persistent", False):
+        record = task_runner.control_task(task_id, "pause")
+        if record is None:
+            raise HTTPException(status_code=404, detail="Task not found")
+        _write_audit(
+            user,
+            action="batch.pause",
+            resource_type="batch_task",
+            resource_id=task_id,
+            metadata={"task_status": record.get("status")},
+        )
+        return {"status": "success", "task_status": record["status"]}
     task.pause()
+    _write_audit(
+        user,
+        action="batch.pause",
+        resource_type="batch_task",
+        resource_id=task_id,
+        metadata={"task_status": task.status},
+    )
     return {"status": "success", "task_status": task.status}
 
 
 @app.post("/api/batch/{task_id}/resume", dependencies=[Depends(require_batch_task)])
-def resume_task(task_id: str):
+def resume_task(
+    task_id: str,
+    user: CurrentUser = Depends(current_user),
+):
     task = task_runner.get_task(task_id)
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
+    if getattr(task, "persistent", False):
+        record = task_runner.control_task(task_id, "resume")
+        if record is None:
+            raise HTTPException(status_code=404, detail="Task not found")
+        _write_audit(
+            user,
+            action="batch.resume",
+            resource_type="batch_task",
+            resource_id=task_id,
+            metadata={"task_status": record.get("status")},
+        )
+        return {"status": "success", "task_status": record["status"]}
     task.resume()
+    _write_audit(
+        user,
+        action="batch.resume",
+        resource_type="batch_task",
+        resource_id=task_id,
+        metadata={"task_status": task.status},
+    )
     return {"status": "success", "task_status": task.status}
 
 
 @app.post("/api/batch/{task_id}/stop", dependencies=[Depends(require_batch_task)])
-def stop_task(task_id: str):
+def stop_task(
+    task_id: str,
+    user: CurrentUser = Depends(current_user),
+):
     task = task_runner.get_task(task_id)
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
+    if getattr(task, "persistent", False):
+        record = task_runner.control_task(task_id, "stop")
+        if record is None:
+            raise HTTPException(status_code=404, detail="Task not found")
+        _write_audit(
+            user,
+            action="batch.stop",
+            resource_type="batch_task",
+            resource_id=task_id,
+            metadata={"task_status": record.get("status")},
+        )
+        return {"status": "success", "task_status": record["status"]}
     task.stop()
+    _write_audit(
+        user,
+        action="batch.stop",
+        resource_type="batch_task",
+        resource_id=task_id,
+        metadata={"task_status": task.status},
+    )
     return {"status": "success", "task_status": task.status}
 
 
@@ -1013,6 +1452,17 @@ def export_csv(task_id: str, only_failed: bool = False):
     task = task_runner.get_task(task_id)
     result_source = None
     result_count = 0
+    consistency = task_result_consistency(task_id)
+    if consistency["indexed_count"] and not consistency["file_exists"]:
+        raise HTTPException(
+            status_code=409,
+            detail="批处理结果文件已丢失，数据库索引仍存在，拒绝伪造空结果",
+        )
+    if not consistency["consistent"]:
+        raise HTTPException(
+            status_code=409,
+            detail="批处理结果文件与数据库索引不一致，请先执行恢复或人工核对",
+        )
     if os.path.isfile(task_results_path(task_id)):
         result_source = lambda: iter_task_results(task_id)
         result_count = count_task_results(task_id)
@@ -1106,7 +1556,21 @@ def export_csv(task_id: str, only_failed: bool = False):
 @app.get("/api/history", dependencies=[Depends(require_operator)])
 def get_history_list(user: CurrentUser = Depends(current_user)):
     all_history = load_history()
-    history = all_history if user.is_admin else [item for item in all_history if item.get("owner_id") == user.subject]
+    scoped_history = [
+        item
+        for item in all_history
+        if str(item.get("issuer") or "") == user.issuer
+        and str(item.get("tenant_id") or "") == user.tenant_id
+    ]
+    history = (
+        scoped_history
+        if user.is_admin
+        else [
+            item
+            for item in scoped_history
+            if item.get("owner_id") == user.subject
+        ]
+    )
     # 仅在全局历史确实为空且当前用户为管理员时，初始化一次兼容旧版演示记录。
     # 不能根据普通用户过滤后的空视图初始化，否则不同用户会反复抢占 init_208。
     if not all_history and user.is_admin:
@@ -1117,6 +1581,8 @@ def get_history_list(user: CurrentUser = Depends(current_user)):
                     data = json.load(f)
                     init_record = {
                         "task_id": "init_208",
+                        "issuer": user.issuer,
+                        "tenant_id": user.tenant_id,
                         "owner_id": None,
                         "api_id": "c2c_msg_withdraw",
                         "api_name": "撤回单聊消息 (历史归档)",
@@ -1157,6 +1623,21 @@ def get_history_detail(
 ):
     history = load_history()
     match = next((h for h in history if h.get("task_id") == task_id), None)
+    if match is None:
+        record = task_runner.get_task_record(task_id)
+        if record is not None:
+            match = {
+                "task_id": record["task_id"],
+                "api_id": record["api_id"],
+                "owner_id": record.get("owner_subject") or None,
+                "status": record["status"],
+                "total": int(record.get("total") or 0),
+                "success": int(record.get("success_count") or 0),
+                "failed": int(record.get("failed_count") or 0),
+                "result_count": int(record.get("success_count") or 0)
+                + int(record.get("failed_count") or 0),
+                "results_path": record.get("result_location"),
+            }
     if not match:
         raise HTTPException(status_code=404, detail="History record not found")
     # Keep the file backed format for now, but do not send an entire large
@@ -1165,6 +1646,17 @@ def get_history_detail(
     data = dict(match)
     results = match.get("results")
     results_path = match.get("results_path")
+    consistency = task_result_consistency(task_id)
+    if consistency["indexed_count"] and not consistency["file_exists"]:
+        raise HTTPException(
+            status_code=409,
+            detail="批处理结果文件已丢失，数据库索引仍存在，拒绝伪造空结果",
+        )
+    if not consistency["consistent"]:
+        raise HTTPException(
+            status_code=409,
+            detail="批处理结果文件与数据库索引不一致，请先执行恢复或人工核对",
+        )
     if results_path and os.path.isfile(results_path):
         total = int(match.get("result_count") or count_task_results(task_id))
         page = list(iter_task_results(task_id, offset=offset, limit=limit))
@@ -1186,17 +1678,45 @@ def get_history_detail(
 
 
 @app.delete("/api/history/{task_id}", dependencies=[Depends(require_batch_task)])
-def delete_single_history(task_id: str):
+def delete_single_history(
+    task_id: str,
+    user: CurrentUser = Depends(current_user),
+):
+    durable_record = task_runner.get_task_record(task_id)
+    if durable_record is not None and str(durable_record.get("status")) not in {
+        "COMPLETED",
+        "FAILED",
+        "CANCELLED",
+    }:
+        raise HTTPException(
+            status_code=409,
+            detail="运行中、暂停中或结果未知的任务不能删除，请先终止并完成核对",
+        )
     success = delete_history_item(task_id)
     if not success:
         raise HTTPException(status_code=404, detail="History record not found")
+    _write_audit(
+        user,
+        action="history.delete",
+        resource_type="batch_task",
+        resource_id=task_id,
+    )
     return {"status": "success", "message": f"Task {task_id} deleted"}
 
 
 @app.delete("/api/history", dependencies=[Depends(require_admin)])
-def delete_all_history():
-    clear_history()
-    return {"status": "success", "message": "All history records cleared"}
+def delete_all_history(user: CurrentUser = Depends(current_user)):
+    if not clear_history():
+        raise HTTPException(status_code=503, detail="历史清理暂时失败，请稍后重试")
+    _write_audit(
+        user,
+        action="history.clear",
+        resource_type="batch_history",
+    )
+    return {
+        "status": "success",
+        "message": "已清理终态历史记录，运行中、暂停中和结果未知的任务已保留",
+    }
 
 
 if __name__ == "__main__":

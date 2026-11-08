@@ -16,9 +16,16 @@ import urllib.parse
 import urllib.request
 from typing import Any, Optional
 
+from core.file_storage import atomic_write_json
+from core.sync_task_manager import SyncTaskCancelled, SyncTaskManager
+
 # 存储目录
 STORAGE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "storage", "docs"))
-os.makedirs(STORAGE_DIR, exist_ok=True)
+os.makedirs(STORAGE_DIR, mode=0o700, exist_ok=True)
+try:
+    os.chmod(STORAGE_DIR, 0o700)
+except OSError:
+    pass
 
 BEIJING_TZ = timezone(timedelta(hours=8))
 
@@ -454,8 +461,7 @@ def save_doc(doc_data: dict) -> str:
     if not doc_id:
         raise ValueError("Missing doc_id in doc_data")
     filepath = get_doc_path(doc_id)
-    with open(filepath, "w", encoding="utf-8") as f:
-        json.dump(doc_data, f, ensure_ascii=False, indent=2)
+    atomic_write_json(filepath, doc_data, mode=0o600)
     return filepath
 
 
@@ -471,17 +477,24 @@ def get_doc_by_id(doc_id: int) -> Optional[dict]:
 
 
 class DocSyncManager:
-    """
-    文档同步管理器：支持单接口即时同步、后台多线程异步批量同步、进度监控与中断控制
+    """官方文档同步管理器。
+
+    文档正文继续是可重建的文件缓存；同步任务本身使用 ``sync_jobs`` 保存
+    任务句柄、租约、进度和取消标志。因此两个 Uvicorn 进程查询到的是同一
+    状态，进程重启后也不会把另一个进程的任务误报成空闲。
     """
 
-    def __init__(self):
-        self._lock = threading.Lock()
-        self._is_running = False
-        self._cancel_requested = False
-        self._thread: Optional[threading.Thread] = None
+    KIND = "docs_batch"
 
-        self._status = {
+    def __init__(self, task_manager: SyncTaskManager | None = None):
+        self._task_manager = task_manager or SyncTaskManager(persistent=True)
+        self._owner_id = "local"
+
+    @staticmethod
+    def _empty_status() -> dict[str, Any]:
+        return {
+            "task_id": None,
+            "status": "IDLE",
             "is_running": False,
             "total": 0,
             "completed": 0,
@@ -493,16 +506,46 @@ class DocSyncManager:
             "start_time": None,
             "end_time": None,
             "errors": [],
+            "cancel_requested": False,
         }
 
-    def get_status(self) -> dict:
-        with self._lock:
-            return dict(self._status)
+    def get_status(self) -> dict[str, Any]:
+        durable = self._task_manager.get_status(
+            self.KIND,
+            owner_id=None,
+            issuer="",
+            tenant_id="",
+            is_admin=True,
+        )
+        if not durable.get("task_id"):
+            return self._empty_status()
+        progress = durable.get("progress") or {}
+        return {
+            "task_id": durable.get("task_id"),
+            "status": durable.get("status"),
+            "is_running": bool(durable.get("is_running")),
+            "total": int(progress.get("total") or 0),
+            "completed": int(progress.get("completed") or 0),
+            "success_count": int(progress.get("success_count") or 0),
+            "error_count": int(progress.get("error_count") or 0),
+            "percent": int(progress.get("percent") or 0),
+            "current_name": progress.get("current_name") or "",
+            "current_doc_id": progress.get("current_doc_id") or 0,
+            "start_time": progress.get("start_time") or durable.get("started_at"),
+            "end_time": progress.get("end_time") or durable.get("finished_at"),
+            "errors": list(progress.get("errors") or []),
+            "cancel_requested": bool(
+                durable.get("cancel_requested")
+                or progress.get("cancel_requested")
+            ),
+            "result": durable.get("result"),
+            "error": durable.get("error"),
+            "attempt": int(durable.get("attempt") or 0),
+        }
 
     def get_doc_for_api(self, api_meta: dict) -> dict:
-        """
-        获取指定 API 的结构化文档。若本地已同步则返回完整文档；否则返回未同步骨架与降级字段。
-        """
+        """读取本地文档缓存，未同步时返回可用的参数骨架。"""
+
         doc_id = api_meta.get("doc_id")
         api_id = str(api_meta.get("api_id") or "")
         name = api_meta.get("name", "")
@@ -514,13 +557,9 @@ class DocSyncManager:
         if doc_id:
             saved = get_doc_by_id(doc_id)
             if saved:
-                # 补充 api_id 若缺失
                 saved["api_id"] = api_id
-                # GET 只读本地缓存。刷新官方文档必须由显式 POST
-                # /api/docs/sync/{api_id} 触发，避免读取文档时产生外部网络副作用。
                 return saved
 
-        # 本地未同步时提供友好骨架
         req_fields = [
             {
                 "name": f.get("name"),
@@ -530,7 +569,6 @@ class DocSyncManager:
             }
             for f in fields
         ]
-
         req_examples = []
         if sample_payload:
             payload_str = json.dumps(sample_payload, ensure_ascii=False, indent=2)
@@ -554,13 +592,11 @@ class DocSyncManager:
                 {"name": "ErrorCode", "type": "Integer", "description": "错误码：0为成功，非0为失败"},
                 {"name": "ErrorInfo", "type": "String", "description": "详细错误信息"},
             ]
-            default_resp_examples = [
-                {
-                    "title": "标准成功响应",
-                    "content": '{\n  "ActionStatus": "OK",\n  "ErrorCode": 0,\n  "ErrorInfo": ""\n}',
-                    "clean_json": '{\n  "ActionStatus": "OK",\n  "ErrorCode": 0,\n  "ErrorInfo": ""\n}',
-                }
-            ]
+            default_resp_examples = [{
+                "title": "标准成功响应",
+                "content": '{\n  "ActionStatus": "OK",\n  "ErrorCode": 0,\n  "ErrorInfo": ""\n}',
+                "clean_json": '{\n  "ActionStatus": "OK",\n  "ErrorCode": 0,\n  "ErrorInfo": ""\n}',
+            }]
             default_err_codes = [
                 {"code": "0", "description": "操作成功", "solution": "无需处理"},
                 {"code": "60002", "description": "UserSig 签名过期或无效", "solution": "请重新生成管理员 UserSig"},
@@ -583,13 +619,11 @@ class DocSyncManager:
                 {"name": "Response.Error.Code", "type": "String", "description": "错误码，如 FailedOperation"},
                 {"name": "Response.Error.Message", "type": "String", "description": "错误信息描述"},
             ]
-            default_resp_examples = [
-                {
-                    "title": "标准 API 3.0 成功响应示例",
-                    "content": '{\n  "Response": {\n    "RequestId": "d98129a0-8113-41c3-bb02-c322b918731f"\n  }\n}',
-                    "clean_json": '{\n  "Response": {\n    "RequestId": "d98129a0-8113-41c3-bb02-c322b918731f"\n  }\n}',
-                }
-            ]
+            default_resp_examples = [{
+                "title": "标准 API 3.0 成功响应示例",
+                "content": '{\n  "Response": {\n    "RequestId": "d98129a0-8113-41c3-bb02-c322b918731f"\n  }\n}',
+                "clean_json": '{\n  "Response": {\n    "RequestId": "d98129a0-8113-41c3-bb02-c322b918731f"\n  }\n}',
+            }]
             default_err_codes = [
                 {"code": "InvalidParameter", "description": "参数错误，请检查入参类型与取值", "solution": "核对入参字段"},
                 {"code": "AuthFailure.SignatureFailure", "description": "签名失败，SecretId 或 SecretKey 不匹配", "solution": "检查环境配置中的 API 3.0 密钥"},
@@ -616,149 +650,171 @@ class DocSyncManager:
             "notes": [],
         }
 
-    def sync_single(self, doc_id: int, api_id: str = "", doc_url: str = "", mode: str = "auto") -> dict:
-        """
-        同步单个文档并持久化保存
-        """
+    def sync_single(
+        self,
+        doc_id: int,
+        api_id: str = "",
+        doc_url: str = "",
+        mode: str = "auto",
+    ) -> dict:
         parsed = parse_official_doc(doc_id, api_id, doc_url, mode=mode)
         save_doc(parsed)
         return parsed
 
-    def start_batch_sync(self, apis_list: list[dict], force: bool = False, mode: str = "auto") -> dict:
-        """
-        启动后台多线程异步批量同步
-        """
-        with self._lock:
-            if self._is_running:
-                return {
-                    "status": "already_running",
-                    "message": "批量同步任务正在后台运行中",
-                    "sync_status": self._status,
-                }
-
-            self._is_running = True
-            self._cancel_requested = False
-            total_items = len(apis_list)
-
-            self._status = {
-                "is_running": True,
-                "total": total_items,
-                "mode": mode,
-                "completed": 0,
-                "success_count": 0,
-                "error_count": 0,
-                "percent": 0,
-                "current_name": "准备中...",
-                "current_doc_id": 0,
-                "start_time": get_current_time_str(),
-                "end_time": None,
-                "errors": [],
-            }
-
-        def worker():
-            max_workers = 5
-            completed_count = 0
-            success_count = 0
-            error_count = 0
-
-            def process_item(item):
-                nonlocal completed_count, success_count, error_count
-
-                if self._cancel_requested:
-                    return
-
-                doc_id = item.get("doc_id")
-                api_id = item.get("api_id")
-                name = item.get("name", "")
-                doc_url = item.get("doc_url", "")
-
-                if not doc_id:
-                    with self._lock:
-                        completed_count += 1
-                    return
-
-                # 若不是强制全量同步且已存在本地文件，可跳过
-                if not force and os.path.exists(get_doc_path(doc_id)):
-                    with self._lock:
-                        completed_count += 1
-                        success_count += 1
-                        pct = int((completed_count / total_items) * 100)
-                        self._status.update({
-                            "completed": completed_count,
-                            "success_count": success_count,
-                            "percent": pct,
-                            "current_name": f"{name} (已跳过本地已有)",
-                            "current_doc_id": doc_id,
-                        })
-                    return
-
-                with self._lock:
-                    self._status["current_name"] = name
-                    self._status["current_doc_id"] = doc_id
-
-                try:
-                    parsed = parse_official_doc(doc_id, api_id, doc_url, mode=mode)
-                    save_doc(parsed)
-                    with self._lock:
-                        success_count += 1
-                except Exception as e:
-                    with self._lock:
-                        error_count += 1
-                        self._status["errors"].append({
-                            "doc_id": doc_id,
-                            "name": name,
-                            "error": str(e),
-                        })
-
-                with self._lock:
-                    completed_count += 1
-                    pct = int((completed_count / total_items) * 100) if total_items > 0 else 100
-                    self._status.update({
-                        "completed": completed_count,
-                        "success_count": success_count,
-                        "error_count": error_count,
-                        "percent": pct,
-                    })
-
-                # 温和间隔避免过于激进的请求突发
-                time.sleep(0.08)
-
-            executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
-            futures = [executor.submit(process_item, item) for item in apis_list]
-            try:
-                for f in concurrent.futures.as_completed(futures):
-                    if self._cancel_requested:
-                        break
-            finally:
-                for future in futures:
-                    future.cancel()
-                # ``cancel_futures`` cannot stop an already running HTTP
-                # request.  Wait for those requests before publishing the
-                # terminal status so a cancelled batch cannot overlap a new
-                # batch or continue writing after it claims to be finished.
-                executor.shutdown(wait=True, cancel_futures=True)
-
-            with self._lock:
-                self._is_running = False
-                self._status["is_running"] = False
-                self._status["end_time"] = get_current_time_str()
-                self._status["current_name"] = "已完成" if not self._cancel_requested else "已取消"
-
-        self._thread = threading.Thread(target=worker, daemon=True)
-        self._thread.start()
-
-        return {
-            "status": "started",
-            "message": f"已启动 {total_items} 项文档异步后台同步任务",
-            "sync_status": self.get_status(),
+    def start_batch_sync(
+        self,
+        apis_list: list[dict],
+        force: bool = False,
+        mode: str = "auto",
+    ) -> dict:
+        total_items = len(apis_list)
+        initial_progress: dict[str, Any] = {
+            "total": total_items,
+            "mode": mode,
+            "completed": 0,
+            "success_count": 0,
+            "error_count": 0,
+            "percent": 0,
+            "current_name": "准备中...",
+            "current_doc_id": 0,
+            "start_time": get_current_time_str(),
+            "end_time": None,
+            "errors": [],
+            "cancel_requested": False,
         }
 
+        def operation_factory(task_id: str):
+            def operation() -> dict[str, Any]:
+                progress_lock = threading.Lock()
+                state: dict[str, Any] = dict(initial_progress)
+                state["errors"] = []
+
+                def publish() -> None:
+                    with progress_lock:
+                        snapshot = dict(state)
+                        snapshot["errors"] = list(state["errors"][-100:])
+                    self._task_manager.update_progress(task_id, snapshot)
+
+                def cancelled() -> bool:
+                    return self._task_manager.is_cancel_requested(task_id)
+
+                publish()
+
+                def process_item(item: dict[str, Any]) -> None:
+                    if cancelled():
+                        return
+                    doc_id = item.get("doc_id")
+                    api_id = item.get("api_id")
+                    name = item.get("name", "")
+                    doc_url = item.get("doc_url", "")
+                    if not doc_id:
+                        with progress_lock:
+                            state["completed"] += 1
+                        publish()
+                        return
+
+                    if not force and os.path.exists(get_doc_path(doc_id)):
+                        with progress_lock:
+                            state["completed"] += 1
+                            state["success_count"] += 1
+                            state["current_name"] = f"{name} (已跳过本地已有)"
+                            state["current_doc_id"] = doc_id
+                            state["percent"] = int(
+                                state["completed"] / total_items * 100
+                            ) if total_items else 100
+                        publish()
+                        return
+
+                    with progress_lock:
+                        state["current_name"] = name
+                        state["current_doc_id"] = doc_id
+                    publish()
+
+                    try:
+                        parsed = parse_official_doc(
+                            doc_id,
+                            api_id,
+                            doc_url,
+                            mode=mode,
+                        )
+                        save_doc(parsed)
+                        with progress_lock:
+                            state["success_count"] += 1
+                    except Exception as exc:  # noqa: BLE001 - task reports item error
+                        with progress_lock:
+                            state["error_count"] += 1
+                            state["errors"].append(
+                                {
+                                    "doc_id": doc_id,
+                                    "name": name,
+                                    "error": str(exc)[:500],
+                                }
+                            )
+
+                    with progress_lock:
+                        state["completed"] += 1
+                        state["percent"] = int(
+                            state["completed"] / total_items * 100
+                        ) if total_items else 100
+                    publish()
+                    time.sleep(0.08)
+
+                executor = concurrent.futures.ThreadPoolExecutor(max_workers=5)
+                futures = [executor.submit(process_item, item) for item in apis_list]
+                try:
+                    for future in concurrent.futures.as_completed(futures):
+                        future.result()
+                        if cancelled():
+                            break
+                finally:
+                    if cancelled():
+                        for future in futures:
+                            future.cancel()
+                    executor.shutdown(wait=True, cancel_futures=True)
+
+                if cancelled():
+                    with progress_lock:
+                        state["cancel_requested"] = True
+                        state["end_time"] = get_current_time_str()
+                        state["current_name"] = "已取消"
+                    publish()
+                    raise SyncTaskCancelled(state)
+
+                with progress_lock:
+                    state["end_time"] = get_current_time_str()
+                    state["current_name"] = "已完成"
+                publish()
+                return state
+
+            return operation
+
+        result = self._task_manager.start(
+            self.KIND,
+            lambda: None,
+            operation_factory=operation_factory,
+            initial_progress=initial_progress,
+            owner_id=self._owner_id,
+            issuer="",
+            tenant_id="",
+            is_admin=True,
+        )
+        result["sync_status"] = self.get_status()
+        if result.get("status") == "started":
+            result["message"] = f"已启动 {total_items} 项文档异步后台同步任务"
+        elif result.get("status") == "already_running":
+            result["message"] = "批量同步任务正在后台运行中"
+        return result
+
     def cancel_batch_sync(self) -> dict:
-        with self._lock:
-            if not self._is_running:
-                return {"status": "not_running", "message": "当前没有运行中的同步任务"}
-            self._cancel_requested = True
-            return {"status": "cancelling", "message": "已发送取消同步请求"}
+        result = self._task_manager.cancel(
+            self.KIND,
+            owner_id=self._owner_id,
+            issuer="",
+            tenant_id="",
+            is_admin=True,
+        )
+        result["sync_status"] = self.get_status()
+        return result
 
     def get_summary(self, apis_list: list[dict]) -> dict:
         total = len(apis_list)
@@ -770,7 +826,10 @@ class DocSyncManager:
             if doc_id and os.path.exists(get_doc_path(doc_id)):
                 synced_count += 1
                 try:
-                    mtime = datetime.fromtimestamp(os.path.getmtime(get_doc_path(doc_id)), tz=BEIJING_TZ)
+                    mtime = datetime.fromtimestamp(
+                        os.path.getmtime(get_doc_path(doc_id)),
+                        tz=BEIJING_TZ,
+                    )
                     mtime_str = mtime.strftime("%Y-%m-%d %H:%M:%S")
                     if not last_sync_time or mtime_str > last_sync_time:
                         last_sync_time = mtime_str
@@ -785,6 +844,5 @@ class DocSyncManager:
             "last_sync_time": last_sync_time,
             "is_running": self.get_status()["is_running"],
         }
-
 
 doc_sync_manager = DocSyncManager()

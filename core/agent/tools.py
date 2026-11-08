@@ -20,9 +20,14 @@ from typing import Any, cast
 
 from smolagents import Tool
 
-from ..runtime_context import runtime_is_admin, runtime_is_operator, runtime_user_id
+from ..runtime_context import (
+    runtime_auth_scope,
+    runtime_is_admin,
+    runtime_is_operator,
+    runtime_user_id,
+)
 from ..tim_client import TimClient
-from .bot_manager import BotManager
+from .bot_manager import BotIdConflict, BotManager
 from .constants import HIGH_RISK_API_KEYWORDS
 from .risk import api_identities, is_high_risk_api, resolve_api
 
@@ -34,6 +39,8 @@ from .risk import api_identities, is_high_risk_api, resolve_api
 # only reachable from this module's implementation code, while tool instances
 # remain disposable and do not retain clients after collection.
 _TOOL_DEPS: weakref.WeakKeyDictionary[Any, dict[str, Any]] = weakref.WeakKeyDictionary()
+DEFAULT_READ_FILE_CHARS = 4_000
+MAX_READ_FILE_CHARS = 100_000
 
 
 def _register_tool_deps(tool: Any, **deps: Any) -> None:
@@ -1112,6 +1119,14 @@ class RunSkillTool(Tool):
         skill = bot_manager.get_skill(bot_id, name)
         if not skill:
             return {"error": f"未找到技能: {name}"}
+        if skill.integrity_status != "verified":
+            return {
+                "success": False,
+                "error": (
+                    "技能完整性校验失败："
+                    f"{skill.integrity_error or skill.integrity_status}"
+                ),
+            }
 
         args = kwargs
         if isinstance(args, str):
@@ -1208,15 +1223,21 @@ class CreateBotTool(Tool):
         # 清洗可能存在的 ChatMessage repr
         target_prompt = BotManager.clean_prompt_text(target_prompt)
 
-        new_bot = bot_manager.create_bot(
-            bot_id=target_id,
-            name=clean_name,
-            avatar=target_avatar,
-            description=target_desc,
-            base_prompt=target_prompt,
-            suggested_prompts=target_suggested,
-            owner_id=None if runtime_user_id.get() == "local" else runtime_user_id.get(),
-        )
+        try:
+            new_bot = bot_manager.create_bot(
+                bot_id=target_id,
+                name=clean_name,
+                avatar=target_avatar,
+                description=target_desc,
+                base_prompt=target_prompt,
+                suggested_prompts=target_suggested,
+                owner_id=None if runtime_user_id.get() == "local" else runtime_user_id.get(),
+            )
+        except BotIdConflict:
+            return {
+                "success": False,
+                "error": "智能体 ID 已被其他并发请求占用，请重试生成或更换名称",
+            }
         return {
             "success": True,
             "message": f"🎉 专属智能体【{new_bot.name}】创建成功！已成功入驻工作室，可随时在左侧切换或在对话中通过 @{new_bot.name} 进行协同调度。",
@@ -1326,7 +1347,20 @@ class CallAgentTool(Tool):
         # 1. 显式 ID 匹配
         if explicit_id:
             cand = bot_manager.get_bot(explicit_id)
-            if cand and (runtime_is_admin.get() or cand.visibility == "public" or cand.owner_id == runtime_user_id.get()):
+            active_scope = runtime_auth_scope.get()
+            if (
+                cand
+                and BotManager.bot_scope_matches(
+                    cand,
+                    issuer=active_scope.issuer,
+                    tenant_id=active_scope.tenant_id,
+                )
+                and (
+                    runtime_is_admin.get()
+                    or cand.visibility == "public"
+                    or cand.owner_id == runtime_user_id.get()
+                )
+            ):
                 target_bot = cand
 
         # 2. 精确 ID 或名称匹配
@@ -1492,7 +1526,14 @@ class ReadFileTool(Tool):
         return None
 
     def forward(self, file_path: str, max_chars: int | None = 4000) -> str:
-        limit = max_chars or 4000
+        if max_chars is None:
+            limit = DEFAULT_READ_FILE_CHARS
+        elif isinstance(max_chars, bool) or not isinstance(max_chars, int):
+            return f"❌ max_chars 必须是 1 到 {MAX_READ_FILE_CHARS} 之间的整数"
+        elif max_chars < 1 or max_chars > MAX_READ_FILE_CHARS:
+            return f"❌ max_chars 必须是 1 到 {MAX_READ_FILE_CHARS} 之间的整数"
+        else:
+            limit = max_chars
         path = self._resolve_readable_path(file_path)
         if not path:
             return f"❌ 文件不存在: '{file_path}'"
@@ -1518,9 +1559,22 @@ class ReadFileTool(Tool):
                 return f"读取 DOCX 失败: {e!s}"
         elif ftype == "pdf":
             try:
+                from .file_parser import MAX_PDF_PAGES
                 import pypdf
                 reader = pypdf.PdfReader(path)
-                pages_text = [p.extract_text() for p in reader.pages if p.extract_text()]
+                if len(reader.pages) > MAX_PDF_PAGES:
+                    return f"读取 PDF 失败: PDF 页数超过 {MAX_PDF_PAGES} 页限制"
+                pages_text = []
+                total_chars = 0
+                for page in reader.pages:
+                    page_text = page.extract_text() or ""
+                    if not page_text:
+                        continue
+                    remaining = limit - total_chars
+                    if remaining <= 0:
+                        break
+                    pages_text.append(page_text[:remaining])
+                    total_chars += min(len(page_text), remaining)
                 full_text = "\n\n".join(pages_text)
                 if len(full_text) > limit:
                     return full_text[:limit] + f"\n\n[... PDF 内容已截断，共读取前 {limit} 字符]"
@@ -1549,12 +1603,24 @@ class SearchKnowledgeTool(Tool):
     }
     output_type = "string"
 
-    def __init__(self, bot_id: str, rag_mgr: Any | None = None):
+    def __init__(
+        self,
+        bot_id: str,
+        rag_mgr: Any | None = None,
+        allow_private_knowledge: bool = True,
+    ):
         super().__init__()
         from .rag_manager import rag_manager
-        _register_tool_deps(self, bot_id=bot_id, rag_mgr=rag_mgr or rag_manager)
+        _register_tool_deps(
+            self,
+            bot_id=bot_id,
+            rag_mgr=rag_mgr or rag_manager,
+            allow_private_knowledge=allow_private_knowledge,
+        )
 
     def forward(self, query: str) -> str:
+        if not _get_tool_dep(self, "allow_private_knowledge", True):
+            return "当前公共 BOT 不提供企业私有知识库检索。"
         bot_id = _get_tool_dep(self, "bot_id")
         rag_mgr = _get_tool_dep(self, "rag_mgr")
         results = rag_mgr.search(bot_id, query, top_k=4)
@@ -1577,6 +1643,7 @@ def build_bot_tools(
     approval_requester: Any | None = None,
     cloud_client: Any | None = None,
     orchestration_recorder: Any | None = None,
+    include_knowledge_tool: bool = True,
 ) -> list[Tool]:
     """为指定 BOT 组装能力工具集（涵盖云直播 API 3.0 与即时通信 IM REST API）"""
     tools = [
@@ -1619,8 +1686,9 @@ def build_bot_tools(
             orchestration_recorder,
         ),
         ReadFileTool(bot_id, bot_manager),
-        SearchKnowledgeTool(bot_id)
     ]
+    if include_knowledge_tool:
+        tools.append(SearchKnowledgeTool(bot_id))
     # 核心限制：仅内建全能助手 (default_assistant) 独享新建智能体的能力
     if bot_id == "default_assistant":
         tools.append(CreateBotTool(bot_manager))

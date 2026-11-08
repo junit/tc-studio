@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import sqlite3
 import sys
 import threading
 from types import SimpleNamespace
@@ -59,6 +60,63 @@ def test_empty_filtered_history_does_not_initialize_global_demo(monkeypatch):
     )
     result = app_module.get_history_list(CurrentUser("alice", frozenset({"operator"})))
     assert result == {"status": "success", "data": []}
+
+
+def test_current_user_exposes_signed_issuer_and_tenant_scope():
+    user = CurrentUser(
+        "same-subject",
+        claims={
+            "iss": "https://issuer.example/",
+            "tenant_id": "tenant-a",
+        },
+    )
+    assert user.issuer == "https://issuer.example"
+    assert user.tenant_id == "tenant-a"
+
+    alias_user = CurrentUser(
+        "same-subject",
+        claims={"iss": "https://issuer.example", "tid": "tenant-b"},
+    )
+    assert alias_user.tenant_id == "tenant-b"
+
+
+def test_batch_task_scope_rejects_same_subject_from_other_tenant(monkeypatch):
+    task = SimpleNamespace(
+        task_id="scoped-task",
+        issuer="https://issuer.example",
+        tenant_id="tenant-a",
+        owner_id="same-subject",
+    )
+    monkeypatch.setattr(app_module.task_runner, "get_task", lambda _task_id: task)
+    user = CurrentUser(
+        "same-subject",
+        frozenset({"operator"}),
+        {"iss": "https://issuer.example", "tenant_id": "tenant-b"},
+    )
+    with pytest.raises(HTTPException) as exc_info:
+        app_module.require_batch_task("scoped-task", user)
+    assert exc_info.value.status_code == 403
+
+
+def test_batch_create_returns_503_when_local_sqlite_is_unavailable(monkeypatch):
+    def fail_create(*_args, **_kwargs):
+        raise sqlite3.OperationalError("attempt to write a readonly database")
+
+    monkeypatch.setattr(app_module.task_runner, "create_task", fail_create)
+    request = app_module.CreateBatchRequest(
+        api_id="c2c_msg_withdraw",
+        items=[{"To_Account": "readonly-user"}],
+        delay_sec=1,
+        dry_run=True,
+    )
+    with pytest.raises(HTTPException) as exc_info:
+        app_module.create_batch_task(
+            request,
+            idempotency_key=None,
+            user=CurrentUser("operator", frozenset({"operator"})),
+        )
+    assert exc_info.value.status_code == 503
+    assert "本地任务持久化暂不可用" in str(exc_info.value.detail)
 
 
 def test_production_fails_closed_when_auth_disabled(monkeypatch):
@@ -272,7 +330,7 @@ def test_public_bot_history_is_partitioned(tmp_path):
 
 
 def test_public_bot_legacy_state_is_migrated_per_user(tmp_path, monkeypatch):
-    """Pre-auth public history/files remain visible after OIDC partitioning."""
+    """Pre-auth public state stays quarantined until an explicit migration."""
     from apis import agent as agent_api
     from core.agent.bot_manager import BotManager
     from core.runtime_context import runtime_user_id
@@ -298,6 +356,10 @@ def test_public_bot_legacy_state_is_migrated_per_user(tmp_path, monkeypatch):
 
     monkeypatch_target = runtime_user_id.set("alice")
     try:
+        assert manager.get_history(bot.id) == []
+        assert manager.list_memories(bot.id) == []
+        assert manager.list_bot_files(bot.id) == []
+        manager.migrate_legacy_state(bot.id, "alice")
         assert manager.get_history(bot.id)[0]["content"] == "历史报告已保留"
         assert manager.list_memories(bot.id)[0].key == "legacy-fact"
         assert manager.list_bot_files(bot.id)[0]["name"] == "f_1_report.txt"
@@ -314,8 +376,9 @@ def test_public_bot_legacy_state_is_migrated_per_user(tmp_path, monkeypatch):
 
     bob_token = runtime_user_id.set("bob")
     try:
-        assert manager.get_history(bot.id)[0]["id"] == "legacy-1"
-        assert os.path.isfile(os.path.join(manager._uploads_dir(bot.id), "f_1_report.txt"))
+        assert manager.get_history(bot.id) == []
+        assert manager.list_memories(bot.id) == []
+        assert manager.list_bot_files(bot.id) == []
     finally:
         runtime_user_id.reset(bob_token)
 

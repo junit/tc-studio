@@ -21,6 +21,7 @@ import threading
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional, Any
 
+from core.file_storage import atomic_write_json
 from core.tree_syncer import fetch_doc_detail_api
 
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -106,8 +107,7 @@ def _save_raw_doc(doc_id: int, detail: dict, title: str, doc_url: str):
         "response_examples": [],
         "error_codes": [],
     }
-    with open(filepath, "w", encoding="utf-8") as f:
-        json.dump(record, f, ensure_ascii=False, indent=2)
+    atomic_write_json(filepath, record, mode=0o600)
 
 
 def parse_request_structure_20458(body: str, title: str) -> dict:
@@ -490,8 +490,11 @@ class CommonSpecsManager:
                         specs["structs"] = parsed_structs
                         # 同时也确保 live_data_types.json 得到持久化更新
                         if parsed_structs.get("structs"):
-                            with open(DATA_TYPES_PATH, "w", encoding="utf-8") as df:
-                                json.dump(parsed_structs["structs"], df, ensure_ascii=False, indent=2)
+                            atomic_write_json(
+                                DATA_TYPES_PATH,
+                                parsed_structs["structs"],
+                                mode=0o644,
+                            )
                     elif doc_id == 30427:
                         specs["errors"] = parse_error_codes_30427(body, title)
                     elif doc_id == 34019:
@@ -503,8 +506,7 @@ class CommonSpecsManager:
 
             # 保存解析后结构化数据至 live_common_specs.json
             cache_path = _specs_cache_path(service)
-            with open(cache_path, "w", encoding="utf-8") as f:
-                json.dump(specs, f, ensure_ascii=False, indent=2)
+            atomic_write_json(cache_path, specs, mode=0o644)
 
             with self._lock:
                 self._specs_cache[service] = specs

@@ -41,7 +41,7 @@ from smolagents.models import (
 )
 
 from ..cloud_client import UniversalCloudClient
-from ..runtime_context import runtime_is_admin, runtime_user_id
+from ..runtime_context import runtime_auth_scope, runtime_is_admin, runtime_user_id
 from .bot_manager import BotManager, bot_manager
 from .constants import (
     AUTHORIZED_IMPORTS,
@@ -376,8 +376,6 @@ def _spawn_executor_worker(
         liveness_conn, expected_parent_pid, inherited_liveness_writer
     )
     try:
-        with suppress(Exception):
-            _executor_send(conn, {"kind": "ready", "process_group": process_group})
         local = local_python_executor.LocalPythonExecutor(
             additional_authorized_imports,
             max_print_outputs_length=max_print_outputs_length,
@@ -389,6 +387,8 @@ def _spawn_executor_worker(
             **dict(base_tools),
             **{name: _ChildRpcProxy(conn, name) for name in function_names},
         }
+        with suppress(Exception):
+            _executor_send(conn, {"kind": "ready", "process_group": process_group})
         while True:
             try:
                 message = _executor_recv(conn)
@@ -455,8 +455,6 @@ def _killable_executor_worker(
         process_group = _prepare_worker_lifecycle(
             liveness_conn, expected_parent_pid, inherited_liveness_writer
         )
-        with suppress(Exception):
-            _executor_send(conn, {"kind": "ready", "process_group": process_group})
         local = local_python_executor.LocalPythonExecutor(
             executor.additional_authorized_imports,
             max_print_outputs_length=executor.max_print_outputs_length,
@@ -465,6 +463,8 @@ def _killable_executor_worker(
         local.state = executor.state
         local.static_tools = executor.static_tools
         local.custom_tools = executor.custom_tools
+        with suppress(Exception):
+            _executor_send(conn, {"kind": "ready", "process_group": process_group})
         while True:
             try:
                 message = _executor_recv(conn)
@@ -630,13 +630,20 @@ class KillablePythonExecutor(PythonExecutor):
         # macOS can report a single active Python thread while Objective-C /
         # CoreFoundation worker threads and runtime locks still exist below
         # Python.  Avoid fork there; the spawn/RPC path is the portable
-        # process boundary for Darwin and Windows.
+        # process boundary for Darwin and Windows.  External capabilities also
+        # use spawn/RPC on Linux: fork would inherit and execute the callable
+        # inside the child, preventing the parent from extending the deadline
+        # across tool I/O and widening the child's inherited capability set.
+        has_external_capabilities = bool(
+            self._child_tool_names or self._child_function_names
+        )
         use_fork = (
             not self.force_spawn
             and self._fork_ctx is not None
             and os.name == "posix"
             and not sys.platform.startswith("darwin")
             and threading.active_count() == 1
+            and not has_external_capabilities
         )
         if not use_fork and self._spawn_ctx is None:
             raise RuntimeError("当前平台多线程执行缺少 spawn 进程边界")
@@ -687,30 +694,30 @@ class KillablePythonExecutor(PythonExecutor):
             liveness_read.close()
         self._process = process
         if self._spawn_worker:
-            try:
-                _executor_send(
-                    self._conn,
-                    {
-                        "kind": "variables",
-                        "variables": _executor_state_snapshot(self.state),
-                    },
-                )
-                # Spawn startup and module import time are infrastructure
-                # overhead, not user code execution.  Wait for the worker's
-                # ready handshake before starting the first code deadline so
-                # short (for example 100 ms) budgets remain meaningful on
-                # macOS and Windows.
-                if not self._conn.poll(5.0):
-                    raise RuntimeError("Python 执行器进程启动超时")
-                ready = _executor_recv(self._conn)
-                if ready.get("kind") != "ready":
-                    raise RuntimeError("Python 执行器握手失败")
-                process_group_id = ready.get("process_group")
-                if isinstance(process_group_id, int) and process_group_id > 1:
-                    self._process_group_id = process_group_id
-            except BaseException:
-                self._terminate_process()
-                raise
+            _executor_send(
+                self._conn,
+                {
+                    "kind": "variables",
+                    "variables": _executor_state_snapshot(self.state),
+                },
+            )
+        try:
+            # Process startup and module import time are infrastructure
+            # overhead, not user code execution.  Both fork and spawn workers
+            # publish the same ready handshake; wait for it before starting
+            # the first code deadline so short budgets remain meaningful on
+            # every supported platform.
+            if not self._conn.poll(5.0):
+                raise RuntimeError("Python 执行器进程启动超时")
+            ready = _executor_recv(self._conn)
+            if ready.get("kind") != "ready":
+                raise RuntimeError("Python 执行器握手失败")
+            process_group_id = ready.get("process_group")
+            if isinstance(process_group_id, int) and process_group_id > 1:
+                self._process_group_id = process_group_id
+        except BaseException:
+            self._terminate_process()
+            raise
 
     def _apply_state(self, snapshot: Any) -> None:
         if isinstance(snapshot, dict):
@@ -1892,8 +1899,25 @@ class AgentEngine:
         self._sandbox_max_entries = DEFAULT_SANDBOX_MAX_ENTRIES
         self._sandbox_lock = threading.Lock()
 
-    def _sandbox_key(self, bot_id: str, user_id: str | None = None) -> str:
-        return f"{bot_id}:{user_id or runtime_user_id.get()}"
+    def _sandbox_key(
+        self,
+        bot_id: str,
+        user_id: str | None = None,
+        issuer: str | None = None,
+        tenant_id: str | None = None,
+    ) -> str:
+        active_scope = runtime_auth_scope.get()
+        effective_user = user_id or active_scope.subject or runtime_user_id.get()
+        effective_issuer = active_scope.issuer if issuer is None else str(issuer or "")
+        effective_tenant = active_scope.tenant_id if tenant_id is None else str(tenant_id or "")
+        if not effective_issuer and not effective_tenant:
+            return f"{bot_id}:{effective_user}"
+        import hashlib
+
+        identity = "\0".join(
+            (str(bot_id), effective_issuer, effective_tenant, effective_user)
+        )
+        return f"{bot_id}:scope:{hashlib.sha256(identity.encode('utf-8')).hexdigest()[:24]}"
 
     def _remember_sandbox(self, key: str, value: dict[str, Any]) -> None:
         with self._sandbox_lock:
@@ -2191,17 +2215,18 @@ class AgentEngine:
         )
 
         # 11. 企业知识库与私有运维手册规范
-        from .rag_manager import rag_manager
+        if getattr(bot, "visibility", "private") != "public":
+            from .rag_manager import rag_manager
 
-        docs = rag_manager.list_documents(bot.id)
-        enabled_docs = [d for d in docs if d.get("enabled", True)]
-        if enabled_docs:
-            doc_names = ", ".join([f"《{d['name']}》" for d in enabled_docs])
-            prompt_parts.append(
-                f"## 📚 企业私有知识库与运维手册已挂载 ({len(enabled_docs)} 份文档)\n"
-                f"当前智能体已挂载以下内部业务知识文档：{doc_names}。\n"
-                f"当用户提问涉及团队特有排障规范、错误码处置 SOP、私有群规或非公开业务规则时，请优先调用 `search_knowledge(query)` 工具进行检索核实，确保回答完全符合团队私有业务规范。\n"
-            )
+            docs = rag_manager.list_documents(bot.id)
+            enabled_docs = [d for d in docs if d.get("enabled", True)]
+            if enabled_docs:
+                doc_names = ", ".join([f"《{d['name']}》" for d in enabled_docs])
+                prompt_parts.append(
+                    f"## 📚 企业私有知识库与运维手册已挂载 ({len(enabled_docs)} 份文档)\n"
+                    f"当前智能体已挂载以下内部业务知识文档：{doc_names}。\n"
+                    f"当用户提问涉及团队特有排障规范、错误码处置 SOP、私有群规或非公开业务规则时，请优先调用 `search_knowledge(query)` 工具进行检索核实，确保回答完全符合团队私有业务规范。\n"
+                )
 
         return "\n".join(prompt_parts)
 
@@ -2234,6 +2259,33 @@ class AgentEngine:
             raise ValueError(f"目标智能体 '{target_bot_id}' 不存在")
 
         caller_bot = self.manager.get_bot(caller_bot_id)
+        active_scope = runtime_auth_scope.get()
+        if not self.manager.bot_scope_matches(
+            target_bot,
+            issuer=active_scope.issuer,
+            tenant_id=active_scope.tenant_id,
+        ):
+            raise PermissionError("目标智能体不属于当前认证范围")
+        if (
+            not caller_bot
+            or not self.manager.bot_scope_matches(
+                caller_bot,
+                issuer=active_scope.issuer,
+                tenant_id=active_scope.tenant_id,
+            )
+            or not (
+                runtime_is_admin.get()
+                or caller_bot.visibility == "public"
+                or caller_bot.owner_id == runtime_user_id.get()
+            )
+        ):
+            raise PermissionError("当前智能体不属于当前认证范围或无权发起协同")
+        if not (
+            runtime_is_admin.get()
+            or target_bot.visibility == "public"
+            or target_bot.owner_id == runtime_user_id.get()
+        ):
+            raise PermissionError("无权委派到目标智能体")
         caller_name = caller_bot.name if caller_bot else caller_bot_id
 
         # 记录到目标智能体历史中
@@ -2285,6 +2337,7 @@ class AgentEngine:
             approval_requester=delegated_tool_approval_requester,
             cloud_client=self.cloud_client,
             orchestration_recorder=delegated_tool_orchestration_recorder,
+            include_knowledge_tool=getattr(target_bot, "visibility", "private") != "public",
         )
         system_prompt = self.assemble_system_prompt(target_bot)
 
@@ -2467,6 +2520,7 @@ class AgentEngine:
             approval_requester=tool_approval_requester,
             cloud_client=self.cloud_client,
             orchestration_recorder=tool_orchestration_recorder,
+            include_knowledge_tool=getattr(bot, "visibility", "private") != "public",
         )
         system_prompt = self.assemble_system_prompt(bot)
         stream_start_time = time.time()

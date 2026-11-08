@@ -40,6 +40,14 @@ class SkillItem(BaseModel):
         default_factory=dict, description="入参模式说明"
     )
     created_at: str = Field(default_factory=now_iso)
+    integrity_status: str = Field(
+        default="unknown",
+        description="技能源码完整性状态：verified、missing、mismatch 或 unknown",
+    )
+    integrity_error: str | None = Field(
+        default=None,
+        description="源码哈希校验失败时的可诊断原因",
+    )
 
 
 class BotStats(BaseModel):
@@ -58,6 +66,8 @@ class BotConfig(BaseModel):
 
     id: str = Field(..., description="BOT 唯一标识符")
     owner_id: str | None = Field(default=None, description="资源所有者 OIDC subject")
+    issuer: str = Field(default="", description="资源所有者的 OIDC issuer")
+    tenant_id: str = Field(default="", description="资源所属租户")
     visibility: str = Field(default="private", description="Bot 可见性：public 或 private")
     name: str = Field(..., description="BOT 名称")
     avatar: str = Field(default="🤖", description="头像 Emoji")

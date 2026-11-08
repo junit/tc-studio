@@ -98,3 +98,21 @@ def test_sync_task_status_is_owner_scoped(isolated_sync_manager):
     with pytest.raises(HTTPException) as exc_info:
         app_module.get_official_tree_sync_status(task_id, CurrentUser("bob", frozenset({"operator"})))
     assert exc_info.value.status_code == 403
+
+
+def test_sync_task_scope_isolated_by_issuer_and_tenant(isolated_sync_manager):
+    task = isolated_sync_manager.start(
+        "docs_tree",
+        lambda: {"ok": True},
+        owner_id="same-subject",
+        issuer="https://issuer.example",
+        tenant_id="tenant-a",
+    )
+    with pytest.raises(PermissionError):
+        isolated_sync_manager.get_status(
+            "docs_tree",
+            task["task_id"],
+            owner_id="same-subject",
+            issuer="https://issuer.example",
+            tenant_id="tenant-b",
+        )

@@ -10,13 +10,25 @@ import json
 import math
 import threading
 import time
+import uuid
+from contextlib import contextmanager, suppress
 from typing import Any, Dict, List, Optional, Tuple
 
-from .file_parser import format_file_size, validate_zip_archive
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows fallback keeps process-local safety
+    fcntl = None
+
+from .file_parser import MAX_PDF_PAGES, format_file_size, validate_zip_archive
+from core.persistence import (
+    SqliteBotMetadataStore,
+    database_path as resolve_database_path,
+)
+from core.runtime_context import runtime_auth_scope, runtime_user_id
 
 MAX_RAG_TEXT_CHARS = 2_000_000
 MAX_RAG_CHUNKS = 5_000
-MAX_RAG_PDF_PAGES = 500
+MAX_RAG_PDF_PAGES = MAX_PDF_PAGES
 
 
 def tokenize(text: str) -> List[str]:
@@ -48,11 +60,111 @@ class RagManager:
     """轻量级知识库与文档检索引擎 (Pure Python BM25 + Section Chunking)"""
 
     def __init__(self, data_root: Optional[str] = None):
+        explicit_data_root = data_root is not None
         if not data_root:
             base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-            data_root = os.path.join(base_dir, "data", "bots")
+            configured_data_dir = os.environ.get("TIM_DATA_DIR")
+            data_root = os.path.join(
+                configured_data_dir or os.path.join(base_dir, "data"),
+                "bots",
+            )
         self.data_root = data_root
+        database_target = (
+            os.path.join(os.path.dirname(os.path.abspath(self.data_root)), "tim.sqlite3")
+            if explicit_data_root
+            else resolve_database_path()
+        )
+        self.database_path = resolve_database_path(database_target)
+        self.metadata_store = SqliteBotMetadataStore(self.database_path)
         self._lock = threading.RLock()
+        self._file_lock_state = threading.local()
+
+    def _metadata_scope(self, bot_id: str) -> dict[str, str]:
+        """Resolve the owner scope for a private BOT's RAG metadata."""
+        bot_manager = None
+        try:
+            from core.agent.bot_manager import bot_manager
+            bot = bot_manager.get_bot(bot_id)
+        except Exception:
+            bot = None
+        if bot:
+            return bot_manager._metadata_scope(bot_id, bot=bot)
+
+        # Standalone migration/tests may use a RagManager without a registered
+        # BotManager definition.  Preserve that mode while still carrying the
+        # authenticated issuer/tenant through the SQLite row.
+        active_scope = runtime_auth_scope.get()
+        effective_user_id = str(runtime_user_id.get() or "")
+        return {
+            "issuer": active_scope.issuer,
+            "tenant_id": active_scope.tenant_id,
+            "owner_subject": (
+                "" if effective_user_id == "local" else effective_user_id
+            ),
+        }
+
+    def _bot_scope_matches_runtime(self, bot_id: str) -> bool:
+        """Fail closed when the authenticated tenant cannot own this BOT."""
+        try:
+            from core.agent.bot_manager import bot_manager
+
+            bot = bot_manager.get_bot(bot_id)
+            if bot is None:
+                # A standalone RagManager can still be used for one-time
+                # legacy migration before a BotManager definition exists.
+                return True
+            active_scope = runtime_auth_scope.get()
+            return bot_manager.bot_scope_matches(
+                bot,
+                issuer=active_scope.issuer,
+                tenant_id=active_scope.tenant_id,
+            )
+        except Exception:
+            return False
+
+    def _import_legacy_metadata_if_needed(self, bot_id: str) -> None:
+        """Import old docs/chunks only when SQLite has no document rows."""
+        if not self._bot_scope_matches_runtime(bot_id):
+            return
+        scope = self._metadata_scope(bot_id)
+        if self.metadata_store.list_rag_documents(bot_id, **scope):
+            return
+        docs = self._read_json(self._get_docs_path(bot_id), [])
+        chunks = self._read_json(self._get_chunks_path(bot_id), [])
+        if not isinstance(docs, list) or not docs:
+            return
+        chunks_by_doc: dict[str, list[dict[str, Any]]] = {}
+        if isinstance(chunks, list):
+            for chunk in chunks:
+                if isinstance(chunk, dict) and chunk.get("doc_id"):
+                    chunks_by_doc.setdefault(str(chunk["doc_id"]), []).append(chunk)
+        imported = False
+        for document in docs:
+            if not isinstance(document, dict) or not document.get("id"):
+                continue
+            document_id = str(document["id"])
+            stored_name = document.get("stored_name")
+            blob_uri = (
+                f"local://data/bots/{bot_id}/knowledge/files/{stored_name}"
+                if stored_name
+                else None
+            )
+            self.metadata_store.replace_rag_document(
+                bot_id=bot_id,
+                document=document,
+                chunks=chunks_by_doc.get(document_id, []),
+                blob_uri=blob_uri,
+                **scope,
+            )
+            imported = True
+        if imported:
+            # These files are now compatibility sources only.  Removing them
+            # after a successful lazy import prevents a later delete from
+            # resurrecting a document that has already been removed in SQL.
+            with suppress(OSError):
+                os.remove(self._get_docs_path(bot_id))
+            with suppress(OSError):
+                os.remove(self._get_chunks_path(bot_id))
 
     def _get_kb_dir(self, bot_id: str) -> str:
         kb_dir = os.path.join(self.data_root, bot_id, "knowledge")
@@ -68,6 +180,37 @@ class RagManager:
 
     def _get_chunks_path(self, bot_id: str) -> str:
         return os.path.join(self._get_kb_dir(bot_id), "chunks.json")
+
+    @contextmanager
+    def _storage_lock(self, bot_id: str):
+        """Serialize one BOT's RAG read/modify/write transaction across workers."""
+        kb_dir = self._get_kb_dir(bot_id)
+        lock_path = os.path.join(kb_dir, ".rag.lock")
+        lock_key = os.path.abspath(lock_path)
+        held = getattr(self._file_lock_state, "held", set())
+        if lock_key in held:
+            yield
+            return
+
+        with self._lock:
+            if fcntl is None:
+                yield
+                return
+            with suppress(OSError):
+                os.chmod(lock_path, 0o600)
+            with open(lock_path, "a+", encoding="utf-8") as lock_file:
+                try:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+                except OSError as exc:
+                    raise RuntimeError(f"无法获取知识库文件锁: {lock_path}") from exc
+                held.add(lock_key)
+                self._file_lock_state.held = held
+                try:
+                    yield
+                finally:
+                    held.discard(lock_key)
+                    with suppress(OSError):
+                        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
     def _read_json(self, file_path: str, default: Any) -> Any:
         with self._lock:
@@ -98,8 +241,12 @@ class RagManager:
 
     def list_documents(self, bot_id: str) -> List[Dict[str, Any]]:
         """列出指定 BOT 挂载的所有企业知识库与手册文档"""
-        docs_path = self._get_docs_path(bot_id)
-        return self._read_json(docs_path, [])
+        with self._storage_lock(bot_id):
+            if not self._bot_scope_matches_runtime(bot_id):
+                return []
+            scope = self._metadata_scope(bot_id)
+            self._import_legacy_metadata_if_needed(bot_id)
+            return self.metadata_store.list_rag_documents(bot_id, **scope)
 
     def get_document(self, bot_id: str, doc_id: str) -> Optional[Dict[str, Any]]:
         """获取单个文档元数据"""
@@ -247,125 +394,150 @@ class RagManager:
         """
         上传并挂载新知识库文件：解析文本 -> 智能切片 -> 计算词频与 Token -> 写入本地索引
         """
-        with self._lock:
+        if not self._bot_scope_matches_runtime(bot_id):
+            raise PermissionError("当前认证范围无权访问该 BOT 的知识库")
+        safe_filename = os.path.basename(filename)
+
+        # Parse before taking the cross-process write lock.  The lock only
+        # covers the read/modify/write transaction, so a slow PDF parser does
+        # not block unrelated readers for the whole extraction lifetime.
+        text = self.extract_text_from_bytes(safe_filename, content)
+        if len(text) > MAX_RAG_TEXT_CHARS:
+            raise ValueError(f"知识库文本超过 {MAX_RAG_TEXT_CHARS:,} 字符限制")
+        raw_chunks = self.chunk_text(text, safe_filename)
+        if len(raw_chunks) > MAX_RAG_CHUNKS:
+            raise ValueError(f"知识库切片超过 {MAX_RAG_CHUNKS:,} 块限制")
+
+        doc_id = f"doc_{uuid.uuid4().hex}"
+        ext = safe_filename.rsplit(".", 1)[-1].lower() if "." in safe_filename else "txt"
+        chunks_data = []
+        for idx, rc in enumerate(raw_chunks):
+            chunk_id = f"{doc_id}_c{idx}"
+            c_text = rc["content"]
+            tokens = tokenize(f"{rc['title']} {c_text}")
+            chunks_data.append({
+                "chunk_id": chunk_id,
+                "doc_id": doc_id,
+                "doc_name": safe_filename,
+                "index": idx,
+                "title": rc["title"],
+                "content": c_text,
+                "tokens": tokens,
+                "token_count": len(tokens)
+            })
+
+        stored_name = f"{doc_id}_{safe_filename}"
+        doc_meta = {
+            "id": doc_id,
+            "name": safe_filename,
+            "stored_name": stored_name,
+            "file_type": ext,
+            "size": len(content),
+            "size_formatted": format_file_size(len(content)),
+            "chunks_count": len(chunks_data),
+            "enabled": True,
+            "tags": tags or ["运维手册", "业务规范"],
+            "created_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+            "preview": text[:200].strip()
+        }
+
+        with self._storage_lock(bot_id):
+            if not self._bot_scope_matches_runtime(bot_id):
+                raise PermissionError("当前认证范围无权访问该 BOT 的知识库")
             kb_dir = self._get_kb_dir(bot_id)
-            doc_id = f"doc_{int(time.time() * 1000)}"
-            safe_filename = os.path.basename(filename)
-            stored_name = f"{doc_id}_{safe_filename}"
             stored_path = os.path.join(kb_dir, "files", stored_name)
-
-            # 1. 提取文本并切片 before persisting anything, so malformed or
-            # oversized documents cannot leave half-built index state behind.
-            text = self.extract_text_from_bytes(safe_filename, content)
-            if len(text) > MAX_RAG_TEXT_CHARS:
-                raise ValueError(f"知识库文本超过 {MAX_RAG_TEXT_CHARS:,} 字符限制")
-            raw_chunks = self.chunk_text(text, safe_filename)
-            if len(raw_chunks) > MAX_RAG_CHUNKS:
-                raise ValueError(f"知识库切片超过 {MAX_RAG_CHUNKS:,} 块限制")
-
-            # 2. 保存物理文件
-            fd = os.open(stored_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            with os.fdopen(fd, "wb") as f:
-                f.write(content)
-            os.chmod(stored_path, 0o600)
-
-            chunks_data = []
-            for idx, rc in enumerate(raw_chunks):
-                chunk_id = f"{doc_id}_c{idx}"
-                c_text = rc["content"]
-                tokens = tokenize(f"{rc['title']} {c_text}")
-                chunks_data.append({
-                    "chunk_id": chunk_id,
-                    "doc_id": doc_id,
-                    "doc_name": safe_filename,
-                    "index": idx,
-                    "title": rc["title"],
-                    "content": c_text,
-                    "tokens": tokens,
-                    "token_count": len(tokens)
-                })
-
-            # 3. 构造文档元数据
-            ext = safe_filename.rsplit(".", 1)[-1].lower() if "." in safe_filename else "txt"
-            doc_meta = {
-                "id": doc_id,
-                "name": safe_filename,
-                "stored_name": stored_name,
-                "file_type": ext,
-                "size": len(content),
-                "size_formatted": format_file_size(len(content)),
-                "chunks_count": len(chunks_data),
-                "enabled": True,
-                "tags": tags or ["运维手册", "业务规范"],
-                "created_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
-                "preview": text[:200].strip()
-            }
-
-            # 4. 追加保存文档列表与 Chunks
-            docs = self.list_documents(bot_id)
-            docs.insert(0, doc_meta)
-            self._write_json(self._get_docs_path(bot_id), docs)
-
-            all_chunks = self._read_json(self._get_chunks_path(bot_id), [])
-            all_chunks.extend(chunks_data)
-            self._write_json(self._get_chunks_path(bot_id), all_chunks)
+            temp_path = f"{stored_path}.{os.getpid()}.{threading.get_ident()}.tmp"
+            try:
+                fd = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                with os.fdopen(fd, "wb") as output:
+                    output.write(content)
+                    output.flush()
+                    os.fsync(output.fileno())
+                os.chmod(temp_path, 0o600)
+                os.replace(temp_path, stored_path)
+                self.metadata_store.replace_rag_document(
+                    bot_id=bot_id,
+                    document=doc_meta,
+                    chunks=chunks_data,
+                    blob_uri=f"local://data/bots/{bot_id}/knowledge/files/{stored_name}",
+                    **self._metadata_scope(bot_id),
+                )
+            except Exception:
+                # The SQLite adapter rolls back its own transaction.  Keep
+                # the outer operation safe for fault-injected/custom
+                # adapters too: a failure after a commit must not leave a
+                # document row whose Blob has already been removed.
+                with suppress(Exception):
+                    self.metadata_store.delete_rag_document(
+                        bot_id,
+                        doc_id,
+                        **self._metadata_scope(bot_id),
+                    )
+                with suppress(OSError):
+                    os.remove(temp_path)
+                with suppress(OSError):
+                    os.remove(stored_path)
+                raise
 
             return doc_meta
 
     def toggle_document(self, bot_id: str, doc_id: str, enabled: Optional[bool] = None) -> bool:
         """启用或禁用某篇文档参与 RAG 语义检索"""
-        with self._lock:
-            docs = self.list_documents(bot_id)
-            found = False
-            for d in docs:
-                if d.get("id") == doc_id:
-                    if enabled is None:
-                        d["enabled"] = not d.get("enabled", True)
-                    else:
-                        d["enabled"] = bool(enabled)
-                    found = True
-                    break
-            if found:
-                self._write_json(self._get_docs_path(bot_id), docs)
-            return found
+        with self._storage_lock(bot_id):
+            if not self._bot_scope_matches_runtime(bot_id):
+                return False
+            scope = self._metadata_scope(bot_id)
+            self._import_legacy_metadata_if_needed(bot_id)
+            return self.metadata_store.toggle_rag_document(
+                bot_id,
+                doc_id,
+                enabled,
+                **scope,
+            )
 
     def delete_document(self, bot_id: str, doc_id: str) -> bool:
         """删除挂载的文档及其索引切片"""
-        with self._lock:
-            docs = self.list_documents(bot_id)
-            target = None
-            rem_docs = []
-            for d in docs:
-                if d.get("id") == doc_id:
-                    target = d
-                else:
-                    rem_docs.append(d)
-
+        with self._storage_lock(bot_id):
+            if not self._bot_scope_matches_runtime(bot_id):
+                return False
+            scope = self._metadata_scope(bot_id)
+            self._import_legacy_metadata_if_needed(bot_id)
+            target = self.metadata_store.delete_rag_document(
+                bot_id,
+                doc_id,
+                **scope,
+            )
             if not target:
                 return False
 
-            # 1. 删除磁盘文件
             kb_dir = self._get_kb_dir(bot_id)
             stored_name = target.get("stored_name")
+            fpath = os.path.join(kb_dir, "files", stored_name) if stored_name else None
             if stored_name:
-                fpath = os.path.join(kb_dir, "files", stored_name)
                 if os.path.exists(fpath):
-                    try:
+                    with suppress(OSError):
                         os.remove(fpath)
-                    except Exception:
-                        pass
-
-            # 2. 从 docs.json 移除
-            self._write_json(self._get_docs_path(bot_id), rem_docs)
-
-            # 3. 从 chunks.json 移除对应 chunks
-            all_chunks = self._read_json(self._get_chunks_path(bot_id), [])
-            rem_chunks = [c for c in all_chunks if c.get("doc_id") != doc_id]
-            self._write_json(self._get_chunks_path(bot_id), rem_chunks)
 
             return True
 
     def search(
+        self,
+        bot_id: str,
+        query: str,
+        top_k: int = 4,
+        min_score: float = 0.05
+    ) -> List[Dict[str, Any]]:
+        with self._storage_lock(bot_id):
+            if not self._bot_scope_matches_runtime(bot_id):
+                return []
+            return self._search_unlocked(
+                bot_id,
+                query,
+                top_k=top_k,
+                min_score=min_score,
+            )
+
+    def _search_unlocked(
         self,
         bot_id: str,
         query: str,
@@ -378,6 +550,8 @@ class RagManager:
         - 支持中英文分词与标题加权
         - 计算精确的相关度分数
         """
+        if not self._bot_scope_matches_runtime(bot_id):
+            return []
         clean_query = (query or "").strip()
         if not clean_query:
             return []
@@ -388,7 +562,10 @@ class RagManager:
         if not enabled_doc_ids:
             return []
 
-        all_chunks = self._read_json(self._get_chunks_path(bot_id), [])
+        all_chunks = self.metadata_store.list_rag_chunks(
+            bot_id,
+            **self._metadata_scope(bot_id),
+        )
         active_chunks = [c for c in all_chunks if c.get("doc_id") in enabled_doc_ids]
         if not active_chunks:
             return []

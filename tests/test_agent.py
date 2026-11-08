@@ -1509,7 +1509,6 @@ def test_sandbox_state_persistence_and_clearing(temp_bot_manager):
 
 def test_hierarchical_memory_manager_all_four_layers(temp_bot_manager, tmp_path):
     """综合测试四层分级记忆与无限上下文架构 (Layer 1~4)"""
-    import json
     import os
     from core.agent.memory import HierarchicalMemoryManager
     from core.agent.models import BotConfig
@@ -1517,8 +1516,8 @@ def test_hierarchical_memory_manager_all_four_layers(temp_bot_manager, tmp_path)
 
     mem_mgr = HierarchicalMemoryManager()
     bot_id = "test_memory_bot"
-    bot_dir = str(tmp_path / bot_id)
-    os.makedirs(bot_dir, exist_ok=True)
+    temp_bot_manager.create_bot(bot_id, "Memory test bot")
+    bot_dir = temp_bot_manager._bot_dir(bot_id)
 
     # 1. Layer 4: 沙箱运行时变量自省 (DataFrame, list, dict, primitives)
     df_sample = pd.DataFrame([{"GroupId": "GROUP_CHAT_V2:974", "Members": 100}])
@@ -1573,21 +1572,28 @@ def test_hierarchical_memory_manager_all_four_layers(temp_bot_manager, tmp_path)
         older_history.append({"id": f"msg-{i}", "role": "user", "content": f"第 {i} 轮分析 GROUP_CHAT_V2:{1000 + i}"})
         older_history.append({"id": f"ast-{i}", "role": "assistant", "content": f"已完成第 {i} 轮 group_open_http_svc/group_msg_get_simple 数据统计"})
 
-    summary_text = mem_mgr.build_or_update_session_summary(bot_id, bot_dir, older_history)
+    summary_text = mem_mgr.build_or_update_session_summary(
+        bot_id,
+        bot_dir,
+        older_history,
+        manager=temp_bot_manager,
+    )
     assert "【会话至今已累计推进" in summary_text
     assert "核心业务脉络与阶段目标" in summary_text
     assert "阶段性执行成果与关键发现" in summary_text
 
-    # 验证 session_summary.json 是否已持久化
+    # SQLite 是结构化摘要的事实源；新的运行期写入不创建 JSON 摘要文件。
     summary_file = os.path.join(bot_dir, "session_summary.json")
-    assert os.path.exists(summary_file)
-    with open(summary_file, "r", encoding="utf-8") as f:
-        data = json.load(f)
-        assert data["total_compacted_count"] == 50
-        assert data["last_compacted_msg_id"] == "ast-24"
+    data = temp_bot_manager.metadata_store.get_summary(bot_id)
+    assert data is not None
+    assert data["total_compacted_count"] == 50
+    assert data["last_compacted_msg_id"] == "ast-24"
+    assert not os.path.exists(summary_file)
 
     # 5. 清理记忆
-    mem_mgr.clear_session_memory(bot_id, bot_dir)
+    mem_mgr.clear_session_memory(bot_id, bot_dir, manager=temp_bot_manager)
+    cleared = temp_bot_manager.metadata_store.get_summary(bot_id)
+    assert cleared and cleared["_cleared"] is True
     assert not os.path.exists(summary_file)
 
 

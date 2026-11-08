@@ -15,7 +15,13 @@ from fastapi import Depends, HTTPException, Request
 from jwt.algorithms import RSAAlgorithm
 from starlette.responses import JSONResponse
 
-from core.runtime_context import runtime_is_admin, runtime_is_operator, runtime_user_id
+from core.runtime_context import (
+    AuthScope,
+    runtime_auth_scope,
+    runtime_is_admin,
+    runtime_is_operator,
+    runtime_user_id,
+)
 
 
 @dataclass(frozen=True)
@@ -24,6 +30,41 @@ class CurrentUser:
     roles: frozenset[str] = field(default_factory=frozenset)
     claims: dict[str, Any] = field(default_factory=dict)
 
+    @staticmethod
+    def _claim_text(value: Any) -> str:
+        """Return a bounded scalar claim value suitable for persistence keys."""
+        if isinstance(value, (dict, list, tuple, set)):
+            return ""
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        return text[:512]
+
+    @property
+    def issuer(self) -> str:
+        """The signed OIDC issuer used as part of every tenant data scope.
+
+        Local development users intentionally have an empty issuer.  An OIDC
+        subject alone is not a globally unique tenant boundary: the same
+        subject can exist under two issuers, so persistence callers must carry
+        both values.
+        """
+        return self._claim_text(self.claims.get("iss")).rstrip("/")
+
+    @property
+    def tenant_id(self) -> str:
+        """Resolve the deployment's supported tenant claim aliases.
+
+        The value is trusted only because it came from the verified token.  A
+        missing tenant claim remains empty for single-tenant deployments; it
+        does not silently inherit another user's tenant.
+        """
+        for claim_name in ("tenant_id", "tenant", "tid", "org_id"):
+            value = self._claim_text(self.claims.get(claim_name))
+            if value:
+                return value
+        return ""
+
     @property
     def is_admin(self) -> bool:
         return "admin" in self.roles or "administrator" in self.roles
@@ -31,6 +72,14 @@ class CurrentUser:
     @property
     def is_operator(self) -> bool:
         return self.is_admin or bool({"operator", "editor"} & self.roles)
+
+    @property
+    def auth_scope(self) -> AuthScope:
+        return AuthScope(
+            issuer=self.issuer,
+            tenant_id=self.tenant_id,
+            subject=self.subject,
+        )
 
 
 class AuthSettings:
@@ -314,6 +363,7 @@ class AuthenticationMiddleware:
             return
 
         request.state.current_user = user
+        scope_token = runtime_auth_scope.set(user.auth_scope)
         token = runtime_user_id.set(user.subject)
         admin_token = runtime_is_admin.set(user.is_admin)
         operator_token = runtime_is_operator.set(user.is_operator)
@@ -323,3 +373,4 @@ class AuthenticationMiddleware:
             runtime_is_admin.reset(admin_token)
             runtime_is_operator.reset(operator_token)
             runtime_user_id.reset(token)
+            runtime_auth_scope.reset(scope_token)

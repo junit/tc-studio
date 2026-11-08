@@ -329,8 +329,21 @@ def test_batch_history_detail_paginates_results(monkeypatch):
 
 def test_batch_results_jsonl_roundtrip(tmp_path, monkeypatch):
     import core.task_runner as task_runner_module
+    from core.persistence import SqliteTaskStore
 
     monkeypatch.setattr(task_runner_module, "RESULTS_DIR", str(tmp_path / "batch_results"))
+    database = tmp_path / "tim.sqlite3"
+    monkeypatch.setattr(task_runner_module, "IDEMPOTENCY_DB_PATH", str(database))
+    assert SqliteTaskStore(str(database)).create_batch_task(
+        {
+            "task_id": "task-jsonl",
+            "api_id": "c2c_msg_withdraw",
+            "status": "RUNNING",
+            "total": 2,
+            "items_json": "[]",
+            "worker_id": "test-worker",
+        }
+    )
     task_runner_module.append_task_result("task-jsonl", {"id": 1, "_status": "OK"})
     task_runner_module.append_task_result("task-jsonl", {"id": 2, "_status": "FAIL"})
 
@@ -340,15 +353,18 @@ def test_batch_results_jsonl_roundtrip(tmp_path, monkeypatch):
     ]
 
 
-def test_bot_history_uses_append_only_jsonl_with_legacy_json_migration(tmp_path):
+def test_bot_history_is_sqlite_first_with_legacy_json_migration(tmp_path):
     manager = BotManager(data_dir=str(tmp_path / "data"))
-    bot = manager.create_bot("jsonl-history", "JSONL history")
+    bot = manager.create_bot("sqlite-history", "SQLite history")
     manager.append_history(bot.id, "user", "first")
     manager.append_history(bot.id, "assistant", "second")
 
     runtime_dir = manager._runtime_dir(bot.id)
-    jsonl_path = os.path.join(runtime_dir, "history.jsonl")
-    assert os.path.exists(jsonl_path)
+    stored = manager.metadata_store.read_conversation(bot_id=bot.id, limit=10)
+    assert [item["content"] for item in stored["history"]] == ["first", "second"]
+    assert stored["storage_exists"] is True
+    assert not os.path.exists(os.path.join(runtime_dir, "history.json"))
+    assert not os.path.exists(os.path.join(runtime_dir, "history.jsonl"))
     assert manager.get_history(bot.id, limit=2)[-1]["content"] == "second"
 
     legacy_bot = manager.create_bot("legacy-json-history", "Legacy history")
@@ -357,27 +373,34 @@ def test_bot_history_uses_append_only_jsonl_with_legacy_json_migration(tmp_path)
     with open(os.path.join(legacy_dir, "history.json"), "w", encoding="utf-8") as stream:
         json.dump([{"id": "legacy-1", "role": "user", "content": "legacy", "metadata": {}}], stream)
     assert manager.get_history(legacy_bot.id, limit=1)[0]["id"] == "legacy-1"
-    assert os.path.exists(os.path.join(legacy_dir, "history.jsonl"))
+    migrated = manager.metadata_store.read_conversation(
+        bot_id=legacy_bot.id,
+        limit=1,
+    )
+    assert migrated["storage_exists"] is True
+    assert migrated["history"][0]["id"] == "legacy-1"
+
+    # Once SQLite has the session row, changing the compatibility source
+    # cannot change the runtime result.
+    with open(os.path.join(legacy_dir, "history.json"), "w", encoding="utf-8") as stream:
+        json.dump([{"id": "forged", "role": "user", "content": "forged"}], stream)
+    assert manager.get_history(legacy_bot.id, limit=1)[0]["id"] == "legacy-1"
 
 
-def test_bot_history_offset_index_and_session_locks(tmp_path):
+def test_bot_history_sqlite_pagination_and_session_locks(tmp_path):
     manager = BotManager(data_dir=str(tmp_path / "data"))
-    bot = manager.create_bot("indexed-history", "Indexed history", visibility="public")
+    bot = manager.create_bot("paged-history", "Paged history", visibility="public")
     for index in range(8):
         manager.append_history(bot.id, "user", f"message-{index}")
 
     runtime_dir = manager._runtime_dir(bot.id)
-    jsonl_path = os.path.join(runtime_dir, "history.jsonl")
-    index_path = f"{jsonl_path}.idx"
-    assert os.path.exists(index_path)
-    with open(index_path, encoding="utf-8") as index_stream:
-        entries = [json.loads(line) for line in index_stream]
-    with open(jsonl_path, "rb") as jsonl_stream:
-        raw_lines = jsonl_stream.read().splitlines(keepends=True)
-    assert len(entries) == len(raw_lines) == 8
-    for entry, raw in zip(entries, raw_lines):
-        assert entry["end"] - entry["offset"] == len(raw)
-        assert json.loads(raw.decode("utf-8"))["id"] == entry["id"]
+    assert not os.path.exists(os.path.join(runtime_dir, "history.json"))
+    assert not os.path.exists(os.path.join(runtime_dir, "history.jsonl"))
+    stored = manager.metadata_store.read_conversation(bot_id=bot.id, limit=20)
+    assert stored["total"] == 8
+    assert [item["content"] for item in stored["history"]] == [
+        f"message-{index}" for index in range(8)
+    ]
 
     latest = manager.get_history_paged(bot.id, limit=3)
     assert [item["content"] for item in latest["history"]] == ["message-5", "message-6", "message-7"]
@@ -388,27 +411,6 @@ def test_bot_history_offset_index_and_session_locks(tmp_path):
     same_session_lock = manager._history_session_lock(bot.id)
     assert same_session_lock is manager._history_session_lock(bot.id)
     assert same_session_lock is not manager._history_session_lock(bot.id, user_id="another-user")
-
-    # A same-sized malformed middle row must not make the offset map return
-    # unrelated bytes; the read path rebuilds the index and skips that row.
-    with open(jsonl_path, "rb") as jsonl_stream:
-        rows = jsonl_stream.read().splitlines(keepends=True)
-    rows[3] = b"!" * (len(rows[3]) - 1) + b"\n"
-    with open(jsonl_path, "wb") as jsonl_stream:
-        jsonl_stream.write(b"".join(rows))
-    repaired = manager.get_history_paged(bot.id, limit=20)
-    assert repaired["total"] == 7
-    assert all(item["content"] != "message-3" for item in repaired["history"])
-
-    # A crash after JSONL append but before newline/index fsync leaves a
-    # partial tail.  Recovery must retain the valid prefix and discard only
-    # that incomplete row.
-    manager.append_history(bot.id, "user", "message-after-repair")
-    with open(jsonl_path, "ab") as jsonl_stream:
-        jsonl_stream.write(b'{"id":"crash-partial"')
-    recovered = manager.get_history_paged(bot.id, limit=20)
-    assert recovered["total"] == 8
-    assert recovered["history"][-1]["content"] == "message-after-repair"
 
 
 def test_chat_payload_rejects_unbounded_runtime_input():

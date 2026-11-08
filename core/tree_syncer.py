@@ -15,6 +15,7 @@ import time
 import urllib.request
 from typing import Dict, List, Optional, Tuple
 
+from core.file_storage import atomic_write_json
 from core.registry import registry
 
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -140,8 +141,7 @@ def fetch_official_hydration_tree() -> Tuple[dict, List[dict]]:
 
     # 保存一份原生活动目录树快照到 storage/official_live_tree.json
     snapshot_path = os.path.join(STORAGE_DIR, "official_live_tree.json")
-    with open(snapshot_path, "w", encoding="utf-8") as f:
-        json.dump(rest_api, f, ensure_ascii=False, indent=2)
+    atomic_write_json(snapshot_path, rest_api, mode=0o600)
 
     # 递归提取页面列表及完整路径
     pages: List[dict] = []
@@ -252,8 +252,7 @@ def sync_catalog_from_live_tree() -> dict:
             final_catalog.append(new_item)
 
     # 写回本地 catalog 文件
-    with open(CATALOG_PATH, "w", encoding="utf-8") as f:
-        json.dump(final_catalog, f, ensure_ascii=False, indent=2)
+    atomic_write_json(CATALOG_PATH, final_catalog, mode=0o644)
 
     # 热重载本地注册表
     registry.reload()

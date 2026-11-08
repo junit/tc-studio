@@ -41,6 +41,13 @@ data/*
 # Local runtime storage & execution ledger
 storage/history.json
 storage/docs_cache/
+storage/tim.sqlite3*
+storage/batch_idempotency.sqlite3*
+storage/batch_results/
+# Atomic JSON publication lock files generated beside cache snapshots.
+storage/.*.json.lock
+storage/docs/.*.json.lock
+core/.*.json.lock
 
 # Log files
 logs/

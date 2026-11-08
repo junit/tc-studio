@@ -7,7 +7,7 @@
 *A modern, multi-cloud developer & DevOps visual studio with Evolving CodeAgents for Tencent Cloud IM, Live (CSS) & API 3.0 Services.*
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Python: 3.11+](https://img.shields.io/badge/Python-3.11%2B-brightgreen.svg)](https://www.python.org/)
+[![Python: 3.11-3.13](https://img.shields.io/badge/Python-3.11--3.13-brightgreen.svg)](https://www.python.org/)
 [![FastAPI: 0.110+](https://img.shields.io/badge/FastAPI-0.110%2B-009688.svg)](https://fastapi.tiangolo.com/)
 [![React: 19](https://img.shields.io/badge/React-19-61DAFB.svg)](https://react.dev/)
 [![TailwindCSS: v4](https://img.shields.io/badge/TailwindCSS-v4-38B2AC.svg)](https://tailwindcss.com/)
@@ -174,14 +174,17 @@ TC Studio 的智能体并非传统打字聊天的对话机器人，而是**以�
 │   ├── sig_util.py                   # 腾讯云 TLSSigAPIv2 (UserSig) 算法与高速内存缓存
 │   ├── tim_client.py                 # 通用 IM HTTP 调用客户端
 │   ├── batch_presets.py              # 批量运维预设场景模版与 QPS 风控规则
+│   ├── persistence.py                # 统一 SQLite schema、迁移与持久化适配器
+│   ├── file_storage.py               # 可重建 JSON 缓存的跨进程原子发布
 │   ├── task_runner.py                # 批处理执行器与审计台账
+│   ├── sync_task_manager.py          # 文档/目录同步任务的持久化状态机
 │   ├── doc_syncer.py                 # 官方文档抓取与解析引擎
 │   └── tree_syncer.py                # 官方目录树在线同步引擎
-├── data/                             # 智能体本地持久化资产库
-│   ├── bots.json                     # 智能体角色与元数据配置
-│   ├── knowledge/                    # 企业私有知识库挂载文档与索引库
-│   ├── skills/                       # 智能体自我沉淀生成的 Python 技能脚本
-│   └── memories/                     # 智能体长期持久化事实记忆
+├── data/                             # Blob/文件层与旧格式迁移源
+│   ├── bots/<bot>/uploads/           # 上传原件与生成文件
+│   ├── bots/<bot>/knowledge/files/   # RAG 原始文档
+│   ├── bots/<bot>/skills/*.py        # 技能源码
+│   └── llm_config.json               # 本地模型配置（可能含密钥，需收紧权限）
 ├── docs/                             # 项目文档与展示资源
 │   ├── images/                       # 高清脱敏界面截图 (WebP / 压缩 PNG)
 │   └── TENCENTCLOUD_API3_INTEGRATION_GUIDE.md # 腾讯云 API 3.0 新业务扩展标准指导文档
@@ -194,9 +197,10 @@ TC Studio 的智能体并非传统打字聊天的对话机器人，而是**以�
 │   ├── index.html
 │   ├── favicon.svg
 │   └── assets/                       # 编译后的极轻 JS/CSS 单包
-├── storage/                          # 本地持久化数据
+├── storage/                          # 本地运行期存储
+│   ├── tim.sqlite3                   # 统一 SQLite 主库（运行期生成）
+│   ├── batch_results/                 # 大型批处理结果正文（JSONL/Blob）
 │   ├── docs/                         # 官方全量 427+ API 离线结构化文档库 (JSON)
-│   ├── history/                      # 批处理执行日志与历史审计台账
 │   └── official_live_tree.json       # 官方在线同步目录树缓存
 ├── tests/                            # 自动化单元测试套件 (pytest)
 │   ├── test_studio.py                # 基础功能与接口工作台测试
@@ -206,7 +210,12 @@ TC Studio 的智能体并非传统打字聊天的对话机器人，而是**以�
 ├── web/                              # 前端源代码 (React 19 + Tailwind v4 + Vite + Zustand)
 ├── app.py                            # FastAPI 后端服务主入口
 ├── config.example.json               # 配置文件模板 (含 IM 与 API 3.0 多环境示例)
-├── requirements.txt                  # Python 依赖清单
+├── pyproject.toml                    # Python 版本与直接依赖声明
+├── uv.lock                           # uv 可重复解析锁文件
+├── requirements.lock                 # 生产依赖锁文件（含 hashes）
+├── requirements-dev.lock             # 开发依赖锁文件（含 hashes）
+├── scripts/install_locked.sh         # 锁定生产环境安装与编译检查入口
+├── requirements.txt                  # 范围版本兼容入口，不用于生产发布
 ├── LICENSE                           # 开源许可协议 (MIT)
 └── README.md
 ```
@@ -217,7 +226,7 @@ TC Studio 的智能体并非传统打字聊天的对话机器人，而是**以�
 
 ### 运行环境准备
 - **操作系统**：macOS / Linux / Windows
-- **Python 版本**：Python 3.11 或更高版本
+- **Python 版本**：Python 3.11、3.12 或 3.13；仓库通过 `pyproject.toml` 明确限制为 `>=3.11,<3.14`
 
 ### 1. 安装后端依赖
 
@@ -226,8 +235,26 @@ TC Studio 的智能体并非传统打字聊天的对话机器人，而是**以�
 git clone git@github.com:junit/tim-studio.git
 cd tim-studio
 
-# 安装依赖
-pip install -r requirements.txt
+# 生产依赖：从 uv.lock 安装，不重新解析版本
+./scripts/install_locked.sh
+
+# 等价的 uv 命令
+uv sync --locked --no-dev
+
+# 没有 uv 时的 pip 兼容入口
+python -m pip install --require-hashes -r requirements.lock
+```
+
+`requirements.txt` 仍保留给旧的兼容安装流程，使用范围版本，不能作为生产环境的可重复构建入口。开发环境使用 `uv sync --locked`，或安装 `requirements-dev.lock`。
+
+如果使用企业内网 PyPI 镜像，镜像必须先同步 `requirements.lock` 中的全部版本和目标平台 wheel；否则应切换到已完整同步的索引。
+
+锁文件和双环境一致性检查：
+
+```bash
+uv lock --check
+UV_PROJECT_ENVIRONMENT=/tmp/tim-lock-a uv sync --locked --no-dev
+UV_PROJECT_ENVIRONMENT=/tmp/tim-lock-b uv sync --locked --no-dev
 ```
 
 ### 2. 准备配置文件
@@ -420,7 +447,45 @@ TC Studio 前端为纯静态轻量单页应用（SPA），支持在请求头中�
 1. **零第三方网络依赖**：除向腾讯云官方 API 域名（如 `console.tim.qq.com` 或 `live.tencentcloudapi.com`）发起您主动调试的请求外，TC Studio 不向任何第三方服务器发送用户数据或凭据。
 2. **高危人机协同门禁**：对断流、禁推、解散群、删除账号等破坏性 API 实施沙箱拦截与人机确认，严防模型幻觉造成线上事故。
 3. **凭据与签名全链路脱敏**：环境密钥与 cURL 命令中的敏感签名（UserSig / TC3 Authorization）在界面默认采用星号脱敏防截屏泄露；企业模式下非管理员在服务端自动剥离凭据，向剪贴板写入有效高权凭据时自动触发醒目警示。
-4. **本地离线审计**：批量执行的明细台账、请求日志全部保存在本地 `storage/` 与 `data/` 目录中，随时可在页面上一键彻底清空。
+4. **本地离线审计**：批量执行的明细台账、请求日志全部保存在本地 `storage/` 与 `data/` 目录中；清理历史时只删除已完成、失败或已取消的终态记录，运行中、暂停中和结果未知的任务会保留。
+
+---
+
+## 🧭 持久化与任务后端架构
+
+持久化分层、SQLite 单机阶段边界、文件与数据库迁移范围，以及未来 PostgreSQL + Redis 的演进方案，见 [ADR-0001：持久化分层与任务后端演进](docs/adr/0001-persistence-and-task-backend.md)。
+
+当前单机阶段默认使用 `storage/tim.sqlite3` 作为统一 SQLite 主库，也可以通过 `TIM_DATABASE_URL=sqlite:////var/lib/tim/tim.sqlite3` 指定持久化路径；生产环境可通过 `TIM_CONFIG_PATH=/var/lib/tim/config.json` 把带凭据配置放在受限运行期目录。旧版 `storage/batch_idempotency.sqlite3` 会自动导入主库并保留源文件。
+
+BOT/RAG 和协同流水的结构化元数据已经 SQLite-first：BOT 定义、owner/visibility、长期记忆、会话摘要、会话消息、技能元数据、文件引用、RAG 文档、chunks、跨 BOT 协同事件都由 SQLite 保存和读取。新写入不会创建新的 `bot.json`、`memory.json`、`history.json`、`history.jsonl`、`session_summary.json`、技能 JSON、`docs.json`、`chunks.json` 或 `orchestrations.json`；旧 JSON/JSONL 只用于一次性迁移或没有 SQLite 行时的兼容回退。上传原件、RAG 原文档、技能 Python 源码和大型批处理结果仍在 Blob/文件层，SQLite 只保存归属、状态、哈希、大小、路径引用和索引。
+
+批处理任务事实、租约、事件、幂等状态和同步任务状态也已经进入主库。单机多进程必须共享同一个本地持久化磁盘、`TIM_CONFIG_PATH`、`TIM_DATA_DIR` 和 SQLite 文件；多主机部署再切换 PostgreSQL，并按实时调度需求引入 Redis。
+
+批处理状态、幂等键、SSE 回放、跨进程控制和历史清理语义见
+[批处理持久化 API 契约](docs/api/batch-task-persistence-contract.md)。
+
+单机部署、SQLite WAL/权限检查、备份恢复、旧 JSON 元数据迁移和生产验收边界见
+[SQLite 单机运行与验收手册](docs/operations/sqlite-single-host-runbook.md)。
+
+可直接使用以下脚本完成基本运维动作：
+
+```bash
+PYTHONPATH=. python scripts/check_sqlite_deployment.py --database /var/lib/tim/tim.sqlite3 --blob-root /var/lib/tim/blobs --results-root /var/lib/tim/storage/batch_results --backup-root /var/lib/tim/backups --data-root /var/lib/tim/data --storage-root /var/lib/tim/storage --min-free-bytes 10737418240
+PYTHONPATH=. python scripts/backup_sqlite.py --database /var/lib/tim/tim.sqlite3
+PYTHONPATH=. python scripts/restore_sqlite.py /var/lib/tim/backups/tim-<timestamp>.sqlite3 --database /var/lib/tim/tim.sqlite3 --force
+PYTHONPATH=. python scripts/migrate_json_metadata_to_sqlite.py --data-root /var/lib/tim/data --database /var/lib/tim/tim.sqlite3
+PYTHONPATH=. python scripts/acceptance_sqlite_multiprocess.py --work-dir /var/lib/tim/acceptance/sqlite-multiprocess --timeout 60
+PYTHONPATH=. python scripts/acceptance_sqlite_multiprocess.py --work-dir /var/lib/tim/acceptance/sqlite-hard-faults --timeout 60 --hard-kill --file-faults --hard-kill-lease-seconds 5
+PYTHONPATH=. python scripts/acceptance_http_multiprocess.py --work-dir /var/lib/tim/acceptance/http-multiprocess --timeout 60
+```
+
+当前阶段不强制引入 Redis。Redis 只在多主机、多 Pod、跨实例队列或实时事件广播成为需求时加入；PostgreSQL 仍是未来事实数据库，Redis 不能替代它。
+
+截至 2026-11-07，单机多进程 Linux 验收已覆盖 SQLite WAL/权限、并发幂等、跨进程
+pause/resume/stop、真实 Worker `SIGKILL` 后的 `UNKNOWN` 保护、结果文件故障拒绝、
+只读数据库拒绝写入，以及两个独立 Uvicorn 实例的 HTTP 状态可见性。详细证据见
+[Linux 单机多进程验收记录](docs/operations/linux-single-host-acceptance-2026-11-07.md)；
+这不包含 OIDC、真实腾讯云副作用、多主机或多 Pod 验收。
 
 ---
 

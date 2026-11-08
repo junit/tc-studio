@@ -19,6 +19,7 @@ from typing import Any, Dict, List, Optional, Tuple
 MAX_OFFICE_EXPANDED_BYTES = 64 * 1024 * 1024
 MAX_SPREADSHEET_EXPANDED_BYTES = MAX_OFFICE_EXPANDED_BYTES
 MAX_OFFICE_ZIP_MEMBERS = 10_000
+MAX_PDF_PAGES = 500
 # Compression ratios on tiny XML members are common in legitimate Office files
 # (for example, repeated whitespace/style records).  Ratio checks only add
 # useful bomb signal once a member is large enough to create material memory
@@ -313,6 +314,8 @@ def parse_file_summary(file_path: str, filename: str) -> Dict[str, Any]:
                 import pypdf
                 reader = pypdf.PdfReader(file_path)
                 page_count = len(reader.pages)
+                if page_count > MAX_PDF_PAGES:
+                    raise ValueError(f"PDF 页数超过 {MAX_PDF_PAGES} 页限制")
                 first_page_text = ""
                 if page_count > 0:
                     first_page_text = reader.pages[0].extract_text() or ""
@@ -325,6 +328,11 @@ def parse_file_summary(file_path: str, filename: str) -> Dict[str, Any]:
                     f"PDF 文档（共 {page_count} 页）\n"
                     f"首页内容摘要：\n{first_page_text.strip() or '（首页为扫描图像或无纯文本）'}"
                 )
+                result["preview"] = result["summary"]
+            except ValueError as exc:
+                result["error"] = "pdf_page_limit"
+                result["error_detail"] = str(exc)
+                result["summary"] = f"PDF 解析拒绝: {exc}"
                 result["preview"] = result["summary"]
             except Exception as e:
                 result["summary"] = f"PDF 文档 ({format_file_size(size)})"

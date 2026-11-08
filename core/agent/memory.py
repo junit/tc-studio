@@ -18,7 +18,11 @@ import os
 import re
 from dataclasses import dataclass
 from datetime import datetime
+from contextlib import suppress
+from pathlib import Path
 from typing import Any, cast
+
+from core.persistence import SqliteBotMetadataStore
 
 from .constants import (
     DEFAULT_MESSAGE_CONTENT_MAX_CHARS,
@@ -168,8 +172,44 @@ class HierarchicalMemoryManager:
     def _summary_file_path(self, bot_dir: str) -> str:
         return os.path.join(bot_dir, "session_summary.json")
 
-    def get_session_summary(self, bot_dir: str) -> dict[str, Any] | None:
-        """读取已持久化的会话滚动摘要数据"""
+    @staticmethod
+    def _metadata_store(
+        bot_dir: str,
+        manager: Any | None = None,
+    ) -> SqliteBotMetadataStore:
+        if manager is not None and hasattr(manager, "metadata_store"):
+            return manager.metadata_store
+        # Direct unit-level callers do not have a BotManager object.  Infer
+        # the isolated database next to the runtime directory so tests and
+        # offline tools never touch the application's production database.
+        return SqliteBotMetadataStore(str(Path(bot_dir).parent / "tim.sqlite3"))
+
+    @staticmethod
+    def _metadata_scope(
+        bot_id: str,
+        manager: Any | None = None,
+    ) -> dict[str, str]:
+        if manager is not None and hasattr(manager, "_metadata_scope"):
+            return manager._metadata_scope(bot_id)
+        return {"issuer": "", "tenant_id": "", "owner_subject": ""}
+
+    def get_session_summary(
+        self,
+        bot_dir: str,
+        *,
+        bot_id: str | None = None,
+        manager: Any | None = None,
+    ) -> dict[str, Any] | None:
+        """读取 SQLite 摘要；仅在缺少数据库行时兼容旧 JSON。"""
+        if bot_id:
+            store = self._metadata_store(bot_dir, manager)
+            summary = store.get_summary(
+                bot_id,
+                **self._metadata_scope(bot_id, manager),
+            )
+            if summary is not None:
+                return summary
+
         path = self._summary_file_path(bot_dir)
         if os.path.exists(path):
             try:
@@ -179,9 +219,14 @@ class HierarchicalMemoryManager:
                 logger.warning("Failed to load session summary from %s: %s", path, str(e))
         return None
 
-    def clear_session_memory(self, bot_id: str, bot_dir: str):
+    def clear_session_memory(self, bot_id: str, bot_dir: str, manager: Any | None = None):
         """清空该智能体的滚动摘要和内存实体缓存"""
         self._entity_cache.pop(bot_id, None)
+        store = self._metadata_store(bot_dir, manager)
+        store.clear_summary(
+            bot_id,
+            **self._metadata_scope(bot_id, manager),
+        )
         path = self._summary_file_path(bot_dir)
         if os.path.exists(path):
             try:
@@ -193,16 +238,28 @@ class HierarchicalMemoryManager:
         self,
         bot_id: str,
         bot_dir: str,
-        older_history: list[dict[str, Any]]
+        older_history: list[dict[str, Any]],
+        manager: Any | None = None,
     ) -> str:
         """
         对滑出即时工作记忆窗口的长周期旧消息进行增量摘要压缩，保持宏观主线不丢失
         """
         if not older_history:
-            existing = self.get_session_summary(bot_dir)
+            existing = self.get_session_summary(
+                bot_dir,
+                bot_id=bot_id,
+                manager=manager,
+            )
             return existing.get("summary", "") if existing else ""
 
-        existing_data = self.get_session_summary(bot_dir) or {}
+        existing_data = (
+            self.get_session_summary(
+                bot_dir,
+                bot_id=bot_id,
+                manager=manager,
+            )
+            or {}
+        )
         last_compacted_id = existing_data.get("last_compacted_msg_id")
 
         # 找出尚未被压缩的新旧消息切片
@@ -265,7 +322,7 @@ class HierarchicalMemoryManager:
 
         full_summary_text = "\n".join(summary_parts)
 
-        # 原子持久化
+        # SQLite 持久化；旧 session_summary.json 只允许作为一次性回退源。
         try:
             save_payload = {
                 "last_compacted_msg_id": older_history[-1].get("id"),
@@ -274,11 +331,14 @@ class HierarchicalMemoryManager:
                 "entities": {k: list(v) for k, v in entities.items()},
                 "updated_at": datetime.now().isoformat()
             }
-            tmp_path = self._summary_file_path(bot_dir) + ".tmp"
-            os.makedirs(bot_dir, exist_ok=True)
-            with open(tmp_path, "w", encoding="utf-8") as f:
-                json.dump(save_payload, f, ensure_ascii=False, indent=2)
-            os.replace(tmp_path, self._summary_file_path(bot_dir))
+            store = self._metadata_store(bot_dir, manager)
+            store.upsert_summary(
+                bot_id=bot_id,
+                summary=save_payload,
+                **self._metadata_scope(bot_id, manager),
+            )
+            with suppress(OSError):
+                os.remove(self._summary_file_path(bot_dir))
         except Exception as e:
             logger.warning("Failed to save session summary: %s", str(e))
 
@@ -435,15 +495,17 @@ class HierarchicalMemoryManager:
                     f"你可以直接通过 `run_skill(name, kwargs)` 运行这些技能，也可以在解决新场景后使用 `save_skill` 沉淀新技能：\n{skills_text}\n"
                 )
 
-        # 3.5 企业知识库 RAG 实时召回
-        try:
-            from .rag_manager import rag_manager
-            matched_chunks = rag_manager.search(bot_id, user_message, top_k=3, min_score=0.15)
-            if matched_chunks:
-                kb_context = rag_manager.format_chunks_for_prompt(matched_chunks)
-                prompt_sections.append(f"{kb_context}\n")
-        except Exception as e:
-            logger.warning("RAG knowledge recall error: %s", str(e))
+        # 3.5 企业知识库 RAG 实时召回。公共 BOT 对话不允许把企业私有
+        # 文档自动注入给不可信用户；私有 BOT 继续沿用原有召回链路。
+        if getattr(bot, "visibility", "private") != "public":
+            try:
+                from .rag_manager import rag_manager
+                matched_chunks = rag_manager.search(bot_id, user_message, top_k=3, min_score=0.15)
+                if matched_chunks:
+                    kb_context = rag_manager.format_chunks_for_prompt(matched_chunks)
+                    prompt_sections.append(f"{kb_context}\n")
+            except Exception as e:
+                logger.warning("RAG knowledge recall error: %s", str(e))
 
         # ---------------------------------------------------------
         # Layer 2: 会话演化滚动摘要 (Running Session Summary)
@@ -456,7 +518,12 @@ class HierarchicalMemoryManager:
         if len(all_history) > working_limit:
             older_history = all_history[:-working_limit]
             compacted_count = len(older_history)
-            running_summary_text = self.build_or_update_session_summary(bot_id, bot_dir, older_history)
+            running_summary_text = self.build_or_update_session_summary(
+                bot_id,
+                bot_dir,
+                older_history,
+                manager=manager,
+            )
             if running_summary_text:
                 prompt_sections.append(
                     "## 📜 全局会话演进脉络 (Layer 2: Running Session Summary - 长期无限记忆)\n"
@@ -535,13 +602,19 @@ class HierarchicalMemoryManager:
         bot_dir: str,
         all_history: list[dict[str, Any]],
         saved_state: dict[str, Any],
-        max_context_turns: int | None = None
+        max_context_turns: int | None = None,
+        manager: Any | None = None,
     ):
         """当单轮交互完成时触发，异步或静默更新滚动摘要与实体缓存"""
         working_limit = max_context_turns or DEFAULT_WORKING_MEMORY_TURNS
         if len(all_history) > working_limit:
             older_history = all_history[:-working_limit]
-            self.build_or_update_session_summary(bot_id, bot_dir, older_history)
+            self.build_or_update_session_summary(
+                bot_id,
+                bot_dir,
+                older_history,
+                manager=manager,
+            )
 
 
 # 单例实例

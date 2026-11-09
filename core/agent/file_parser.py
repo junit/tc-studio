@@ -20,6 +20,8 @@ MAX_OFFICE_EXPANDED_BYTES = 64 * 1024 * 1024
 MAX_SPREADSHEET_EXPANDED_BYTES = MAX_OFFICE_EXPANDED_BYTES
 MAX_OFFICE_ZIP_MEMBERS = 10_000
 MAX_PDF_PAGES = 500
+MAX_PDF_FILE_BYTES = 64 * 1024 * 1024
+MAX_IMAGE_PIXELS = 40_000_000
 # Compression ratios on tiny XML members are common in legitimate Office files
 # (for example, repeated whitespace/style records).  Ratio checks only add
 # useful bomb signal once a member is large enough to create material memory
@@ -99,6 +101,19 @@ def recognize_image_text(file_path: str, max_chars: int = 3000) -> Optional[str]
     无第三方环境时优雅降级。
     """
     if not os.path.exists(file_path):
+        return None
+
+    # Read only the image header before handing the file to native OCR or
+    # pytesseract.  This rejects decompression bombs before either backend
+    # allocates a full raster.
+    try:
+        from PIL import Image
+
+        with Image.open(file_path) as image:
+            width, height = image.size
+            if width * height > MAX_IMAGE_PIXELS:
+                return None
+    except Exception:
         return None
 
     # 1. 尝试 macOS 原生 Apple Vision OCR (通过 swift - 极速进程内调用，无须 pip 安装庞大机器学习框架)
@@ -312,6 +327,10 @@ def parse_file_summary(file_path: str, filename: str) -> Dict[str, Any]:
         elif ftype == "pdf":
             try:
                 import pypdf
+                if size > MAX_PDF_FILE_BYTES:
+                    raise ValueError(
+                        f"PDF 文件超过 {MAX_PDF_FILE_BYTES // (1024 * 1024)} MiB 限制"
+                    )
                 reader = pypdf.PdfReader(file_path)
                 page_count = len(reader.pages)
                 if page_count > MAX_PDF_PAGES:
@@ -344,6 +363,10 @@ def parse_file_summary(file_path: str, filename: str) -> Dict[str, Any]:
                 from PIL import Image
                 with Image.open(file_path) as img:
                     width, height = img.size
+                    if width * height > MAX_IMAGE_PIXELS:
+                        raise ValueError(
+                            f"图片像素总量超过 {MAX_IMAGE_PIXELS:,} 限制"
+                        )
                     img_format = img.format or ftype.upper()
                     img_mode = img.mode
 

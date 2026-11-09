@@ -217,6 +217,8 @@ TC Studio 的智能体并非传统打字聊天的对话机器人，而是**以�
 ├── config.example.json               # 配置文件模板 (含 IM 与 API 3.0 多环境示例)
 ├── pyproject.toml                    # Python 版本与直接依赖声明
 ├── uv.lock                           # uv 可重复解析锁文件
+├── Dockerfile                        # Python + Node 锁定构建镜像
+├── compose.yaml                      # 单机 SQLite 运行编排
 ├── requirements.lock                 # 生产依赖锁文件（含 hashes）
 ├── requirements-dev.lock             # 开发依赖锁文件（含 hashes）
 ├── scripts/install_locked.sh         # 锁定生产环境安装与编译检查入口
@@ -486,6 +488,21 @@ BOT/RAG 和协同流水的结构化元数据已经 SQLite-first：BOT 定义、o
 单机部署、SQLite WAL/权限检查、备份恢复、旧 JSON 元数据迁移和生产验收边界见
 [SQLite 单机运行与验收手册](docs/operations/sqlite-single-host-runbook.md)。
 
+容器化单机部署可以直接使用仓库中的 `Dockerfile` 和 `compose.yaml`：
+
+```bash
+docker compose build
+docker compose up -d
+docker compose ps
+curl -fsS http://127.0.0.1:8000/healthz
+```
+
+Compose 默认使用 Python 3.13、Node 22、`uv.lock`、`web/pnpm-lock.yaml`，
+非 root 用户 `10001:10001`、只读根文件系统、独立的
+`/var/lib/tc-studio` 数据卷以及 2 GiB 内存、2 CPU、512 个进程的上限。
+它默认只启动一个 Uvicorn worker；单机多实例应由多个容器或 systemd 实例共享
+同一个本地持久化卷，并把批处理以外的实时 Agent 会话固定到同一个实例。
+
 可直接使用以下脚本完成基本运维动作：
 
 ```bash
@@ -500,11 +517,17 @@ PYTHONPATH=. python scripts/acceptance_http_multiprocess.py --work-dir /var/lib/
 
 当前阶段不强制引入 Redis。Redis 只在多主机、多 Pod、跨实例队列或实时事件广播成为需求时加入；PostgreSQL 仍是未来事实数据库，Redis 不能替代它。
 
-截至 2026-11-07，单机多进程 Linux 验收已覆盖 SQLite WAL/权限、并发幂等、跨进程
+批处理事实、任务事件、幂等、租约和结果索引可以跨进程从 SQLite 读取。AgentRun、
+审批等待、`/chat` 对话上下文、`/chat/stream` 的实时连接状态以及 sandbox
+运行句柄仍保存在进程内；单机多实例部署时，这些请求必须通过反向代理固定到同一
+实例，不能把批处理的跨进程验收结果解释成 Agent 实时会话已经跨进程共享。
+
+截至 2026-11-09，单机多进程 Linux 验收已覆盖 SQLite WAL/权限、并发幂等、跨进程
 pause/resume/stop、真实 Worker `SIGKILL` 后的 `UNKNOWN` 保护、结果文件故障拒绝、
 只读数据库拒绝写入，以及两个独立 Uvicorn 实例的 HTTP 状态可见性。详细证据见
 [Linux 单机多进程验收记录](docs/operations/linux-single-host-acceptance-2026-11-07.md)；
-这不包含 OIDC、真实腾讯云副作用、多主机或多 Pod 验收。
+本次全量回归为 `332 passed`，并额外完成了 Docker 镜像构建、Compose 健康检查和
+UID 1000 降权强故障探针；这不包含 OIDC、真实腾讯云副作用、多主机或多 Pod 验收。
 
 ---
 

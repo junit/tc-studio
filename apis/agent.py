@@ -115,6 +115,35 @@ MAX_ATTACHMENT_DATA_URL_LENGTH = 5 * 1024 * 1024
 # this separate from the general upload limit so sanitisation cannot allocate
 # an unbounded in-memory document.
 MAX_SAFE_SVG_BYTES = 5 * 1024 * 1024
+MAX_PROVIDER_NAME_CHARS = 64
+MAX_MODEL_NAME_CHARS = 256
+MAX_MODEL_URL_CHARS = 2048
+MAX_MODEL_API_KEY_CHARS = 4096
+MAX_MODEL_OVERRIDE_BYTES = 32 * 1024
+MAX_BOT_NAME_CHARS = 128
+MAX_BOT_GOAL_CHARS = 4_096
+MAX_BOT_DESCRIPTION_CHARS = 8_192
+MAX_BOT_PROMPT_CHARS = 65_536
+MAX_BOT_PROMPT_ITEM_CHARS = 1_024
+MAX_MEMORY_KEY_CHARS = 256
+MAX_MEMORY_CONTENT_CHARS = 16_384
+MAX_GUIDELINE_INSTRUCTION_CHARS = 16_384
+MAX_GUIDELINE_REASON_CHARS = 4_096
+MAX_KNOWLEDGE_QUERY_CHARS = 4_096
+
+
+def _bound_json_bytes(value: Optional[Dict[str, Any]], *, label: str) -> Optional[Dict[str, Any]]:
+    if value is None:
+        return None
+    encoded = json.dumps(
+        value,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        default=str,
+    ).encode("utf-8")
+    if len(encoded) > MAX_MODEL_OVERRIDE_BYTES:
+        raise ValueError(f"{label}超过 {MAX_MODEL_OVERRIDE_BYTES // 1024} KiB 限制")
+    return value
 
 
 def _write_agent_audit(
@@ -631,35 +660,57 @@ def sanitize_svg(content: bytes, *, max_bytes: int = MAX_SAFE_SVG_BYTES) -> byte
 # DTO 请求体定义
 # -------------------------------------------------------------
 class LLMConfigPayload(BaseModel):
-    provider: str = Field(..., description="模型提供商：deepseek, qwen, ollama, openai, custom")
-    model_name: str = Field(..., description="模型名称")
-    base_url: str = Field(default="", description="Base URL")
-    api_key: Optional[str] = Field(default="", description="API Key")
-    temperature: float = Field(default=0.2, description="温度")
-    max_steps: Optional[int] = Field(default=30, description="最大执行步数（推荐 20~50 轮）")
-    context_budget: Optional[int] = Field(default=32000, description="即时工作记忆总字符预算")
-    max_context_turns: Optional[int] = Field(default=25, description="即时工作记忆保留最大轮数")
+    provider: str = Field(..., max_length=MAX_PROVIDER_NAME_CHARS, description="模型提供商：deepseek, qwen, ollama, openai, custom")
+    model_name: str = Field(..., max_length=MAX_MODEL_NAME_CHARS, description="模型名称")
+    base_url: str = Field(default="", max_length=MAX_MODEL_URL_CHARS, description="Base URL")
+    api_key: Optional[str] = Field(default="", max_length=MAX_MODEL_API_KEY_CHARS, description="API Key")
+    temperature: float = Field(default=0.2, ge=0, le=2, description="温度")
+    max_steps: Optional[int] = Field(default=30, ge=1, le=200, description="最大执行步数（推荐 20~50 轮）")
+    context_budget: Optional[int] = Field(default=32000, ge=1_024, le=2_000_000, description="即时工作记忆总字符预算")
+    max_context_turns: Optional[int] = Field(default=25, ge=1, le=200, description="即时工作记忆保留最大轮数")
 
 
 class FetchModelsPayload(BaseModel):
-    provider: Optional[str] = Field(default=None, description="模型提供商")
-    base_url: Optional[str] = Field(default=None, description="Base URL")
-    api_key: Optional[str] = Field(default=None, description="API Key")
+    provider: Optional[str] = Field(default=None, max_length=MAX_PROVIDER_NAME_CHARS, description="模型提供商")
+    base_url: Optional[str] = Field(default=None, max_length=MAX_MODEL_URL_CHARS, description="Base URL")
+    api_key: Optional[str] = Field(default=None, max_length=MAX_MODEL_API_KEY_CHARS, description="API Key")
 
 
 class CreateBotPayload(BaseModel):
-    name: str = Field(..., description="智能体名称")
-    goal: Optional[str] = Field(default="", description="职责与业务目标（希望智能体做什么）")
+    name: str = Field(..., max_length=MAX_BOT_NAME_CHARS, description="智能体名称")
+    goal: Optional[str] = Field(default="", max_length=MAX_BOT_GOAL_CHARS, description="职责与业务目标（希望智能体做什么）")
     id: Optional[str] = Field(
         default=None,
         pattern=r"^[A-Za-z0-9_-]{1,64}$",
         description="唯一标识 (可选，留空由 AI 自动生成)",
     )
-    avatar: Optional[str] = Field(default=None, description="头像 Emoji (可选，留空由 AI 自动匹配)")
-    description: Optional[str] = Field(default=None, description="功能描述 (可选，留空由 AI 自动生成)")
-    base_prompt: Optional[str] = Field(default=None, description="基础人设提示词 (可选，留空由 AI 自动生成)")
-    suggested_prompts: Optional[List[str]] = Field(default=None, description="个性化推荐快捷指令")
+    avatar: Optional[str] = Field(default=None, max_length=32, description="头像 Emoji (可选，留空由 AI 自动匹配)")
+    description: Optional[str] = Field(default=None, max_length=MAX_BOT_DESCRIPTION_CHARS, description="功能描述 (可选，留空由 AI 自动生成)")
+    base_prompt: Optional[str] = Field(default=None, max_length=MAX_BOT_PROMPT_CHARS, description="基础人设提示词 (可选，留空由 AI 自动生成)")
+    suggested_prompts: Optional[List[str]] = Field(default=None, max_length=8, description="个性化推荐快捷指令")
     model_override: Optional[Dict[str, Any]] = Field(default=None, description="专属模型配置")
+
+    @field_validator("suggested_prompts")
+    @classmethod
+    def bound_suggested_prompts(
+        cls,
+        value: Optional[List[str]],
+    ) -> Optional[List[str]]:
+        if value is None:
+            return None
+        if any(len(str(item)) > MAX_BOT_PROMPT_ITEM_CHARS for item in value):
+            raise ValueError(
+                f"每条推荐指令不能超过 {MAX_BOT_PROMPT_ITEM_CHARS} 个字符"
+            )
+        return value
+
+    @field_validator("model_override")
+    @classmethod
+    def bound_model_override(
+        cls,
+        value: Optional[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        return _bound_json_bytes(value, label="专属模型配置")
 
 
 class TransferBotOwnershipPayload(BaseModel):
@@ -676,11 +727,19 @@ class GeneratePreviewPayload(BaseModel):
 
 
 class UpdateBotPayload(BaseModel):
-    name: Optional[str] = None
-    avatar: Optional[str] = None
-    description: Optional[str] = None
-    base_prompt: Optional[str] = None
+    name: Optional[str] = Field(default=None, max_length=MAX_BOT_NAME_CHARS)
+    avatar: Optional[str] = Field(default=None, max_length=32)
+    description: Optional[str] = Field(default=None, max_length=MAX_BOT_DESCRIPTION_CHARS)
+    base_prompt: Optional[str] = Field(default=None, max_length=MAX_BOT_PROMPT_CHARS)
     model_override: Optional[Dict[str, Any]] = None
+
+    @field_validator("model_override")
+    @classmethod
+    def bound_model_override(
+        cls,
+        value: Optional[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        return _bound_json_bytes(value, label="专属模型配置")
 
 
 class AttachmentItem(BaseModel):
@@ -725,13 +784,13 @@ class TruncateHistoryPayload(BaseModel):
 
 
 class MemoryPayload(BaseModel):
-    key: str = Field(..., description="记忆标识")
-    content: str = Field(..., description="记忆事实详情")
+    key: str = Field(..., max_length=MAX_MEMORY_KEY_CHARS, description="记忆标识")
+    content: str = Field(..., max_length=MAX_MEMORY_CONTENT_CHARS, description="记忆事实详情")
 
 
 class GuidelinePayload(BaseModel):
-    instruction: str = Field(..., description="指令规则内容")
-    reason: Optional[str] = Field(default="", description="强化原因")
+    instruction: str = Field(..., max_length=MAX_GUIDELINE_INSTRUCTION_CHARS, description="指令规则内容")
+    reason: Optional[str] = Field(default="", max_length=MAX_GUIDELINE_REASON_CHARS, description="强化原因")
 
 
 class SaveSkillPayload(BaseModel):
@@ -762,9 +821,9 @@ class ToggleKnowledgePayload(BaseModel):
 
 
 class SearchKnowledgePayload(BaseModel):
-    query: str = Field(..., description="检索问题或关键词")
-    top_k: Optional[int] = Field(default=4, description="返回最多匹配条数")
-    min_score: Optional[float] = Field(default=0.05, description="最低相关度分数阈值")
+    query: str = Field(..., max_length=MAX_KNOWLEDGE_QUERY_CHARS, description="检索问题或关键词")
+    top_k: Optional[int] = Field(default=4, ge=1, le=50, description="返回最多匹配条数")
+    min_score: Optional[float] = Field(default=0.05, ge=0, le=1_000_000, description="最低相关度分数阈值")
 
 
 class ApprovalDecisionPayload(BaseModel):
@@ -946,7 +1005,11 @@ def fetch_available_models(payload: Optional[FetchModelsPayload] = None, user: C
             "message": "Base URL 为空，返回该提供商默认推荐模型列表"
         }
 
-    norm_base = base_url.rstrip("/") if is_official_target else _validate_model_base_url(base_url)
+    # Official host names still need the same DNS/IP policy check.  The
+    # provider allowlist only identifies the intended service; it must not
+    # bypass validation when DNS or a local proxy resolves that name to an
+    # internal address.
+    norm_base = _validate_model_base_url(base_url)
     candidates = []
     if provider == "ollama" or "11434" in norm_base:
         candidates.append(f"{norm_base}/api/tags")

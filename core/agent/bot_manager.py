@@ -54,6 +54,10 @@ MAX_HISTORY_METADATA_BYTES = 2 * 1024 * 1024
 MAX_HISTORY_TOTAL_BYTES = 32 * 1024 * 1024
 MAX_RUNTIME_FILES = 1000
 MAX_RUNTIME_TOTAL_FILE_BYTES = 512 * 1024 * 1024
+MAX_MEMORY_KEY_CHARS = 256
+MAX_MEMORY_CONTENT_CHARS = 16_384
+MAX_GUIDELINE_INSTRUCTION_CHARS = 16_384
+MAX_GUIDELINE_REASON_CHARS = 4_096
 
 
 class BotIdConflict(ValueError):
@@ -346,6 +350,20 @@ class BotManager:
         return {
             "issuer": bot_issuer,
             "tenant_id": bot_tenant,
+            "owner_subject": str(bot.owner_id or ""),
+        }
+
+    @staticmethod
+    def _guideline_scope(bot: BotConfig) -> dict[str, str]:
+        """Return the BOT-definition scope for shared guideline rows.
+
+        Public BOT runtime memories are user-partitioned, but learned
+        guidelines belong to the BOT definition itself and must remain visible
+        to every authorized user of that public BOT.
+        """
+        return {
+            "issuer": str(bot.issuer or ""),
+            "tenant_id": str(bot.tenant_id or ""),
             "owner_subject": str(bot.owner_id or ""),
         }
 
@@ -1537,25 +1555,39 @@ class BotManager:
         bot = self.get_bot(bot_id)
         if not bot:
             return None
+        instruction = str(instruction or "").strip()
+        reason = str(reason or "").strip()
+        if not instruction:
+            raise ValueError("准则内容不能为空")
+        if len(instruction) > MAX_GUIDELINE_INSTRUCTION_CHARS:
+            raise ValueError(
+                f"准则内容不能超过 {MAX_GUIDELINE_INSTRUCTION_CHARS} 个字符"
+            )
+        if len(reason) > MAX_GUIDELINE_REASON_CHARS:
+            raise ValueError(
+                f"强化原因不能超过 {MAX_GUIDELINE_REASON_CHARS} 个字符"
+            )
         guideline = LearnedGuideline(
-            id=f"g-{int(time.time() * 1000)}",
-            instruction=instruction.strip(),
-            reason=reason.strip()
+            id=f"g-{uuid.uuid4().hex}",
+            instruction=instruction,
+            reason=reason,
         )
-        bot.learned_guidelines.append(guideline)
-        self.save_bot(bot)
+        self.metadata_store.insert_guideline(
+            bot_id=bot_id,
+            guideline=guideline.model_dump(),
+            **self._guideline_scope(bot),
+        )
         return guideline
 
     def remove_learned_guideline(self, bot_id: str, guideline_id: str) -> bool:
         bot = self.get_bot(bot_id)
         if not bot:
             return False
-        orig_len = len(bot.learned_guidelines)
-        bot.learned_guidelines = [g for g in bot.learned_guidelines if g.id != guideline_id]
-        if len(bot.learned_guidelines) < orig_len:
-            self.save_bot(bot)
-            return True
-        return False
+        return self.metadata_store.delete_guideline(
+            bot_id,
+            guideline_id,
+            **self._guideline_scope(bot),
+        )
 
     # -------------------------------------------------------------
     # 长期事实记忆系统 (Memory System)
@@ -1596,6 +1628,16 @@ class BotManager:
             bot = self.get_bot(bot_id)
             if not bot:
                 raise ValueError("BOT 不存在")
+            key = str(key or "").strip()
+            content = str(content or "").strip()
+            if not key:
+                raise ValueError("记忆键不能为空")
+            if len(key) > MAX_MEMORY_KEY_CHARS:
+                raise ValueError(f"记忆键不能超过 {MAX_MEMORY_KEY_CHARS} 个字符")
+            if len(content) > MAX_MEMORY_CONTENT_CHARS:
+                raise ValueError(
+                    f"记忆内容不能超过 {MAX_MEMORY_CONTENT_CHARS} 个字符"
+                )
             scope = self._metadata_scope(bot_id, bot=bot)
             now_str = now_iso()
             existing = next(

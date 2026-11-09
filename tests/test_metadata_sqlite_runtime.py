@@ -3,9 +3,11 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+from concurrent.futures import ThreadPoolExecutor
 
 from core.agent.bot_manager import BotManager
 from core.agent.memory import HierarchicalMemoryManager
+from core.persistence import SqliteBotMetadataStore
 from core.agent.rag_manager import RagManager
 from core.runtime_context import runtime_user_id
 
@@ -149,6 +151,148 @@ def test_public_bot_memory_is_scoped_by_runtime_subject(tmp_path):
         assert manager.list_memories(bot.id) == []
     finally:
         runtime_user_id.reset(bob)
+
+
+def test_rag_document_id_is_scoped_by_bot_and_owner(tmp_path):
+    database = tmp_path / "tc_studio.sqlite3"
+    store = SqliteBotMetadataStore(str(database))
+
+    store.replace_rag_document(
+        bot_id="bot-a",
+        document={
+            "id": "same-document-id",
+            "name": "A document",
+            "stored_name": "a.txt",
+        },
+        chunks=[{"index": 0, "content": "A secret"}],
+        issuer="issuer-a",
+        tenant_id="tenant-a",
+        owner_subject="owner-a",
+    )
+    store.replace_rag_document(
+        bot_id="bot-b",
+        document={
+            "id": "same-document-id",
+            "name": "B document",
+            "stored_name": "b.txt",
+        },
+        chunks=[{"index": 0, "content": "B secret"}],
+        issuer="issuer-b",
+        tenant_id="tenant-b",
+        owner_subject="owner-b",
+    )
+
+    documents_a = store.list_rag_documents(
+        "bot-a",
+        issuer="issuer-a",
+        tenant_id="tenant-a",
+        owner_subject="owner-a",
+    )
+    documents_b = store.list_rag_documents(
+        "bot-b",
+        issuer="issuer-b",
+        tenant_id="tenant-b",
+        owner_subject="owner-b",
+    )
+    assert [item["name"] for item in documents_a] == ["A document"]
+    assert [item["name"] for item in documents_b] == ["B document"]
+    assert store.list_rag_chunks(
+        "bot-a",
+        issuer="issuer-a",
+        tenant_id="tenant-a",
+        owner_subject="owner-a",
+    )[0]["content"] == "A secret"
+    assert store.list_rag_chunks(
+        "bot-b",
+        issuer="issuer-b",
+        tenant_id="tenant-b",
+        owner_subject="owner-b",
+    )[0]["content"] == "B secret"
+
+
+def test_rag_stored_name_cannot_escape_bot_files_directory(tmp_path):
+    data_root = tmp_path / "data" / "bots"
+    rag = RagManager(data_root=str(data_root))
+    outside = tmp_path / "outside.txt"
+    outside.write_text("must survive", encoding="utf-8")
+
+    rag.metadata_store.replace_rag_document(
+        bot_id="path-bot",
+        document={
+            "id": "path-doc",
+            "name": "path.txt",
+            "stored_name": "../outside.txt",
+        },
+        chunks=[],
+    )
+
+    assert rag.get_document_file_path("path-bot", "path-doc") is None
+    assert rag.delete_document("path-bot", "path-doc") is True
+    assert outside.read_text(encoding="utf-8") == "must survive"
+
+
+def test_rag_legacy_metadata_is_imported_before_new_document_write(tmp_path):
+    data_root = tmp_path / "data" / "bots"
+    rag = RagManager(data_root=str(data_root))
+    bot_dir = data_root / "legacy-race" / "knowledge"
+    bot_dir.mkdir(parents=True)
+    (bot_dir / "docs.json").write_text(
+        json.dumps(
+            [
+                {
+                    "id": "legacy-doc",
+                    "name": "legacy.txt",
+                    "stored_name": "legacy-doc_legacy.txt",
+                    "enabled": True,
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    (bot_dir / "chunks.json").write_text(
+        json.dumps(
+            [
+                {
+                    "doc_id": "legacy-doc",
+                    "index": 0,
+                    "content": "legacy content",
+                    "tokens": ["legacy"],
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    rag.add_document("legacy-race", "new.txt", b"new content")
+    names = {item["name"] for item in rag.list_documents("legacy-race")}
+    assert names == {"legacy.txt", "new.txt"}
+    assert not (bot_dir / "docs.json").exists()
+    assert not (bot_dir / "chunks.json").exists()
+
+
+def test_guideline_appends_from_independent_managers_are_not_lost(tmp_path):
+    data_dir = tmp_path / "data"
+    creator = BotManager(data_dir=str(data_dir))
+    bot = creator.create_bot("guideline-race", "Guideline race")
+    managers = [BotManager(data_dir=str(data_dir)) for _ in range(2)]
+
+    def append(index: int):
+        return managers[index].add_learned_guideline(
+            bot.id,
+            f"rule-{index}",
+            f"reason-{index}",
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        created = list(executor.map(append, (0, 1)))
+
+    assert all(item is not None for item in created)
+    loaded = BotManager(data_dir=str(data_dir)).get_bot(bot.id)
+    assert loaded is not None
+    assert {item.instruction for item in loaded.learned_guidelines} == {
+        "rule-0",
+        "rule-1",
+    }
 
 
 def test_skill_source_hash_mismatch_is_diagnostic_and_blocks_execution(tmp_path):

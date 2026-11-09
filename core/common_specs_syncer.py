@@ -497,11 +497,30 @@ class CommonSpecsManager:
                         return loaded
 
         # sync_all acquires the lock itself; never call it from the lock above.
-        return self.sync_all(service=service)
+        # A cache miss can be observed by several worker threads at once.
+        # Mark this as a non-forced sync so the second waiter rechecks the
+        # snapshot after acquiring the single-flight lock.
+        return self.sync_all(service=service, force=False)
 
-    def sync_all(self, service: str = "live") -> dict:
+    def sync_all(self, service: str = "live", *, force: bool = True) -> dict:
         """全量同步 9 篇公共规范文档并结构化存储"""
         with self._sync_lock:
+            if not force:
+                cached = _load_cached_specs(service)
+                if isinstance(cached, dict):
+                    loaded_service = str(cached.get("service") or service)
+                    with self._lock:
+                        self._specs_cache[loaded_service] = cached
+                        try:
+                            stat = os.stat(_specs_cache_path(loaded_service))
+                            self._specs_cache_signature[loaded_service] = (
+                                stat.st_mtime_ns,
+                                stat.st_size,
+                            )
+                        except OSError:
+                            self._specs_cache_signature[loaded_service] = None
+                    if loaded_service == service:
+                        return cached
             print(f"[INFO] Starting Tencent Cloud API 3.0 Common Specs Sync for service={service}...")
             cache_path = _specs_cache_path(service)
             previous_specs = _load_cached_specs(service)

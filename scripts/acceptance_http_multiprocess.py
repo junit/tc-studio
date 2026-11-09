@@ -148,6 +148,8 @@ def _run_probe(work_dir: Path, timeout: float) -> dict[str, Any]:
         {
             "APP_ENV": "development",
             "AUTH_ENABLED": "false",
+            "TC_STUDIO_APP_ENV": "development",
+            "TC_STUDIO_AUTH_ENABLED": "false",
             "TC_STUDIO_DATABASE_URL": f"sqlite:///{database}",
             "TC_STUDIO_SQLITE_PATH": str(database),
             "TC_STUDIO_CONFIG_PATH": str(config),

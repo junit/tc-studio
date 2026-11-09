@@ -359,6 +359,22 @@ CREATE TABLE IF NOT EXISTS bot_session_summaries (
     FOREIGN KEY (bot_id) REFERENCES bots(bot_id) ON DELETE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS bot_guidelines (
+    bot_id TEXT NOT NULL,
+    issuer TEXT NOT NULL DEFAULT '',
+    tenant_id TEXT NOT NULL DEFAULT '',
+    owner_subject TEXT NOT NULL DEFAULT '',
+    guideline_id TEXT NOT NULL,
+    instruction TEXT NOT NULL,
+    reason TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (
+        bot_id, issuer, tenant_id, owner_subject, guideline_id
+    ),
+    FOREIGN KEY (bot_id) REFERENCES bots(bot_id) ON DELETE CASCADE
+);
+
 CREATE TABLE IF NOT EXISTS bot_skills (
     skill_id TEXT PRIMARY KEY,
     bot_id TEXT NOT NULL,
@@ -439,7 +455,8 @@ CREATE INDEX IF NOT EXISTS idx_bot_file_reservations_scope
     ON bot_file_reservations(bot_id, issuer, tenant_id, owner_subject, created_at);
 
 CREATE TABLE IF NOT EXISTS rag_documents (
-    document_id TEXT PRIMARY KEY,
+    document_key TEXT PRIMARY KEY,
+    document_id TEXT NOT NULL,
     bot_id TEXT NOT NULL,
     issuer TEXT NOT NULL DEFAULT '',
     tenant_id TEXT NOT NULL DEFAULT '',
@@ -451,17 +468,19 @@ CREATE TABLE IF NOT EXISTS rag_documents (
     metadata_json TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
+    UNIQUE (document_id, bot_id, issuer, tenant_id, owner_subject),
     FOREIGN KEY (bot_id) REFERENCES bots(bot_id) ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS rag_chunks (
+    document_key TEXT NOT NULL,
     document_id TEXT NOT NULL,
     chunk_index INTEGER NOT NULL,
     content TEXT NOT NULL,
     metadata_json TEXT,
     created_at TEXT NOT NULL,
-    PRIMARY KEY (document_id, chunk_index),
-    FOREIGN KEY (document_id) REFERENCES rag_documents(document_id) ON DELETE CASCADE
+    PRIMARY KEY (document_key, chunk_index),
+    FOREIGN KEY (document_key) REFERENCES rag_documents(document_key) ON DELETE CASCADE
 );
 """
 
@@ -515,6 +534,287 @@ def _ensure_schema_columns(connection: sqlite3.Connection) -> None:
                     # reports that the column now exists.
                     if "duplicate column name" not in str(exc).lower():
                         raise
+
+
+def _rag_document_key(
+    document_id: str,
+    *,
+    bot_id: str,
+    issuer: str = "",
+    tenant_id: str = "",
+    owner_subject: str = "",
+) -> str:
+    """Return the stable internal key for one scoped logical document ID."""
+    identity = "\0".join(
+        (
+            str(bot_id),
+            str(issuer or ""),
+            str(tenant_id or ""),
+            str(owner_subject or ""),
+            str(document_id),
+        )
+    )
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()
+
+
+def _migrate_rag_documents_to_scoped_keys(connection: sqlite3.Connection) -> None:
+    """Rebuild the pre-scope RAG tables without losing existing rows.
+
+    Older databases used ``document_id`` as the primary key, which made two
+    BOTs overwrite each other when they happened to generate the same logical
+    document ID.  SQLite cannot change a primary key in place, so rebuild the
+    two related tables once and derive a deterministic internal key from the
+    full ownership scope.
+    """
+    document_columns = {
+        str(row[1])
+        for row in connection.execute("PRAGMA table_info(rag_documents)")
+    }
+    chunk_columns = {
+        str(row[1])
+        for row in connection.execute("PRAGMA table_info(rag_chunks)")
+    }
+    if "document_key" in document_columns and "document_key" in chunk_columns:
+        foreign_key_tables = {
+            str(row[2])
+            for row in connection.execute("PRAGMA foreign_key_list(rag_chunks)")
+        }
+        if "rag_documents_v2" not in foreign_key_tables:
+            return
+        # An interrupted first implementation could leave the child table
+        # referring to the temporary parent name. Repair that relation before
+        # any runtime writer attempts to insert a chunk.
+        connection.execute("PRAGMA foreign_keys = OFF")
+        try:
+            connection.execute("BEGIN")
+            connection.execute(
+                """
+                CREATE TABLE rag_chunks_v3 (
+                    document_key TEXT NOT NULL,
+                    document_id TEXT NOT NULL,
+                    chunk_index INTEGER NOT NULL,
+                    content TEXT NOT NULL,
+                    metadata_json TEXT,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY (document_key, chunk_index),
+                    FOREIGN KEY (document_key)
+                        REFERENCES rag_documents(document_key)
+                        ON DELETE CASCADE
+                )
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO rag_chunks_v3 (
+                    document_key, document_id, chunk_index, content,
+                    metadata_json, created_at
+                )
+                SELECT document_key, document_id, chunk_index, content,
+                       metadata_json, created_at
+                FROM rag_chunks
+                """
+            )
+            connection.execute("DROP TABLE rag_chunks")
+            connection.execute("ALTER TABLE rag_chunks_v3 RENAME TO rag_chunks")
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_rag_chunks_document
+                ON rag_chunks(document_key, chunk_index)
+                """
+            )
+            connection.commit()
+        except Exception:
+            with _safe_rollback(connection):
+                pass
+            raise
+        finally:
+            connection.execute("PRAGMA foreign_keys = ON")
+        return
+
+    connection.execute("PRAGMA foreign_keys = OFF")
+    try:
+        connection.execute("BEGIN")
+        connection.execute(
+            """
+            CREATE TABLE rag_documents_v2 (
+                document_key TEXT PRIMARY KEY,
+                document_id TEXT NOT NULL,
+                bot_id TEXT NOT NULL,
+                issuer TEXT NOT NULL DEFAULT '',
+                tenant_id TEXT NOT NULL DEFAULT '',
+                owner_subject TEXT NOT NULL DEFAULT '',
+                name TEXT NOT NULL,
+                blob_uri TEXT,
+                status TEXT NOT NULL,
+                version INTEGER NOT NULL DEFAULT 1,
+                metadata_json TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE (document_id, bot_id, issuer, tenant_id, owner_subject),
+                FOREIGN KEY (bot_id) REFERENCES bots(bot_id) ON DELETE CASCADE
+            )
+            """
+        )
+        old_documents = connection.execute(
+            """
+            SELECT document_id, bot_id, issuer, tenant_id, owner_subject,
+                   name, blob_uri, status, version, metadata_json,
+                   created_at, updated_at
+            FROM rag_documents
+            ORDER BY rowid
+            """
+        ).fetchall()
+        document_keys: dict[str, str] = {}
+        for row in old_documents:
+            document_id = str(row["document_id"])
+            bot_id = str(row["bot_id"])
+            issuer = str(row["issuer"] or "")
+            tenant_id = str(row["tenant_id"] or "")
+            owner_subject = str(row["owner_subject"] or "")
+            document_key = _rag_document_key(
+                document_id,
+                bot_id=bot_id,
+                issuer=issuer,
+                tenant_id=tenant_id,
+                owner_subject=owner_subject,
+            )
+            # A legacy database could contain duplicate scope rows after a
+            # manually repaired import. Preserve every row deterministically.
+            if document_key in document_keys.values():
+                document_key = hashlib.sha256(
+                    f"{document_key}\0{row['name']}\0{row['created_at']}".encode("utf-8")
+                ).hexdigest()
+            document_keys[document_id] = document_key
+            connection.execute(
+                """
+                INSERT INTO rag_documents_v2 (
+                    document_key, document_id, bot_id, issuer, tenant_id,
+                    owner_subject, name, blob_uri, status, version,
+                    metadata_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    document_key,
+                    document_id,
+                    bot_id,
+                    issuer,
+                    tenant_id,
+                    owner_subject,
+                    str(row["name"]),
+                    row["blob_uri"],
+                    str(row["status"]),
+                    int(row["version"] or 1),
+                    row["metadata_json"],
+                    str(row["created_at"]),
+                    str(row["updated_at"]),
+                ),
+            )
+
+        connection.execute(
+            """
+            CREATE TABLE rag_chunks_v2 (
+                document_key TEXT NOT NULL,
+                document_id TEXT NOT NULL,
+                chunk_index INTEGER NOT NULL,
+                content TEXT NOT NULL,
+                metadata_json TEXT,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (document_key, chunk_index),
+                FOREIGN KEY (document_key)
+                    REFERENCES rag_documents(document_key)
+                    ON DELETE CASCADE
+            )
+            """
+        )
+        old_chunks = connection.execute(
+            """
+            SELECT document_id, chunk_index, content, metadata_json, created_at
+            FROM rag_chunks
+            ORDER BY document_id, chunk_index
+            """
+        ).fetchall()
+        for row in old_chunks:
+            document_key = document_keys.get(str(row["document_id"]))
+            if document_key is None:
+                continue
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO rag_chunks_v2 (
+                    document_key, document_id, chunk_index, content,
+                    metadata_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    document_key,
+                    str(row["document_id"]),
+                    int(row["chunk_index"]),
+                    str(row["content"]),
+                    row["metadata_json"],
+                    str(row["created_at"]),
+                ),
+            )
+
+        connection.execute("DROP TABLE rag_chunks")
+        connection.execute("DROP TABLE rag_documents")
+        connection.execute("ALTER TABLE rag_documents_v2 RENAME TO rag_documents")
+        connection.execute("ALTER TABLE rag_chunks_v2 RENAME TO rag_chunks")
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_rag_documents_scope
+            ON rag_documents(bot_id, issuer, tenant_id, owner_subject, updated_at)
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_rag_chunks_document
+            ON rag_chunks(document_key, chunk_index)
+            """
+        )
+        connection.commit()
+    except Exception:
+        with _safe_rollback(connection):
+            pass
+        raise
+    finally:
+        connection.execute("PRAGMA foreign_keys = ON")
+
+
+def _migrate_embedded_bot_guidelines(connection: sqlite3.Connection) -> None:
+    """Copy pre-SQLite guideline arrays into the concurrent child table."""
+    rows = connection.execute(
+        """
+        SELECT bot_id, issuer, tenant_id, owner_subject, definition_json
+        FROM bots
+        """
+    ).fetchall()
+    for row in rows:
+        definition = _json_load_object(row["definition_json"])
+        guidelines = definition.get("learned_guidelines")
+        if not isinstance(guidelines, list):
+            continue
+        for item in guidelines:
+            if not isinstance(item, Mapping) or not item.get("id"):
+                continue
+            created_at = str(item.get("created_at") or datetime.now(timezone.utc).isoformat())
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO bot_guidelines (
+                    bot_id, issuer, tenant_id, owner_subject, guideline_id,
+                    instruction, reason, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(row["bot_id"]),
+                    str(row["issuer"] or ""),
+                    str(row["tenant_id"] or ""),
+                    str(row["owner_subject"] or ""),
+                    str(item["id"]),
+                    str(item.get("instruction") or ""),
+                    str(item.get("reason") or ""),
+                    created_at,
+                    created_at,
+                ),
+            )
 
 
 def _json_load_object(value: str | None) -> dict[str, Any]:
@@ -1042,7 +1342,8 @@ class SqliteMetadataMigrationStore:
         try:
             now = str(record.get("updated_at") or datetime.now(timezone.utc).isoformat())
             created = str(record.get("created_at") or now)
-            definition = _sanitize_audit_metadata(record.get("definition") or {})
+            definition = dict(_sanitize_audit_metadata(record.get("definition") or {}))
+            guidelines = definition.pop("learned_guidelines", [])
             connection.execute(
                 """
                 INSERT INTO bots (
@@ -1073,6 +1374,33 @@ class SqliteMetadataMigrationStore:
                     now,
                 ),
             )
+            if isinstance(guidelines, list):
+                for guideline in guidelines:
+                    if not isinstance(guideline, Mapping) or not guideline.get("id"):
+                        continue
+                    created_at = str(
+                        guideline.get("created_at")
+                        or datetime.now(timezone.utc).isoformat()
+                    )
+                    connection.execute(
+                        """
+                        INSERT OR IGNORE INTO bot_guidelines (
+                            bot_id, issuer, tenant_id, owner_subject, guideline_id,
+                            instruction, reason, created_at, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            str(record["bot_id"]),
+                            str(record.get("issuer") or ""),
+                            str(record.get("tenant_id") or ""),
+                            str(record.get("owner_subject") or ""),
+                            str(guideline["id"]),
+                            str(guideline.get("instruction") or ""),
+                            str(guideline.get("reason") or ""),
+                            created_at,
+                            created_at,
+                        ),
+                    )
             connection.commit()
         finally:
             connection.close()
@@ -1097,6 +1425,13 @@ class SqliteMetadataMigrationStore:
             )
             created = str(document.get("created_at") or now)
             document_id = str(document["id"])
+            document_key = _rag_document_key(
+                document_id,
+                bot_id=str(bot_id),
+                issuer=issuer,
+                tenant_id=tenant_id,
+                owner_subject=owner_subject,
+            )
             connection.execute(
                 """
                 INSERT INTO bots (
@@ -1119,15 +1454,12 @@ class SqliteMetadataMigrationStore:
             connection.execute(
                 """
                 INSERT INTO rag_documents (
-                    document_id, bot_id, issuer, tenant_id, owner_subject,
-                    name, blob_uri, status, version, metadata_json,
-                    created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(document_id) DO UPDATE SET
-                    bot_id = excluded.bot_id,
-                    issuer = excluded.issuer,
-                    tenant_id = excluded.tenant_id,
-                    owner_subject = excluded.owner_subject,
+                    document_key, document_id, bot_id, issuer, tenant_id,
+                    owner_subject, name, blob_uri, status, version,
+                    metadata_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(document_id, bot_id, issuer, tenant_id, owner_subject)
+                DO UPDATE SET
                     name = excluded.name,
                     blob_uri = excluded.blob_uri,
                     status = excluded.status,
@@ -1136,6 +1468,7 @@ class SqliteMetadataMigrationStore:
                     updated_at = excluded.updated_at
                 """,
                 (
+                    document_key,
                     document_id,
                     bot_id,
                     issuer,
@@ -1156,8 +1489,8 @@ class SqliteMetadataMigrationStore:
                 ),
             )
             connection.execute(
-                "DELETE FROM rag_chunks WHERE document_id = ?",
-                (document_id,),
+                "DELETE FROM rag_chunks WHERE document_key = ?",
+                (document_key,),
             )
             used_chunk_indexes: set[int] = set()
             next_chunk_index = 0
@@ -1186,10 +1519,12 @@ class SqliteMetadataMigrationStore:
                 connection.execute(
                     """
                     INSERT INTO rag_chunks (
-                        document_id, chunk_index, content, metadata_json, created_at
-                    ) VALUES (?, ?, ?, ?, ?)
+                        document_key, document_id, chunk_index, content,
+                        metadata_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)
                     """,
                     (
+                        document_key,
                         document_id,
                         chunk_index,
                         str(chunk.get("content") or ""),
@@ -1503,6 +1838,23 @@ class SqliteBotMetadataStore:
         return open_database(self.path)
 
     @staticmethod
+    def _rag_document_key(
+        document_id: str,
+        *,
+        bot_id: str,
+        issuer: str = "",
+        tenant_id: str = "",
+        owner_subject: str = "",
+    ) -> str:
+        return _rag_document_key(
+            document_id,
+            bot_id=bot_id,
+            issuer=issuer,
+            tenant_id=tenant_id,
+            owner_subject=owner_subject,
+        )
+
+    @staticmethod
     def _scope(
         issuer: str | None = None,
         tenant_id: str | None = None,
@@ -1577,7 +1929,10 @@ class SqliteBotMetadataStore:
         content = str(row["content"])
         title = str(metadata.get("title") or row["name"])
         return {
-            "chunk_id": str(metadata.get("chunk_id") or f"{row['document_id']}_c{row['chunk_index']}"),
+            "chunk_id": str(
+                metadata.get("chunk_id")
+                or f"{row['document_id']}_c{row['chunk_index']}"
+            ),
             "doc_id": str(row["document_id"]),
             "doc_name": str(metadata.get("doc_name") or row["name"]),
             "index": int(row["chunk_index"]),
@@ -1586,6 +1941,112 @@ class SqliteBotMetadataStore:
             "tokens": tokens,
             "token_count": int(metadata.get("token_count") or len(tokens)),
         }
+
+    @staticmethod
+    def _decode_guideline(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "id": str(row["guideline_id"]),
+            "instruction": str(row["instruction"]),
+            "reason": str(row["reason"] or ""),
+            "created_at": str(row["created_at"]),
+        }
+
+    def list_guidelines(
+        self,
+        bot_id: str,
+        *,
+        issuer: str = "",
+        tenant_id: str = "",
+        owner_subject: str = "",
+    ) -> list[dict[str, Any]]:
+        connection = self._open()
+        try:
+            rows = connection.execute(
+                """
+                SELECT guideline_id, instruction, reason, created_at
+                FROM bot_guidelines
+                WHERE bot_id = ? AND issuer = ? AND tenant_id = ?
+                  AND owner_subject = ?
+                ORDER BY created_at ASC, guideline_id ASC
+                """,
+                (str(bot_id), issuer, tenant_id, owner_subject),
+            ).fetchall()
+            return [self._decode_guideline(row) for row in rows]
+        finally:
+            connection.close()
+
+    def insert_guideline(
+        self,
+        *,
+        bot_id: str,
+        guideline: Mapping[str, Any],
+        issuer: str = "",
+        tenant_id: str = "",
+        owner_subject: str = "",
+    ) -> bool:
+        guideline_id = str(guideline.get("id") or "").strip()
+        instruction = str(guideline.get("instruction") or "").strip()
+        if not guideline_id or not instruction:
+            raise ValueError("准则 ID 和 instruction 不能为空")
+        created_at = str(
+            guideline.get("created_at")
+            or datetime.now(timezone.utc).isoformat()
+        )
+        connection = self._open()
+        try:
+            cursor = connection.execute(
+                """
+                INSERT OR IGNORE INTO bot_guidelines (
+                    bot_id, issuer, tenant_id, owner_subject, guideline_id,
+                    instruction, reason, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(bot_id),
+                    issuer,
+                    tenant_id,
+                    owner_subject,
+                    guideline_id,
+                    instruction,
+                    str(guideline.get("reason") or "").strip(),
+                    created_at,
+                    created_at,
+                ),
+            )
+            connection.commit()
+            return cursor.rowcount > 0
+        finally:
+            connection.close()
+
+    def delete_guideline(
+        self,
+        bot_id: str,
+        guideline_id: str,
+        *,
+        issuer: str = "",
+        tenant_id: str = "",
+        owner_subject: str = "",
+    ) -> bool:
+        connection = self._open()
+        try:
+            cursor = connection.execute(
+                """
+                DELETE FROM bot_guidelines
+                WHERE bot_id = ? AND issuer = ? AND tenant_id = ?
+                  AND owner_subject = ? AND guideline_id = ?
+                """,
+                (
+                    str(bot_id),
+                    issuer,
+                    tenant_id,
+                    owner_subject,
+                    str(guideline_id),
+                ),
+            )
+            connection.commit()
+            return cursor.rowcount > 0
+        finally:
+            connection.close()
 
     # ------------------------------------------------------------------
     # BOT definitions
@@ -1607,6 +2068,25 @@ class SqliteBotMetadataStore:
             definition["tenant_id"] = str(row["tenant_id"] or "")
             definition["created_at"] = str(row["created_at"])
             definition["updated_at"] = str(row["updated_at"])
+            guideline_rows = connection.execute(
+                """
+                SELECT guideline_id, instruction, reason, created_at
+                FROM bot_guidelines
+                WHERE bot_id = ? AND issuer = ? AND tenant_id = ?
+                  AND owner_subject = ?
+                ORDER BY created_at ASC, guideline_id ASC
+                """,
+                (
+                    str(row["bot_id"]),
+                    str(row["issuer"] or ""),
+                    str(row["tenant_id"] or ""),
+                    str(row["owner_subject"] or ""),
+                ),
+            ).fetchall()
+            definition["learned_guidelines"] = [
+                self._decode_guideline(guideline_row)
+                for guideline_row in guideline_rows
+            ]
             return definition
         finally:
             connection.close()
@@ -1627,6 +2107,25 @@ class SqliteBotMetadataStore:
                 definition["tenant_id"] = str(row["tenant_id"] or "")
                 definition["created_at"] = str(row["created_at"])
                 definition["updated_at"] = str(row["updated_at"])
+                guideline_rows = connection.execute(
+                    """
+                    SELECT guideline_id, instruction, reason, created_at
+                    FROM bot_guidelines
+                    WHERE bot_id = ? AND issuer = ? AND tenant_id = ?
+                      AND owner_subject = ?
+                    ORDER BY created_at ASC, guideline_id ASC
+                    """,
+                    (
+                        str(row["bot_id"]),
+                        str(row["issuer"] or ""),
+                        str(row["tenant_id"] or ""),
+                        str(row["owner_subject"] or ""),
+                    ),
+                ).fetchall()
+                definition["learned_guidelines"] = [
+                    self._decode_guideline(guideline_row)
+                    for guideline_row in guideline_rows
+                ]
                 result.append(definition)
             return result
         finally:
@@ -1635,7 +2134,10 @@ class SqliteBotMetadataStore:
     def upsert_bot(self, record: Mapping[str, Any]) -> None:
         now = str(record.get("updated_at") or datetime.now(timezone.utc).isoformat())
         created = str(record.get("created_at") or now)
-        definition = _sanitize_audit_metadata(record.get("definition") or {})
+        definition = dict(_sanitize_audit_metadata(record.get("definition") or {}))
+        # Guidelines are a child table so independent processes can append or
+        # remove one row without replacing the complete BOT definition.
+        definition.pop("learned_guidelines", None)
         owner_subject = record.get("owner_subject")
         connection = self._open()
         try:
@@ -1672,7 +2174,8 @@ class SqliteBotMetadataStore:
         """Insert a new BOT without allowing a concurrent creator to overwrite it."""
         now = str(record.get("updated_at") or datetime.now(timezone.utc).isoformat())
         created = str(record.get("created_at") or now)
-        definition = _sanitize_audit_metadata(record.get("definition") or {})
+        definition = dict(_sanitize_audit_metadata(record.get("definition") or {}))
+        definition.pop("learned_guidelines", None)
         owner_subject = record.get("owner_subject")
         connection = self._open()
         try:
@@ -2769,10 +3272,10 @@ class SqliteBotMetadataStore:
                 """
                 SELECT d.*, COUNT(c.chunk_index) AS chunks_count
                 FROM rag_documents d
-                LEFT JOIN rag_chunks c ON c.document_id = d.document_id
+                LEFT JOIN rag_chunks c ON c.document_key = d.document_key
                 WHERE d.bot_id = ? AND d.issuer = ? AND d.tenant_id = ?
                   AND d.owner_subject = ?
-                GROUP BY d.document_id
+                GROUP BY d.document_key
                 ORDER BY d.created_at DESC, d.document_id DESC
                 """,
                 (str(bot_id), issuer, tenant_id, owner_subject),
@@ -2799,11 +3302,11 @@ class SqliteBotMetadataStore:
                 """
                 SELECT d.*, COUNT(c.chunk_index) AS chunks_count
                 FROM rag_documents d
-                LEFT JOIN rag_chunks c ON c.document_id = d.document_id
+                LEFT JOIN rag_chunks c ON c.document_key = d.document_key
                 WHERE d.document_id = ? AND d.bot_id = ?
                   AND d.issuer = ? AND d.tenant_id = ?
                   AND d.owner_subject = ?
-                GROUP BY d.document_id
+                GROUP BY d.document_key
                 """,
                 (
                     str(document_id),
@@ -2835,10 +3338,10 @@ class SqliteBotMetadataStore:
                 """
                 SELECT c.*, d.name
                 FROM rag_chunks c
-                JOIN rag_documents d ON d.document_id = c.document_id
+                JOIN rag_documents d ON d.document_key = c.document_key
                 WHERE d.bot_id = ? AND d.issuer = ? AND d.tenant_id = ?
                   AND d.owner_subject = ?
-                ORDER BY c.document_id ASC, c.chunk_index ASC
+                ORDER BY d.document_id ASC, c.chunk_index ASC
                 """,
                 (str(bot_id), issuer, tenant_id, owner_subject),
             ).fetchall()
@@ -2864,6 +3367,13 @@ class SqliteBotMetadataStore:
         )
         created = str(document.get("created_at") or now)
         document_id = str(document["id"])
+        document_key = self._rag_document_key(
+            document_id,
+            bot_id=str(bot_id),
+            issuer=issuer,
+            tenant_id=tenant_id,
+            owner_subject=owner_subject,
+        )
         connection = self._open()
         try:
             connection.execute("BEGIN IMMEDIATE")
@@ -2889,15 +3399,12 @@ class SqliteBotMetadataStore:
             connection.execute(
                 """
                 INSERT INTO rag_documents (
-                    document_id, bot_id, issuer, tenant_id, owner_subject,
-                    name, blob_uri, status, version, metadata_json,
-                    created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(document_id) DO UPDATE SET
-                    bot_id = excluded.bot_id,
-                    issuer = excluded.issuer,
-                    tenant_id = excluded.tenant_id,
-                    owner_subject = excluded.owner_subject,
+                    document_key, document_id, bot_id, issuer, tenant_id,
+                    owner_subject, name, blob_uri, status, version,
+                    metadata_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(document_id, bot_id, issuer, tenant_id, owner_subject)
+                DO UPDATE SET
                     name = excluded.name,
                     blob_uri = excluded.blob_uri,
                     status = excluded.status,
@@ -2906,6 +3413,7 @@ class SqliteBotMetadataStore:
                     updated_at = excluded.updated_at
                 """,
                 (
+                    document_key,
                     document_id,
                     str(bot_id),
                     issuer,
@@ -2921,8 +3429,8 @@ class SqliteBotMetadataStore:
                 ),
             )
             connection.execute(
-                "DELETE FROM rag_chunks WHERE document_id = ?",
-                (document_id,),
+                "DELETE FROM rag_chunks WHERE document_key = ?",
+                (document_key,),
             )
             used_indexes: set[int] = set()
             next_index = 0
@@ -2951,10 +3459,12 @@ class SqliteBotMetadataStore:
                 connection.execute(
                     """
                     INSERT INTO rag_chunks (
-                        document_id, chunk_index, content, metadata_json, created_at
-                    ) VALUES (?, ?, ?, ?, ?)
+                        document_key, document_id, chunk_index, content,
+                        metadata_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)
                     """,
                     (
+                        document_key,
                         document_id,
                         chunk_index,
                         str(chunk.get("content") or ""),
@@ -3004,13 +3514,19 @@ class SqliteBotMetadataStore:
                 """
                 UPDATE rag_documents
                 SET status = ?, metadata_json = ?, updated_at = ?
-                WHERE document_id = ?
+                WHERE document_key = ?
                 """,
                 (
                     "ENABLED" if next_enabled else "DISABLED",
                     self._encode(metadata),
                     datetime.now(timezone.utc).isoformat(),
-                    str(document_id),
+                    self._rag_document_key(
+                        document_id,
+                        bot_id=str(bot_id),
+                        issuer=issuer,
+                        tenant_id=tenant_id,
+                        owner_subject=owner_subject,
+                    ),
                 ),
             )
             connection.commit()
@@ -3038,10 +3554,10 @@ class SqliteBotMetadataStore:
                 """
                 SELECT d.*, COUNT(c.chunk_index) AS chunks_count
                 FROM rag_documents d
-                LEFT JOIN rag_chunks c ON c.document_id = d.document_id
+                LEFT JOIN rag_chunks c ON c.document_key = d.document_key
                 WHERE d.document_id = ? AND d.bot_id = ? AND d.issuer = ?
                   AND d.tenant_id = ? AND d.owner_subject = ?
-                GROUP BY d.document_id
+                GROUP BY d.document_key
                 """,
                 (str(document_id), str(bot_id), issuer, tenant_id, owner_subject),
             ).fetchone()
@@ -3050,8 +3566,16 @@ class SqliteBotMetadataStore:
                 return None
             document = self._decode_document(row, chunks_count=int(row["chunks_count"]))
             connection.execute(
-                "DELETE FROM rag_documents WHERE document_id = ?",
-                (str(document_id),),
+                "DELETE FROM rag_documents WHERE document_key = ?",
+                (
+                    self._rag_document_key(
+                        document_id,
+                        bot_id=str(bot_id),
+                        issuer=issuer,
+                        tenant_id=tenant_id,
+                        owner_subject=owner_subject,
+                    ),
+                ),
             )
             connection.commit()
             return document
@@ -4532,6 +5056,8 @@ def initialize_database(path: str | None = None) -> str:
         try:
             connection.executescript(SCHEMA_SQL)
             _ensure_schema_columns(connection)
+            _migrate_rag_documents_to_scoped_keys(connection)
+            _migrate_embedded_bot_guidelines(connection)
             connection.execute(
                 """
                 INSERT OR IGNORE INTO schema_migrations(version, applied_at)
@@ -4573,6 +5099,13 @@ def initialize_database(path: str | None = None) -> str:
                 VALUES (?, ?)
                 """,
                 (6, datetime.now(timezone.utc).isoformat()),
+            )
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO schema_migrations(version, applied_at)
+                VALUES (?, ?)
+                """,
+                (7, datetime.now(timezone.utc).isoformat()),
             )
             connection.execute("BEGIN IMMEDIATE")
             imported_legacy = _migrate_legacy_idempotency(connection, target_path)

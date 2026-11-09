@@ -28,6 +28,31 @@ def test_non_admin_can_probe_allowed_local_ollama_without_key():
     assert result["models"] == ["llama3"]
 
 
+def test_official_model_probe_does_not_bypass_dns_ssrf_guard(monkeypatch):
+    import pytest
+    from fastapi import HTTPException
+    from unittest.mock import patch
+
+    from apis.agent import FetchModelsPayload, fetch_available_models
+    from core.auth import CurrentUser
+
+    monkeypatch.setattr(
+        "core.agent.model_url_guard.socket.getaddrinfo",
+        lambda host, port=None, **_: [(2, 1, 6, "", ("127.0.0.1", port or 443))],
+    )
+    with patch("apis.agent.requests.get") as request:
+        with pytest.raises(HTTPException) as exc_info:
+            fetch_available_models(
+                FetchModelsPayload(
+                    provider="deepseek",
+                    base_url="https://api.deepseek.com",
+                ),
+                CurrentUser("user-1"),
+            )
+    assert exc_info.value.status_code == 422
+    request.assert_not_called()
+
+
 def test_persistence_rejects_private_model_base_url():
     """BOT 持久化层必须拦截内网模型地址，不得仅在 /models 探测时校验。"""
     import pytest

@@ -66,7 +66,7 @@ from core.persistence import SqliteAuditStore
 from core.namespace import get_env, set_default_env
 from core.runtime_paths import official_tree_read_paths
 from core.sync_task_manager import sync_task_manager
-from core.tree_syncer import fetch_official_hydration_tree, sync_catalog_from_live_tree
+from core.tree_syncer import sync_catalog_from_live_tree
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(BASE_DIR, "static")
@@ -170,6 +170,12 @@ def require_batch_task(task_id: str, user: CurrentUser = Depends(current_user)):
 @app.get("/api/auth/me")
 def get_auth_me(user: CurrentUser = Depends(current_user)):
     return {"subject": user.subject, "roles": sorted(user.roles), "is_admin": user.is_admin, "is_operator": user.is_operator}
+
+
+@app.get("/healthz")
+def healthz():
+    """Process liveness endpoint for systemd, Docker and local probes."""
+    return {"status": "ok"}
 
 
 # ---------------- 静态资源路由 ----------------
@@ -803,11 +809,10 @@ def get_raw_official_tree():
                 return {"status": "success", "data": json.load(f)}
         except (OSError, json.JSONDecodeError) as exc:
             print(f"[WARN] 忽略损坏的官方目录树快照 {snapshot_path}: {exc}")
-    try:
-        raw_tree, _ = fetch_official_hydration_tree()
-        return {"status": "success", "data": raw_tree}
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"获取官方目录树快照失败: {exc!s}") from exc
+    raise HTTPException(
+        status_code=503,
+        detail="官方目录树快照尚未就绪，请先通过 POST /api/docs/tree/sync 触发同步",
+    )
 
 
 @app.get("/api/docs/{api_id}")

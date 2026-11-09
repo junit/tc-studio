@@ -8,6 +8,9 @@
 
 这份 ADR 确定当前单机部署和未来 PostgreSQL + Redis 部署的共同数据边界。它不要求当前版本立即引入 Redis，也不把“所有文件都迁入 SQLite”作为目标。
 
+最近复审：2026-11-09。复审结论维持本 ADR 的单机边界，并补充 Docker 可重复构建、
+RAG 作用域键、BOT 准则并发模型和 Agent 实时状态的进程内限制。
+
 应用自身的运行时命名已经在 2026-11-08 由
 [ADR-0002：TC Studio 命名空间迁移与 TIM 兼容窗口](0002-tc-studio-namespace-compatibility.md)
 统一为 `TC_STUDIO_*`、`tc_studio.sqlite3` 和 `/var/lib/tc-studio`。本文中
@@ -152,12 +155,17 @@ Redis 不是当前单机阶段的强制依赖。必须引入的是“共享、�
   只允许在 SQLite 表为空时做一次兼容导入，后续写入不会再整文件读改写。
 - 已提供 JSON 元数据只读扫描/追加迁移命令，以及 SQLite 备份、恢复和单机部署检查脚本。
 - BOT 定义、长期记忆、会话摘要、会话消息、技能元数据、文件引用、RAG 文档和 chunks 的运行期读写已经切换到 SQLite；旧 JSON/JSONL 只在迁移或缺少对应 SQLite 行时兼容读取，新写入不会创建这些旧结构化文件。
+- `rag_documents` 使用内部 `document_key`，并以 `document_id + bot_id + issuer + tenant_id + owner_subject` 形成作用域唯一边界；`rag_chunks` 通过内部键关联文档并保留原始 `document_id` 兼容查询。
+- BOT 准则已经拆到 `bot_guidelines` 表，准则增删使用单行事务操作，不再通过整个 BOT JSON 读改写。
 - 上传原件、RAG 原文档、技能 Python 源码和大型批处理结果继续放在本地 Blob/文件层，SQLite 保存其归属、状态、哈希、大小、URI 和索引。
 - 已提供独立进程 SQLite 验收脚本，覆盖并发幂等、跨进程控制、事件回放、过期租约
   和旧 Worker 防覆盖；同时修复了首次并发打开数据库时的 WAL/schema 初始化竞态。
 - 已在 Linux 容器中用降权用户完成单机多进程验收：真实 Worker `SIGKILL`、租约过期、
   `UNKNOWN` 终态防旧 Worker 覆盖、结果文件截断/篡改/删除/不可读、只读数据库拒绝写入，
   以及两个独立 Uvicorn 进程共享同一 SQLite 的 HTTP 幂等和状态可见性。
+- 已用 Dockerfile/Compose 完成 Python 3.13、Node 22、`uv.lock`、`web/pnpm-lock.yaml`
+  的实际构建；容器使用 UID 10001、只读根文件系统、独立数据卷和资源上限，最终全量
+  回归为 `332 passed`。
 - 幂等记录清理只针对 `COMPLETED`、`FAILED`、`CANCELLED`；`UNKNOWN` 永久保留，避免
   外部请求结果未知时因保留期到期再次执行同一副作用。
 - 部署检查已兼容 Linux `mount`/`findmnt` 输出；无法识别数据库或运行期目录的文件系统类型
@@ -183,8 +191,10 @@ Redis 不是当前单机阶段的强制依赖。必须引入的是“共享、�
 
 因此当前版本的准确定位是：**统一 SQLite 主库已经接入批处理事实、事件、控制、同步任务状态和
 BOT/RAG 结构化元数据；单机多进程的共享状态、幂等、控制、租约失效保护和双 HTTP 实例可见性
-已经通过 Linux 验收；自动接管和多主机调度仍属于后续阶段。** `UNKNOWN` 仍需要人工核对后
-决定是否重新发起外部操作。
+已经通过 Linux 验收；自动接管和多主机调度仍属于后续阶段。** 批处理 SSE 可以回放 SQLite
+事件，但 AgentRun、审批等待、`/chat` 对话上下文、`/chat/stream` 实时连接状态和 sandbox
+运行句柄仍在进程内；多实例部署必须固定同一 Agent 会话到同一 API 实例。`UNKNOWN` 仍需要
+人工核对后决定是否重新发起外部操作。
 
 ## 数据分类与迁移结论
 
@@ -302,6 +312,7 @@ schema_migrations
 tenants
 users
 bots
+bot_guidelines
 bot_memories
 bot_session_summaries
 conversation_sessions

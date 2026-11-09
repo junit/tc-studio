@@ -49,6 +49,7 @@ def _child_environment(
     environment["TC_STUDIO_DATABASE_URL"] = f"sqlite:///{database}"
     environment["TC_STUDIO_SQLITE_PATH"] = str(database)
     environment["TC_STUDIO_CONFIG_PATH"] = str(database.with_name("config.json"))
+    environment["TC_STUDIO_DATA_DIR"] = str(database.parent / "data")
     environment["TC_STUDIO_STORAGE_DIR"] = str(storage)
     environment["TC_STUDIO_RESULTS_DIR"] = str(results)
     environment["TC_STUDIO_HISTORY_PATH"] = str(history)

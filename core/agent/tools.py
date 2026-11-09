@@ -700,6 +700,9 @@ _SKILL_BLOCKED_ATTRIBUTES = frozenset({
     "__setattr__",
 })
 _SKILL_TIMEOUT_SECONDS = 25.0
+_SKILL_RLIMIT_AS_BYTES = 512 * 1024 * 1024
+_SKILL_RLIMIT_NOFILE = 128
+_SKILL_RLIMIT_NPROC = 32
 MAX_SKILL_CODE_BYTES = 64 * 1024
 _MISSING = object()
 
@@ -908,6 +911,19 @@ def _skill_worker_entry(conn, code: str, args: dict, service_names: list):
             import resource
             resource.setrlimit(resource.RLIMIT_CPU, (int(_SKILL_TIMEOUT_SECONDS) + 2, int(_SKILL_TIMEOUT_SECONDS) + 2))
             resource.setrlimit(resource.RLIMIT_FSIZE, (16 * 1024 * 1024, 16 * 1024 * 1024))
+            resource.setrlimit(
+                resource.RLIMIT_AS,
+                (_SKILL_RLIMIT_AS_BYTES, _SKILL_RLIMIT_AS_BYTES),
+            )
+            resource.setrlimit(
+                resource.RLIMIT_NOFILE,
+                (_SKILL_RLIMIT_NOFILE, _SKILL_RLIMIT_NOFILE),
+            )
+            if hasattr(resource, "RLIMIT_NPROC"):
+                resource.setrlimit(
+                    resource.RLIMIT_NPROC,
+                    (_SKILL_RLIMIT_NPROC, _SKILL_RLIMIT_NPROC),
+                )
 
         def safe_import(name, globals=None, locals=None, fromlist=(), level=0):
             module = str(name).split(".", 1)[0]
@@ -1559,7 +1575,12 @@ class ReadFileTool(Tool):
                 return f"读取 DOCX 失败: {e!s}"
         elif ftype == "pdf":
             try:
-                from .file_parser import MAX_PDF_PAGES
+                from .file_parser import MAX_PDF_FILE_BYTES, MAX_PDF_PAGES
+                if os.path.getsize(path) > MAX_PDF_FILE_BYTES:
+                    return (
+                        "读取 PDF 失败: PDF 文件超过 "
+                        f"{MAX_PDF_FILE_BYTES // (1024 * 1024)} MiB 限制"
+                    )
                 import pypdf
                 reader = pypdf.PdfReader(path)
                 if len(reader.pages) > MAX_PDF_PAGES:

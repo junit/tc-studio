@@ -99,6 +99,39 @@ print("refresh-ok")
     assert output.strip().endswith("refresh-ok")
 
 
+def test_common_specs_cache_miss_is_single_flight(tmp_path):
+    output = _run_isolated(
+        """
+import threading
+from concurrent.futures import ThreadPoolExecutor
+
+import core.common_specs_syncer as module
+
+calls = 0
+calls_lock = threading.Lock()
+
+def fake_fetch(_doc_id):
+    global calls
+    with calls_lock:
+        calls += 1
+    return {"title": "probe", "body": "<p>probe</p>"}
+
+module.fetch_doc_detail_api = fake_fetch
+manager = module.CommonSpecsManager()
+
+with ThreadPoolExecutor(max_workers=8) as executor:
+    results = list(executor.map(lambda _item: manager.get_specs("probe"), range(8)))
+
+assert all(result["service"] == "probe" for result in results)
+assert calls == len(module.COMMON_DOC_CONFIGS)
+print("single-flight-ok")
+""",
+        tmp_path,
+    )
+
+    assert output.strip().endswith("single-flight-ok")
+
+
 def test_invalid_runtime_specs_fall_back_to_package_snapshot(tmp_path):
     output = _run_isolated(
         """

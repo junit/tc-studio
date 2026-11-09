@@ -47,6 +47,12 @@ export TC_STUDIO_HISTORY_PATH=/var/lib/tc-studio/storage/history.json
 `history.jsonl`、`session_summary.json`、技能 JSON、`docs.json` 和 `chunks.json`
 只作为迁移源或兼容回退，新写入不会创建这些结构化文件。
 
+RAG 文档不再使用全局 `document_id` 覆盖记录：SQLite 内部使用 `document_key`，
+并以 `document_id + bot_id + issuer + tenant_id + owner_subject` 组成作用域唯一边界；
+`rag_chunks` 通过内部键关联文档，同时保留原始 `document_id` 供兼容查询。
+BOT 准则已经拆到 `bot_guidelines` 表，新增和删除只修改单行，避免多个进程读取
+整个 BOT JSON 后互相覆盖。
+
 `storage/history.json` 只保留在旧数据观察期内。首次读取时，缺少 SQLite 行的旧
 任务可以补录到 `batch_tasks`；已有 SQLite 行以数据库为准。删除任务会写入
 `batch_task_tombstones`，因此旧快照不能再次创建被删除的任务。确认观察期结束后，
@@ -137,6 +143,38 @@ systemctl status tc-studio-api@8100.service tc-studio-api@8101.service
 systemd 模板提供进程生命周期契约，但它不会替代发布前的 SQLite 检查和强故障验收。
 启用服务后，必须在目标主机重新执行本手册的启动检查、强杀探针和 HTTP 双实例探针。
 
+## Docker 单机部署
+
+仓库中的 `Dockerfile` 和 `compose.yaml` 提供了可重复构建的单机运行路径。构建时
+使用 Python 3.13、Node 22、`uv.lock` 和 `web/pnpm-lock.yaml`；运行时使用
+`tcstudio:10001` 非 root 用户、只读根文件系统、`/tmp` 临时文件系统和独立的
+`/var/lib/tc-studio` 数据卷。
+
+首次构建和启动：
+
+```bash
+docker compose build
+docker compose up -d
+docker compose ps
+docker compose logs --no-log-prefix
+curl -fsS http://127.0.0.1:8000/healthz
+```
+
+启动后应看到服务为 `healthy`，`/healthz` 返回 `{"status":"ok"}`。可以进一步检查
+运行身份和只读根文件系统：
+
+```bash
+docker compose exec tc-studio id
+docker inspect --format \
+  'user={{.Config.User}} read_only={{.HostConfig.ReadonlyRootfs}} pids={{.HostConfig.PidsLimit}} mem={{.HostConfig.Memory}} nano_cpus={{.HostConfig.NanoCpus}}' \
+  "$(docker compose ps -q tc-studio)"
+```
+
+Compose 默认打开生产认证开关，因此正式接入前必须提供完整的认证配置；本阶段的
+本地 SQLite 验收脚本会显式设置 `TC_STUDIO_APP_ENV=development` 和
+`TC_STUDIO_AUTH_ENABLED=false`，不能用验收环境代替公网身份系统验收。停止容器时
+使用 `docker compose down`；不要随意加 `-v`，否则会删除单机 SQLite 数据卷。
+
 ## 启动前检查
 
 执行：
@@ -225,7 +263,8 @@ PYTHONPATH=. python scripts/acceptance_http_multiprocess.py \
 
 最近一次 Linux 验收记录见
 [Linux 单机多进程验收记录](linux-single-host-acceptance-2026-11-07.md)。该记录包含
-容器版本、降权用户、启动检查、真实 `SIGKILL` 和双 HTTP 实例的实测结果。
+容器版本、降权用户、Docker Compose 健康检查、启动检查、真实 `SIGKILL` 和双 HTTP
+实例的实测结果。
 
 这次探针会启动真实 Worker 进程并发送 `SIGKILL`，由另一个进程等待租约过期、
 读取 `UNKNOWN`，再用被杀 Worker 的旧 `worker_id` 尝试终态写入。它还会验证结果
@@ -286,8 +325,10 @@ docker run --rm \
 ```
 
 `requirements-dev.lock` 包含 `pytest`、`pytest-asyncio` 和开发测试依赖，不能用生产
-锁文件代替。当前 Docker Desktop Linux/arm64 复验已经通过 `283 passed`；如果生产主机
-是 x86_64 或其他架构，仍需在目标架构上重新安装锁文件并复跑。
+锁文件代替。当前 Docker Desktop Linux/arm64 复验已经通过 `332 passed in 63.36s`；
+Docker 镜像也已实际通过 `uv sync --frozen --no-dev`、`pnpm install --frozen-lockfile`
+和前端生产构建。如果生产主机是 x86_64 或其他架构，仍需在目标架构上重新构建镜像、
+安装锁文件并复跑。
 
 ## 备份与恢复
 
@@ -398,6 +439,12 @@ ID、哈希和文件存在性做一次核验；SQLite 行存在时运行期不�
 `/opt/tc-studio/core`。任务句柄、租约、进度和取消标志保存在 `sync_jobs`。
 因此两个 API 进程查询同一个同步任务会看到同一状态，目录注册器和公共规范缓存也会
 在发现运行期文件版本变化后刷新。
+
+批处理的事实状态和事件可以跨进程从 SQLite 读取；AgentRun、审批等待、
+`/chat` 对话上下文、`/chat/stream` 的实时连接状态和 sandbox 运行句柄仍是进程内
+状态。单机多实例部署时，反向代理必须把同一 Agent 会话、审批回调和流式连接固定
+到同一 API 实例；当前验收不能宣称这些实时 Agent 状态已经跨进程共享。未来引入
+Redis 时，这些短期状态和事件发布才可以演进为跨实例协调。
 
 ## 发布验收矩阵
 

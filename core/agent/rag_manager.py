@@ -19,7 +19,12 @@ try:
 except ImportError:  # pragma: no cover - Windows fallback keeps process-local safety
     fcntl = None
 
-from .file_parser import MAX_PDF_PAGES, format_file_size, validate_zip_archive
+from .file_parser import (
+    MAX_PDF_FILE_BYTES,
+    MAX_PDF_PAGES,
+    format_file_size,
+    validate_zip_archive,
+)
 from core.namespace import (
     CANONICAL_DATABASE_FILENAME,
     LEGACY_DATABASE_FILENAME,
@@ -35,6 +40,7 @@ from core.runtime_context import runtime_auth_scope, runtime_user_id
 MAX_RAG_TEXT_CHARS = 2_000_000
 MAX_RAG_CHUNKS = 5_000
 MAX_RAG_PDF_PAGES = MAX_PDF_PAGES
+MAX_RAG_QUERY_CHARS = 4_096
 
 
 def tokenize(text: str) -> List[str]:
@@ -197,6 +203,44 @@ class RagManager:
     def _get_chunks_path(self, bot_id: str) -> str:
         return os.path.join(self._get_kb_dir(bot_id), "chunks.json")
 
+    def _safe_document_file_path(
+        self,
+        bot_id: str,
+        stored_name: Any,
+    ) -> Optional[str]:
+        """Resolve a stored RAG Blob only inside the BOT files directory."""
+        if not isinstance(stored_name, str) or not stored_name:
+            return None
+        if (
+            os.path.isabs(stored_name)
+            or os.path.basename(stored_name) != stored_name
+            or stored_name in {".", ".."}
+        ):
+            return None
+        kb_dir = self._get_kb_dir(bot_id)
+        files_dir = os.path.join(kb_dir, "files")
+        if os.path.islink(files_dir):
+            return None
+        base_path = os.path.abspath(files_dir)
+        target_path = os.path.abspath(os.path.join(files_dir, stored_name))
+        try:
+            if os.path.commonpath((base_path, target_path)) != base_path:
+                return None
+        except ValueError:
+            return None
+        resolved_base = os.path.realpath(base_path)
+        resolved_target = os.path.realpath(target_path)
+        if resolved_base != base_path:
+            return None
+        try:
+            if os.path.commonpath((resolved_base, resolved_target)) != resolved_base:
+                return None
+        except ValueError:
+            return None
+        if os.path.lexists(target_path) and os.path.islink(target_path):
+            return None
+        return target_path
+
     @contextmanager
     def _storage_lock(self, bot_id: str):
         """Serialize one BOT's RAG read/modify/write transaction across workers."""
@@ -280,8 +324,8 @@ class RagManager:
         kb_dir = self._get_kb_dir(bot_id)
         stored_name = doc.get("stored_name")
         if stored_name:
-            path = os.path.join(kb_dir, "files", stored_name)
-            if os.path.exists(path):
+            path = self._safe_document_file_path(bot_id, stored_name)
+            if path and os.path.isfile(path):
                 return path
         return None
 
@@ -321,6 +365,10 @@ class RagManager:
         elif ext == "pdf":
             import io
             import pypdf
+            if len(content) > MAX_PDF_FILE_BYTES:
+                raise ValueError(
+                    f"PDF 文件超过 {MAX_PDF_FILE_BYTES // (1024 * 1024)} MiB 限制"
+                )
             pdf_file = io.BytesIO(content)
             reader = pypdf.PdfReader(pdf_file)
             if len(reader.pages) > MAX_RAG_PDF_PAGES:
@@ -460,8 +508,11 @@ class RagManager:
         with self._storage_lock(bot_id):
             if not self._bot_scope_matches_runtime(bot_id):
                 raise PermissionError("当前认证范围无权访问该 BOT 的知识库")
+            self._import_legacy_metadata_if_needed(bot_id)
             kb_dir = self._get_kb_dir(bot_id)
-            stored_path = os.path.join(kb_dir, "files", stored_name)
+            stored_path = self._safe_document_file_path(bot_id, stored_name)
+            if stored_path is None:
+                raise ValueError("知识库文件名不安全")
             temp_path = f"{stored_path}.{os.getpid()}.{threading.get_ident()}.tmp"
             try:
                 fd = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -528,11 +579,10 @@ class RagManager:
 
             kb_dir = self._get_kb_dir(bot_id)
             stored_name = target.get("stored_name")
-            fpath = os.path.join(kb_dir, "files", stored_name) if stored_name else None
-            if stored_name:
-                if os.path.exists(fpath):
-                    with suppress(OSError):
-                        os.remove(fpath)
+            fpath = self._safe_document_file_path(bot_id, stored_name)
+            if fpath and os.path.isfile(fpath):
+                with suppress(OSError):
+                    os.remove(fpath)
 
             return True
 
@@ -543,6 +593,11 @@ class RagManager:
         top_k: int = 4,
         min_score: float = 0.05
     ) -> List[Dict[str, Any]]:
+        query = str(query or "").strip()
+        if len(query) > MAX_RAG_QUERY_CHARS:
+            raise ValueError(
+                f"知识库检索问题不能超过 {MAX_RAG_QUERY_CHARS} 个字符"
+            )
         with self._storage_lock(bot_id):
             if not self._bot_scope_matches_runtime(bot_id):
                 return []

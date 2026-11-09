@@ -1,12 +1,13 @@
-# Linux 单机多进程验收记录
+# TC Studio Linux 单机多进程验收记录
 
 ## 验收范围
 
-本记录只证明 TIM 在**一台 Linux 主机、一个本地持久化存储边界、多个独立进程**
+本记录只证明 TC Studio 在**一台 Linux 主机、一个本地持久化存储边界、多个独立进程**
 下的生产基础能力。它不证明多主机、多 Pod、OIDC/JWKS、真实腾讯云副作用或 Redis
 故障恢复。
 
-验收日期：2026-11-07。
+文件名保留原有日期；初始记录日期为 2026-11-07，当前工作树最终复验日期为
+2026-11-09。
 
 运行环境：
 
@@ -158,32 +159,40 @@ python -m venv /tmp/tim-pip-lock
 
 ## 当前工作树复验
 
-在当前工作树完成同步任务、协同流水和执行器修复后，使用 Docker Desktop
-`4.98.0`、Docker Engine `29.9.2` 的 Linux/arm64 后端重新执行验收。生产依赖使用
-`requirements.lock`，全量回归使用 `requirements-dev.lock`，测试和故障探针均在
-UID 1000 的非 root 用户下运行。
+在当前工作树完成 SQLite 作用域、BOT 准则并发、路径/SSRF、输入边界、缓存、容器化
+和命名空间兼容修复后，使用 Docker Desktop Linux/arm64 后端重新执行验收。Docker
+镜像实际使用 Python 3.13、Node 22、`uv.lock`、`web/pnpm-lock.yaml`，运行容器以
+UID 10001 非 root 用户启动；独立故障探针又以 UID 1000 的非 root 用户运行。
 
 全量回归结果：
 
 ```text
-283 passed in 54.04s
+332 passed in 63.36s
 ```
 
 部署检查结果：
 
 ```text
-platform: Linux-7.0.14-linuxkit-aarch64-with-glibc2.41
+platform: Linux-7.0.14-linuxkit-aarch64-with-glibc2.36
 journal_mode: wal
 synchronous: 2
 foreign_keys: true
 integrity: ok
 database_mode: 0o600
 parent_mode: 0o700
+free_bytes: 992665387008
+min_free_bytes: 10737418240
+database_filesystem: ext4
+blob_filesystem: ext4
+results_filesystem: ext4
+data_filesystem: ext4
+storage_filesystem: ext4
 same_device: true
 same_device_results: true
 same_device_data: true
 same_device_storage: true
 network_filesystem: false
+filesystem_types_known: true
 passed: true
 ```
 
@@ -214,6 +223,27 @@ cross_process_http_status_visibility: true
 cross_process_http_completion: true
 ```
 
+最终 Docker 镜像与 Compose 验收结果：
+
+```text
+docker build: passed
+uv sync --frozen --no-dev: passed
+pnpm install --frozen-lockfile: passed
+frontend production build: passed
+compose service: healthy
+container user: uid=10001(tcstudio) gid=10001(tcstudio)
+readonly root filesystem: true
+pids limit: 512
+memory limit: 2147483648
+cpu limit: 2.0
+/healthz: 200 {"status":"ok"}
+uv pip check: 56 packages, all compatible
+```
+
+同一最终镜像下，UID 1000、只读根文件系统、可写 `/tmp` 临时文件系统的 SQLite
+强故障探针也全部通过，结果与上面的 SQLite 强故障探针相同。这证明运行期不依赖
+固定的 10001 UID；实际部署仍应使用专用服务账号。
+
 当前代码的 SQLite 备份和恢复结果：
 
 ```text
@@ -230,9 +260,14 @@ restore integrity=ok
 - `UNKNOWN` 只表示外部副作用结果未知，不会自动重试；需要人工核对后重新发起。
 - BOT/RAG 结构化元数据的运行期读写已经 SQLite-first；旧 JSON/JSONL 只作为迁移源
   或缺少 SQLite 行时的兼容回退，新写入不会创建旧结构化文件。
+- RAG 文档使用内部 `document_key`，并以 `document_id + bot_id + issuer + tenant_id +
+  owner_subject` 组成作用域唯一边界；BOT 准则使用独立的 `bot_guidelines` 表。
 - 上传原件、RAG 原文档、技能 Python 源码和大结果正文仍在本地 Blob/文件层；
   SQLite 保存归属、状态、哈希、大小、URI 和索引。
 - 大结果正文仍在本地 JSONL/Blob，SQLite 保存索引、哈希和偏移。
+- 批处理事实和事件可以跨进程共享；AgentRun、审批等待、`/chat` 对话上下文、
+  `/chat/stream` 实时连接状态和 sandbox 运行句柄仍在进程内。多实例部署必须把同一
+  Agent 会话、审批回调和流式连接固定到同一 API 实例。
 - 没有执行真实腾讯云写操作、OIDC/JWKS、真实生产进程管理器、设备级磁盘耗尽、
   nsjail/cgroup 隔离、多主机或多 Pod 验收。
 - OIDC、PostgreSQL、Redis、多 Pod、多主机以及真实外部 API 副作用仍未验收。

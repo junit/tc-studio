@@ -4,11 +4,12 @@
 """
 
 import os
-import json
 from typing import List, Dict, Any, Optional
 
-STORAGE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "storage"))
-DOCS_DIR = os.path.join(STORAGE_DIR, "docs")
+from core.runtime_paths import runtime_docs_dir, runtime_storage_dir
+
+STORAGE_DIR = str(runtime_storage_dir())
+DOCS_DIR = str(runtime_docs_dir())
 
 # 1. 核心高频运维场景预设清单
 BATCH_PRESETS = [
@@ -324,7 +325,7 @@ def get_api_batch_guidance(api_id: str) -> Dict[str, Any]:
     risk_level = rule.get("risk_level", "NORMAL")
     tip = rule.get("tip")
 
-    # 检查 storage/docs/*.json
+    # 读取运行期 docs 缓存；未覆盖时由 doc_syncer 使用随包 fallback。
     try:
         from .registry import registry
         api_obj = registry.get_api(api_id)
@@ -337,11 +338,11 @@ def get_api_batch_guidance(api_id: str) -> Dict[str, Any]:
                 if not tip:
                     tip = "⚠️ 该接口会删除、撤回、禁用或修改云端资源，批量执行前必须核对目标范围并显式确认。"
         if api_obj and api_obj.doc_id:
-            doc_path = os.path.join(DOCS_DIR, f"{api_obj.doc_id}.json")
-            if os.path.exists(doc_path):
-                with open(doc_path, "r", encoding="utf-8") as f:
-                    doc_data = json.load(f)
-                    rate_limit_str = doc_data.get("rate_limit", "")
+            from .doc_syncer import get_doc_by_id
+
+            doc_data = get_doc_by_id(api_obj.doc_id)
+            if doc_data:
+                rate_limit_str = doc_data.get("rate_limit", "")
 
                 if "5次/秒" in rate_limit_str or "5 次/秒" in rate_limit_str:
                     min_delay = max(min_delay, 0.2)

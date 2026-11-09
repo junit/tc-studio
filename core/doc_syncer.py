@@ -17,10 +17,11 @@ import urllib.request
 from typing import Any, Optional
 
 from core.file_storage import atomic_write_json
+from core.runtime_paths import package_docs_dir, runtime_docs_dir
 from core.sync_task_manager import SyncTaskCancelled, SyncTaskManager
 
 # 存储目录
-STORAGE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "storage", "docs"))
+STORAGE_DIR = str(runtime_docs_dir())
 os.makedirs(STORAGE_DIR, mode=0o700, exist_ok=True)
 try:
     os.chmod(STORAGE_DIR, 0o700)
@@ -36,6 +37,19 @@ def get_current_time_str() -> str:
 
 def get_doc_path(doc_id: int) -> str:
     return os.path.join(STORAGE_DIR, f"{doc_id}.json")
+
+
+def get_existing_doc_path(doc_id: int) -> str | None:
+    """Return the first available runtime or package document cache."""
+
+    candidates = (
+        get_doc_path(doc_id),
+        os.path.join(str(package_docs_dir()), f"{doc_id}.json"),
+    )
+    for candidate in candidates:
+        if os.path.exists(candidate):
+            return candidate
+    return None
 
 
 def clean_json_str(raw: str) -> str:
@@ -466,13 +480,18 @@ def save_doc(doc_data: dict) -> str:
 
 
 def get_doc_by_id(doc_id: int) -> Optional[dict]:
-    filepath = get_doc_path(doc_id)
-    if os.path.exists(filepath):
+    candidates = (
+        get_doc_path(doc_id),
+        os.path.join(str(package_docs_dir()), f"{doc_id}.json"),
+    )
+    for filepath in candidates:
+        if not os.path.exists(filepath):
+            continue
         try:
             with open(filepath, "r", encoding="utf-8") as f:
                 return json.load(f)
         except Exception:
-            return None
+            continue
     return None
 
 
@@ -713,7 +732,7 @@ class DocSyncManager:
                         publish()
                         return
 
-                    if not force and os.path.exists(get_doc_path(doc_id)):
+                    if not force and get_existing_doc_path(doc_id):
                         with progress_lock:
                             state["completed"] += 1
                             state["success_count"] += 1
@@ -823,11 +842,12 @@ class DocSyncManager:
 
         for item in apis_list:
             doc_id = item.get("doc_id")
-            if doc_id and os.path.exists(get_doc_path(doc_id)):
+            existing_path = get_existing_doc_path(doc_id) if doc_id else None
+            if existing_path:
                 synced_count += 1
                 try:
                     mtime = datetime.fromtimestamp(
-                        os.path.getmtime(get_doc_path(doc_id)),
+                        os.path.getmtime(existing_path),
                         tz=BEIJING_TZ,
                     )
                     mtime_str = mtime.strftime("%Y-%m-%d %H:%M:%S")

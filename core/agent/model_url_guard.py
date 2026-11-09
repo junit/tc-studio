@@ -11,6 +11,8 @@ import os
 import socket
 from urllib.parse import urlparse, urlunparse
 
+from core.namespace import get_env
+
 LOCAL_MODEL_ALLOWED_PORTS = {11434, 8080}
 LOCAL_MODEL_HOSTS = {"localhost", "127.0.0.1", "::1"}
 PRIVATE_MODEL_HOSTS_ENV = "ALLOW_PRIVATE_MODEL_HOSTS"
@@ -47,7 +49,7 @@ def _configured_private_model_hosts() -> tuple[set[str], tuple[ipaddress._BaseNe
     """
     hosts: set[str] = set()
     networks: list[ipaddress._BaseNetwork] = []
-    raw_hosts = os.environ.get(PRIVATE_MODEL_HOSTS_ENV, "")
+    raw_hosts = get_env(PRIVATE_MODEL_HOSTS_ENV, default="") or ""
     for raw_host in raw_hosts.split(","):
         host = raw_host.strip().lower().rstrip(".")
         if not host:
@@ -124,7 +126,7 @@ def _is_trusted_official_model_host(host: str, addresses: set[ipaddress._BaseAdd
 
 def _local_model_allowed_ports() -> set[int]:
     """读取显式配置的本地模型端口白名单，默认不放宽。"""
-    raw_ports = os.environ.get("LOCAL_MODEL_ALLOWED_PORTS", "")
+    raw_ports = get_env("LOCAL_MODEL_ALLOWED_PORTS", default="") or ""
     if not raw_ports.strip():
         return set(LOCAL_MODEL_ALLOWED_PORTS)
     ports: set[int] = set()
@@ -162,7 +164,7 @@ def validate_model_base_url(base_url: str) -> str:
         if port not in _local_model_allowed_ports():
             allowed_ports = ", ".join(str(item) for item in sorted(_local_model_allowed_ports()))
             raise UnsafeModelUrlError(
-                f"本地模型端口不在允许列表，仅支持：{allowed_ports}；可通过 LOCAL_MODEL_ALLOWED_PORTS 配置"
+                f"本地模型端口不在允许列表，仅支持：{allowed_ports}；可通过 TC_STUDIO_LOCAL_MODEL_ALLOWED_PORTS 配置（旧 LOCAL_MODEL_ALLOWED_PORTS 仍兼容）"
             )
         return base_url.rstrip("/")
 

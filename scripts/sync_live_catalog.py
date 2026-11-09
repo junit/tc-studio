@@ -2,7 +2,7 @@
 """
 腾讯云直播 (CSS) 官方全量 API 目录与参数定义动态拉取脚本
 从官方文档产品 267 (云直播) 的 API 概览 (doc 20456) 提取全量 260+ 接口元数据，
-并并发抓取各接口参数定义生成 core/live_full_catalog.json
+并发抓取各接口参数定义并写入运行期 live catalog 覆盖文件
 """
 
 import gzip
@@ -16,10 +16,10 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
 from core.file_storage import atomic_write_json
+from core.runtime_paths import runtime_catalog_path, runtime_storage_dir
 
-BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-OUTPUT_PATH = os.path.join(BASE_DIR, "core", "live_full_catalog.json")
-CACHE_DIR = os.path.join(BASE_DIR, "storage", "docs_cache", "live")
+OUTPUT_PATH = str(runtime_catalog_path("live"))
+CACHE_DIR = str(runtime_storage_dir() / "docs_cache" / "live")
 os.makedirs(CACHE_DIR, mode=0o700, exist_ok=True)
 try:
     os.chmod(CACHE_DIR, 0o700)
@@ -185,6 +185,9 @@ def sync_all_live_apis():
                     "doc_url": doc_url,
                     "qps": qps_str
                 })
+
+    if not raw_api_list:
+        raise RuntimeError("官方云直播目录未解析出任何接口，拒绝覆盖现有 catalog")
 
     print(f"共发现 {len(raw_api_list)} 个官方云直播 API，开始并发拉取接口参数与描述详情...")
 

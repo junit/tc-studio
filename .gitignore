@@ -41,6 +41,10 @@ data/*
 # Local runtime storage & execution ledger
 storage/history.json
 storage/docs_cache/
+storage/catalogs/
+storage/official_live_tree.json
+storage/*_common_specs.json
+storage/*_data_types.json
 storage/tim.sqlite3*
 storage/tc_studio.sqlite3*
 storage/batch_idempotency.sqlite3*

@@ -17,11 +17,17 @@ from typing import Dict, List, Optional, Tuple
 
 from core.file_storage import atomic_write_json
 from core.registry import registry
+from core.runtime_paths import (
+    package_catalog_path,
+    runtime_catalog_path,
+    runtime_storage_dir,
+)
 
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-CATALOG_PATH = os.path.join(BASE_DIR, "core", "tim_full_catalog.json")
-STORAGE_DIR = os.path.join(BASE_DIR, "storage")
-os.makedirs(STORAGE_DIR, exist_ok=True)
+CATALOG_PATH = str(runtime_catalog_path("im"))
+STATIC_CATALOG_PATH = str(package_catalog_path("im"))
+STORAGE_DIR = str(runtime_storage_dir())
+os.makedirs(STORAGE_DIR, mode=0o700, exist_ok=True)
 
 BEIJING_TZ = timezone(timedelta(hours=8))
 
@@ -139,10 +145,6 @@ def fetch_official_hydration_tree() -> Tuple[dict, List[dict]]:
     if not rest_api:
         raise ValueError("服务端 API 中未找到 'REST API' (id: 1518)")
 
-    # 保存一份原生活动目录树快照到 storage/official_live_tree.json
-    snapshot_path = os.path.join(STORAGE_DIR, "official_live_tree.json")
-    atomic_write_json(snapshot_path, rest_api, mode=0o600)
-
     # 递归提取页面列表及完整路径
     pages: List[dict] = []
 
@@ -169,7 +171,43 @@ def fetch_official_hydration_tree() -> Tuple[dict, List[dict]]:
     for item in rest_api.get("children", []):
         traverse(item, [])
 
+    _save_tree_snapshot_if_usable(rest_api, pages)
+
     return rest_api, pages
+
+
+def _save_tree_snapshot_if_usable(tree: dict, pages: List[dict]) -> None:
+    """Publish only a non-empty official tree snapshot."""
+
+    # 空页面结果可能来自官方页面结构变化或解析退化；不要覆盖共享目录中
+    # 上一次可用的快照，否则其他进程会立刻看到一棵空树。
+    if not pages:
+        return
+    snapshot_path = os.path.join(STORAGE_DIR, "official_live_tree.json")
+    atomic_write_json(snapshot_path, tree, mode=0o600)
+
+
+def _load_existing_catalog() -> list[dict]:
+    """Load a usable runtime catalog, falling back to the package copy."""
+
+    seen: set[str] = set()
+    for candidate in (CATALOG_PATH, STATIC_CATALOG_PATH):
+        if candidate in seen or not os.path.exists(candidate):
+            continue
+        seen.add(candidate)
+        try:
+            with open(candidate, "r", encoding="utf-8") as stream:
+                loaded = json.load(stream)
+            if (
+                isinstance(loaded, list)
+                and loaded
+                and all(isinstance(item, dict) for item in loaded)
+            ):
+                return loaded
+            print(f"[WARN] Ignoring unusable catalog {candidate}")
+        except (OSError, ValueError) as exc:
+            print(f"[WARN] Failed to load catalog {candidate}: {exc}")
+    return []
 
 
 def sync_catalog_from_live_tree() -> dict:
@@ -178,15 +216,14 @@ def sync_catalog_from_live_tree() -> dict:
     1. 动态抓取官方实时目录树；
     2. 对比本地现有目录，更新分类层级与接口名称；
     3. 若发现全新接口，通过 getDocPageDetail 抓取其路由及基础参数；
-    4. 持久化写回 core/tim_full_catalog.json 并热重载 ApiRegistry。
+    4. 持久化写回运行期 catalog 覆盖文件并热重载 ApiRegistry。
     """
     raw_tree, live_pages = fetch_official_hydration_tree()
+    if not live_pages:
+        raise RuntimeError("官方目录树未返回任何接口，拒绝覆盖现有 catalog")
 
-    # 读取本地现存 catalog
-    existing_catalog = []
-    if os.path.exists(CATALOG_PATH):
-        with open(CATALOG_PATH, "r", encoding="utf-8") as f:
-            existing_catalog = json.load(f)
+    # 读取运行期覆盖；损坏或空覆盖自动回退到随包静态 catalog。
+    existing_catalog = _load_existing_catalog()
 
     catalog_by_doc_id: Dict[int, dict] = {
         item.get("doc_id"): item for item in existing_catalog if item.get("doc_id")

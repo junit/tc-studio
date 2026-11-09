@@ -21,13 +21,36 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from core.doc_syncer import parse_official_doc, save_doc, get_doc_by_id
+from core.runtime_paths import catalog_read_path, package_catalog_path
 from core.tree_syncer import fetch_doc_detail_api
 
 
+def _load_live_catalog() -> list[dict]:
+    """Load a usable runtime catalog, falling back to the package copy."""
+
+    candidates = (catalog_read_path("live"), package_catalog_path("live"))
+    seen: set[str] = set()
+    for candidate in candidates:
+        if candidate in seen or not os.path.exists(candidate):
+            continue
+        seen.add(candidate)
+        try:
+            with open(candidate, "r", encoding="utf-8") as stream:
+                loaded = json.load(stream)
+            if (
+                isinstance(loaded, list)
+                and loaded
+                and all(isinstance(item, dict) for item in loaded)
+            ):
+                return loaded
+            print(f"[WARN] 忽略损坏或空的云直播 catalog: {candidate}")
+        except (OSError, ValueError) as exc:
+            print(f"[WARN] 读取云直播 catalog 失败 {candidate}: {exc}")
+    raise RuntimeError("没有可用的云直播 catalog，请先完成目录同步或检查发布包")
+
+
 def run_audit_and_sync():
-    catalog_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "core", "live_full_catalog.json"))
-    with open(catalog_path, "r", encoding="utf-8") as f:
-        live_apis = json.load(f)
+    live_apis = _load_live_catalog()
 
     total = len(live_apis)
     print(f"============================================================")

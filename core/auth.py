@@ -15,6 +15,7 @@ from fastapi import Depends, HTTPException, Request
 from jwt.algorithms import RSAAlgorithm
 from starlette.responses import JSONResponse
 
+from core.namespace import get_env
 from core.runtime_context import (
     AuthScope,
     runtime_auth_scope,
@@ -85,23 +86,28 @@ class CurrentUser:
 class AuthSettings:
     def __init__(self) -> None:
         # A missing deployment environment must fail closed.  Local callers
-        # should opt in explicitly with APP_ENV=development (and tests do so
-        # in tests/conftest.py); silently treating an unset value as a local
+        # should opt in explicitly with TC_STUDIO_APP_ENV=development (and
+        # tests do so in tests/conftest.py); silently treating an unset value as a local
         # administrator is unsafe for container and process managers.
-        raw_environment = os.getenv("APP_ENV")
+        raw_environment = get_env("APP_ENV")
         self.environment = (raw_environment or "").strip().lower()
         self.app_env_configured = bool(raw_environment and raw_environment.strip())
-        self.allow_insecure_local = os.getenv("ALLOW_INSECURE_LOCAL_AUTH", "false").lower() in {"1", "true", "yes", "on"}
-        raw_enabled = os.getenv("AUTH_ENABLED")
+        self.allow_insecure_local = (get_env("ALLOW_INSECURE_LOCAL_AUTH", default="false") or "").lower() in {"1", "true", "yes", "on"}
+        raw_enabled = get_env("AUTH_ENABLED")
         self.auth_enabled_configured = bool(raw_enabled and raw_enabled.strip())
         self.enabled = (raw_enabled or "false").lower() in {"1", "true", "yes", "on"}
-        self.provider = os.getenv("AUTH_PROVIDER", "oidc").lower()
+        self.provider = (get_env("AUTH_PROVIDER", default="oidc") or "oidc").lower()
         self.issuer = os.getenv("OIDC_ISSUER_URL", "").rstrip("/")
         self.client_id = os.getenv("OIDC_CLIENT_ID", "").strip()
         self.audience = os.getenv("OIDC_AUDIENCE", "").strip() or self.client_id
         self.jwks_url = os.getenv("OIDC_JWKS_URL", "").strip()
-        self.required_role = os.getenv("AUTH_REQUIRED_ROLE", "").strip()
-        self.jwks_ttl = max(30, int(os.getenv("OIDC_JWKS_TTL_SECONDS", "300")))
+        self.required_role = get_env("AUTH_REQUIRED_ROLE", default="") or ""
+        self.required_role = self.required_role.strip()
+        raw_jwks_ttl = get_env("OIDC_JWKS_TTL_SECONDS", default="300") or "300"
+        try:
+            self.jwks_ttl = max(30, int(raw_jwks_ttl))
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("OIDC_JWKS_TTL_SECONDS 必须是整数") from exc
 
 
 # 仅这些环境允许在未启用认证时回落到本地管理员模式；其余环境一律 fail-closed。
@@ -290,11 +296,11 @@ def authenticate_request(request: Request) -> CurrentUser:
     if not settings.app_env_configured or not settings.auth_enabled_configured:
         raise HTTPException(
             status_code=503,
-            detail="必须显式配置 APP_ENV 与 AUTH_ENABLED；本地开发请设置 APP_ENV=development、AUTH_ENABLED=false",
+            detail="必须显式配置 TC_STUDIO_APP_ENV 与 TC_STUDIO_AUTH_ENABLED；旧 APP_ENV/AUTH_ENABLED 仍兼容；本地开发请设置 TC_STUDIO_APP_ENV=development、TC_STUDIO_AUTH_ENABLED=false",
         )
     if not settings.enabled:
         if settings.environment not in LOCAL_DEVELOPMENT_ENVIRONMENTS and not settings.allow_insecure_local:
-            raise HTTPException(status_code=503, detail="非本地开发环境必须启用认证（AUTH_ENABLED=true），或明确设置 ALLOW_INSECURE_LOCAL_AUTH=true")
+            raise HTTPException(status_code=503, detail="非本地开发环境必须启用认证（TC_STUDIO_AUTH_ENABLED=true），或明确设置 TC_STUDIO_ALLOW_INSECURE_LOCAL_AUTH=true")
         return CurrentUser(subject="local", roles=frozenset({"admin", "operator"}), claims={"mode": "disabled"})
     if settings.provider != "oidc":
         raise HTTPException(status_code=503, detail="未支持的认证提供商")

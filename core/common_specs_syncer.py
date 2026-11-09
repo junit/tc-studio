@@ -22,20 +22,70 @@ from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional, Any
 
 from core.file_storage import atomic_write_json
+from core.runtime_paths import (
+    package_data_types_path,
+    package_specs_path,
+    runtime_data_types_path,
+    runtime_docs_dir,
+    runtime_specs_path,
+)
 from core.tree_syncer import fetch_doc_detail_api
 
-BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-STORAGE_DIR = os.path.join(BASE_DIR, "storage", "docs")
-SPECS_CACHE_PATH = os.path.join(BASE_DIR, "core", "live_common_specs.json")
-DATA_TYPES_PATH = os.path.join(BASE_DIR, "core", "live_data_types.json")
+STORAGE_DIR = str(runtime_docs_dir())
+SPECS_CACHE_PATH = str(runtime_specs_path("live"))
+DATA_TYPES_PATH = str(runtime_data_types_path("live"))
 BEIJING_TZ = timezone(timedelta(hours=8))
 
 
 def _specs_cache_path(service: str) -> str:
-    safe_service = re.sub(r"[^a-zA-Z0-9_-]", "_", str(service or "live").lower())
-    if safe_service == "live":
+    if str(service or "live").lower() == "live":
         return SPECS_CACHE_PATH
-    return os.path.join(BASE_DIR, "core", f"{safe_service}_common_specs.json")
+    return str(runtime_specs_path(service))
+
+
+def _cache_signature_for_path(path: str) -> tuple[int, int] | None:
+    try:
+        stat = os.stat(path)
+        return stat.st_mtime_ns, stat.st_size
+    except OSError:
+        return None
+
+
+def _load_cached_specs(service: str) -> dict | None:
+    """Load a valid runtime cache or fall back to the package snapshot."""
+
+    candidates = (
+        _specs_cache_path(service),
+        str(package_specs_path(service)),
+    )
+    seen: set[str] = set()
+    for candidate in candidates:
+        if candidate in seen or not os.path.exists(candidate):
+            continue
+        seen.add(candidate)
+        try:
+            with open(candidate, "r", encoding="utf-8") as stream:
+                loaded = json.load(stream)
+            if isinstance(loaded, dict):
+                return loaded
+            print(f"[WARN] Ignoring invalid common specs cache {candidate}: root is not an object")
+        except (OSError, ValueError) as exc:
+            print(f"[WARN] Failed to load common specs cache {candidate}: {exc}")
+    return None
+
+
+def _data_types_read_path() -> str:
+    for candidate in (DATA_TYPES_PATH, str(package_data_types_path("live"))):
+        if not os.path.exists(candidate):
+            continue
+        try:
+            with open(candidate, "r", encoding="utf-8") as stream:
+                loaded = json.load(stream)
+            if isinstance(loaded, dict):
+                return candidate
+        except (OSError, ValueError):
+            continue
+    return DATA_TYPES_PATH
 
 COMMON_DOC_CONFIGS = [
     {"id": 20458, "title": "请求结构", "category": "invocation", "key": "request_structure", "url": "https://cloud.tencent.com/document/api/267/20458"},
@@ -85,7 +135,7 @@ def _strip_html(raw: str) -> str:
 
 
 def _save_raw_doc(doc_id: int, detail: dict, title: str, doc_url: str):
-    """将获取的原始文档规范保存为 storage/docs/<doc_id>.json 统一格式"""
+    """将获取的原始文档规范保存到运行期 docs 缓存。"""
     os.makedirs(STORAGE_DIR, exist_ok=True)
     filepath = os.path.join(STORAGE_DIR, f"{doc_id}.json")
     record = {
@@ -306,9 +356,10 @@ def parse_data_structures_20474(body: str, title: str) -> dict:
             structs[raw_name] = fields
 
     # 如果存在本地已缓存的 live_data_types.json 且当前解析数量少，融合增强
-    if os.path.exists(DATA_TYPES_PATH):
+    cached_data_types_path = _data_types_read_path()
+    if os.path.exists(cached_data_types_path):
         try:
-            with open(DATA_TYPES_PATH, "r", encoding="utf-8") as f:
+            with open(cached_data_types_path, "r", encoding="utf-8") as f:
                 cached = json.load(f)
                 for k, v in cached.items():
                     if k not in structs:
@@ -418,25 +469,32 @@ class CommonSpecsManager:
         # separate single-flight lock for concurrent explicit sync requests.
         self._sync_lock = threading.Lock()
         self._specs_cache: dict[str, dict] = {}
+        self._specs_cache_signature: dict[str, tuple[int, int] | None] = {}
 
     def get_specs(self, service: str = "live", force_reload: bool = False) -> dict:
         """获取结构化公共规范；不在持锁状态下进入同步 I/O。"""
         cache_path = _specs_cache_path(service)
+        try:
+            stat = os.stat(cache_path)
+            cache_signature: tuple[int, int] | None = (stat.st_mtime_ns, stat.st_size)
+        except OSError:
+            cache_signature = None
         with self._lock:
-            if not force_reload and service in self._specs_cache:
+            if (
+                not force_reload
+                and service in self._specs_cache
+                and self._specs_cache_signature.get(service) == cache_signature
+            ):
                 return self._specs_cache[service]
 
-            if not force_reload and os.path.exists(cache_path):
-                try:
-                    with open(cache_path, "r", encoding="utf-8") as f:
-                        loaded = json.load(f)
-                    if isinstance(loaded, dict):
-                        loaded_service = str(loaded.get("service") or "live")
-                        self._specs_cache[loaded_service] = loaded
-                        if loaded_service == service:
-                            return loaded
-                except Exception as e:
-                    print(f"[WARN] Failed to load {cache_path}: {e}")
+            if not force_reload:
+                loaded = _load_cached_specs(service)
+                if loaded is not None:
+                    loaded_service = str(loaded.get("service") or "live")
+                    self._specs_cache[loaded_service] = loaded
+                    self._specs_cache_signature[loaded_service] = cache_signature
+                    if loaded_service == service:
+                        return loaded
 
         # sync_all acquires the lock itself; never call it from the lock above.
         return self.sync_all(service=service)
@@ -445,6 +503,8 @@ class CommonSpecsManager:
         """全量同步 9 篇公共规范文档并结构化存储"""
         with self._sync_lock:
             print(f"[INFO] Starting Tencent Cloud API 3.0 Common Specs Sync for service={service}...")
+            cache_path = _specs_cache_path(service)
+            previous_specs = _load_cached_specs(service)
             specs: Dict[str, Any] = {
                 "service": service,
                 "service_name": "云直播 (CSS)" if service == "live" else f"腾讯云 {service.upper()}",
@@ -455,6 +515,12 @@ class CommonSpecsManager:
                 "errors": {},
                 "mappings": {},
             }
+            if isinstance(previous_specs, dict):
+                for category in ("invocation", "structs", "errors", "mappings"):
+                    previous_value = previous_specs.get(category)
+                    if isinstance(previous_value, dict):
+                        specs[category] = previous_value
+            synced_doc_count = 0
 
             for cfg in COMMON_DOC_CONFIGS:
                 doc_id = cfg["id"]
@@ -468,8 +534,9 @@ class CommonSpecsManager:
                     if not detail:
                         print(f"[WARN] Failed to fetch doc detail for {doc_id} ({title})")
                         continue
+                    synced_doc_count += 1
 
-                    # 保存原始格式至 storage/docs/<doc_id>.json
+                    # 保存原始格式至运行期 docs 缓存
                     _save_raw_doc(doc_id, detail, title, url)
                     body = detail.get("body", "")
 
@@ -488,7 +555,7 @@ class CommonSpecsManager:
                     elif doc_id == 20474:
                         parsed_structs = parse_data_structures_20474(body, title)
                         specs["structs"] = parsed_structs
-                        # 同时也确保 live_data_types.json 得到持久化更新
+                        # 同时也确保运行期 data types 缓存得到持久化更新
                         if parsed_structs.get("structs"):
                             atomic_write_json(
                                 DATA_TYPES_PATH,
@@ -504,12 +571,26 @@ class CommonSpecsManager:
                 except Exception as e:
                     print(f"[ERROR] Failed syncing common doc {doc_id} ({title}): {e}")
 
-            # 保存解析后结构化数据至 live_common_specs.json
-            cache_path = _specs_cache_path(service)
+            if synced_doc_count == 0:
+                if isinstance(previous_specs, dict):
+                    print(
+                        "[WARN] Common specs sync returned no usable documents; "
+                        "keeping the last known-good cache"
+                    )
+                    with self._lock:
+                        self._specs_cache[service] = previous_specs
+                        self._specs_cache_signature[service] = _cache_signature_for_path(
+                            cache_path
+                        )
+                    return previous_specs
+                raise RuntimeError("公共规范同步未获取到任何有效文档，拒绝发布空缓存")
+
+            # 保存解析后结构化数据至运行期 common specs 缓存
             atomic_write_json(cache_path, specs, mode=0o644)
 
             with self._lock:
                 self._specs_cache[service] = specs
+                self._specs_cache_signature[service] = _cache_signature_for_path(cache_path)
             print(f"[SUCCESS] Tencent Cloud API 3.0 Common Specs successfully synced to {cache_path}!")
             return specs
 

@@ -166,10 +166,10 @@ TC Studio 的智能体并非传统打字聊天的对话机器人，而是**以�
 │   ├── live_util.py                  # 云直播推拉流防盗链鉴权计算工具
 │   ├── common_specs_syncer.py        # API 3.0 公共规范与官方错误码同步器
 │   ├── registry.py                   # 动态 API 注册中心与服务摘要汇总 (SSoT)
-│   ├── tim_full_catalog.json         # 官方 IM 166 项全量接口元数据库
-│   ├── live_full_catalog.json        # 官方云直播 261 项 API 3.0 元数据库
-│   ├── live_data_types.json          # 云直播复杂数据结构体字典
-│   ├── live_common_specs.json        # 云直播与 API 3.0 官方错误码/地域公共规范
+│   ├── tim_full_catalog.json         # 官方 IM 166 项全量接口元数据（只读发布 fallback）
+│   ├── live_full_catalog.json        # 官方云直播 261 项 API 3.0 元数据（只读发布 fallback）
+│   ├── live_data_types.json          # 云直播复杂数据结构体字典（只读发布 fallback）
+│   ├── live_common_specs.json        # 官方错误码/地域公共规范（只读发布 fallback）
 │   ├── config.py                     # 多环境配置管理、密钥脱敏与存储
 │   ├── sig_util.py                   # 腾讯云 TLSSigAPIv2 (UserSig) 算法与高速内存缓存
 │   ├── tim_client.py                 # 通用 IM HTTP 调用客户端
@@ -202,6 +202,10 @@ TC Studio 的智能体并非传统打字聊天的对话机器人，而是**以�
 │   ├── tim.sqlite3                   # 旧版主库（仅兼容发现，不与新库合并）
 │   ├── batch_results/                 # 大型批处理结果正文（JSONL/Blob）
 │   ├── docs/                         # 官方全量 427+ API 离线结构化文档库 (JSON)
+│   ├── catalogs/                     # 运行期目录覆盖（同步任务写入，发布包目录保持只读）
+│   ├── docs_cache/                   # 官方详情抓取缓存
+│   ├── live_common_specs.json        # 运行期公共规范覆盖
+│   ├── live_data_types.json          # 运行期结构体字典覆盖
 │   └── official_live_tree.json       # 官方在线同步目录树缓存
 ├── tests/                            # 自动化单元测试套件 (pytest)
 │   ├── test_studio.py                # 基础功能与接口工作台测试
@@ -300,7 +304,7 @@ cp config.example.json config.json
 
 ```bash
 # 本地开发（直接运行 app.py 时也会使用这两个安全的本地默认值）
-APP_ENV=development AUTH_ENABLED=false python3 app.py
+TC_STUDIO_APP_ENV=development TC_STUDIO_AUTH_ENABLED=false python3 app.py
 ```
 
 服务启动后，在浏览器中打开：
@@ -323,9 +327,9 @@ APP_ENV=development AUTH_ENABLED=false python3 app.py
 - **通义千问 / OpenAI / vLLM / 兼容服务**：
   - 填入对应 Base URL、API Key 与 Model Name 即可，支持点击动态探测下拉列表一键匹配。
 
-企业局域网中的 Ollama、vLLM 或 OpenAI 兼容模型默认仍会被出站 SSRF 守卫拦截。部署方明确批准后，可用逗号分隔的精确主机名、IP 或 CIDR 配置 `ALLOW_PRIVATE_MODEL_HOSTS`，例如 `ALLOW_PRIVATE_MODEL_HOSTS=10.20.0.15,gpu.internal,192.168.20.0/24`；域名解析到的所有地址都必须是私有地址，通配符和 `host:port` 不受支持。Ollama 以外的端口可另用 `LOCAL_MODEL_ALLOWED_PORTS` 配置。
+企业局域网中的 Ollama、vLLM 或 OpenAI 兼容模型默认仍会被出站 SSRF 守卫拦截。部署方明确批准后，可用逗号分隔的精确主机名、IP 或 CIDR 配置 `TC_STUDIO_ALLOW_PRIVATE_MODEL_HOSTS`，例如 `TC_STUDIO_ALLOW_PRIVATE_MODEL_HOSTS=10.20.0.15,gpu.internal,192.168.20.0/24`；域名解析到的所有地址都必须是私有地址，通配符和 `host:port` 不受支持。Ollama 以外的端口可另用 `TC_STUDIO_LOCAL_MODEL_ALLOWED_PORTS` 配置。旧的无前缀变量仍兼容读取。
 
-> 💡 **代理/TUN 模式免配置支持 (Out-of-the-Box)**：若本地开启了 Clash / Surge / Shadowrocket 等代理客户端的 TUN 增强模式（Fake-IP），公网域名可能会被操作系统映射为 `198.18.0.0/15` 保留网段。系统已内置主流官方大模型域名（DeepSeek、通义千问、OpenAI、Anthropic、Moonshot、Zhipu、SiliconFlow 等）在 Fake-IP 下的自动信任与放行，**无需配置任何环境变量，开箱即用**。`ALLOW_PRIVATE_MODEL_HOSTS` 仅用于企业局域网内的自建内网服务器。
+> 💡 **代理/TUN 模式免配置支持 (Out-of-the-Box)**：若本地开启了 Clash / Surge / Shadowrocket 等代理客户端的 TUN 增强模式（Fake-IP），公网域名可能会被操作系统映射为 `198.18.0.0/15` 保留网段。系统已内置主流官方大模型域名（DeepSeek、通义千问、OpenAI、Anthropic、Moonshot、Zhipu、SiliconFlow 等）在 Fake-IP 下的自动信任与放行，**无需配置任何环境变量，开箱即用**。`TC_STUDIO_ALLOW_PRIVATE_MODEL_HOSTS` 仅用于企业局域网内的自建内网服务器。
 
 ---
 
@@ -334,8 +338,10 @@ APP_ENV=development AUTH_ENABLED=false python3 app.py
 TC Studio 底层采用微内核即插即用架构。如果您需要接入腾讯云其它业务（如 TRTC 实时音视频、VOD 云点播、COS 等）：
 
 1. 请查阅官方集成指南：👉 **[`docs/TENCENTCLOUD_API3_INTEGRATION_GUIDE.md`](docs/TENCENTCLOUD_API3_INTEGRATION_GUIDE.md)**；
-2. 运行抓取脚本生成 `core/{service}_full_catalog.json`；
-3. 系统将自动完成注册发现，工作台、API 树、文档中心以及智能体提示词与工具全部自动生效，15 分钟即可完成新业务上线！
+2. 发布包构建阶段可生成 `core/{service}_full_catalog.json`；线上同步任务将覆盖写入
+   `${TC_STUDIO_STORAGE_DIR}/catalogs/{service}_full_catalog.json`，不会修改只读代码目录；
+3. 系统会优先读取运行期覆盖，找不到时回退到发布包 catalog。其他进程会在下次访问
+   注册中心时检测文件版本变化并自动 reload，工作台、API 树、文档中心以及智能体提示词与工具保持一致。
 
 ---
 
@@ -365,19 +371,19 @@ pytest
 
 ## 🔐 可插拔企业级认证（本地开发 / OIDC / Keycloak / Authentik）
 
-系统提供可插拔鉴权机制，并对缺失配置 fail-closed。必须显式设置 `APP_ENV` 与 `AUTH_ENABLED`；本地开发可设置 `APP_ENV=development`、`AUTH_ENABLED=false`，生产环境必须设置 `APP_ENV=production`、`AUTH_ENABLED=true` 以及完整 OIDC 配置。任何未配置环境变量或非本地环境关闭认证的请求都会被拒绝。
+系统提供可插拔鉴权机制，并对缺失配置 fail-closed。必须显式设置 `TC_STUDIO_APP_ENV` 与 `TC_STUDIO_AUTH_ENABLED`；本地开发可设置 `TC_STUDIO_APP_ENV=development`、`TC_STUDIO_AUTH_ENABLED=false`，生产环境必须设置 `TC_STUDIO_APP_ENV=production`、`TC_STUDIO_AUTH_ENABLED=true` 以及完整 OIDC 配置。旧的 `APP_ENV`、`AUTH_ENABLED` 和 `ALLOW_INSECURE_LOCAL_AUTH` 仍兼容读取，任何未配置环境变量或非本地环境关闭认证的请求都会被拒绝。
 
 ### 1. 环境变量配置指南
 
 ```bash
 # 本地开发（必须显式声明，不会再从缺失变量推断本地管理员模式）
-export APP_ENV=development
-export AUTH_ENABLED=false
+export TC_STUDIO_APP_ENV=development
+export TC_STUDIO_AUTH_ENABLED=false
 
 # 启用 OIDC 认证
-export APP_ENV=production
-export AUTH_ENABLED=true
-export AUTH_PROVIDER=oidc
+export TC_STUDIO_APP_ENV=production
+export TC_STUDIO_AUTH_ENABLED=true
+export TC_STUDIO_AUTH_PROVIDER=oidc
 export OIDC_ISSUER_URL=https://sso.example.com/realms/ops
 # aud/client_id 是身份系统的外部契约，只有身份系统同步变更后才能改名
 export OIDC_AUDIENCE=tim-studio
@@ -385,6 +391,7 @@ export OIDC_CLIENT_ID=tim-studio
 
 # 可选：自定义 JWKS 公钥验签端点（默认自动取 Keycloak 标准端点）
 export OIDC_JWKS_URL=https://sso.example.com/realms/ops/protocol/openid-connect/certs
+# 旧 AUTH_PROVIDER / TIM_AUTH_PROVIDER 仍兼容读取；OIDC_* 名称保持外部身份系统契约
 
 # 启动服务
 python3 app.py
@@ -397,7 +404,7 @@ python3 app.py
 Linux 生产、预发布环境必须使用 `nsjail`，并由部署提供最小 rootfs 与 seccomp-bpf（Kafel）策略文件：
 
 ```bash
-export APP_ENV=production
+export TC_STUDIO_APP_ENV=production
 export TC_STUDIO_CODE_EXECUTOR_MODE=nsjail
 export TC_STUDIO_NSJAIL_BIN=/usr/local/bin/nsjail
 export TC_STUDIO_NSJAIL_ROOT=/opt/tc-studio/nsjail-rootfs
@@ -418,12 +425,13 @@ macOS/Windows 生产环境没有本项目支持的 nsjail 部署契约。此时�
 | :--- | :--- | :--- |
 | **`admin` / `administrator`** (系统管理员) | • 系统与 LLM 大模型配置<br>• 多环境凭证增删改与测试<br>• 转移私有 Bot 归属<br>• 查看/复制完整未脱敏签名凭据<br>• 查看并清空所有人的批处理台账 | 具备最高控制权限，向剪贴板写入未脱敏签名时系统自动弹出安全操作警示。 |
 | **`operator` / `editor`** (业务运维/开发) | • 接口单次调用与预览（Dry-Run）<br>• 发起/管理自己的批处理任务<br>• 使用 AI 智能体并持久化独立会话记忆<br>• 执行已授权的 Agent 运维技能 | **凭据自动脱敏保护**：cURL 脚本与响应中的有效签名（UserSig/TC3）由服务端自动抹除（`<redacted>`），从源头阻断权限越界与外泄。 |
-| **未授权 / 匿名访问** | • 仅限静态资产及文档中心浏览 | 在 `AUTH_ENABLED=true` 时，所有 `/api/` 路由严格返回 HTTP 401。 |
+| **未授权 / 匿名访问** | • 仅限静态资产及文档中心浏览 | 在 `TC_STUDIO_AUTH_ENABLED=true` 时，所有 `/api/` 路由严格返回 HTTP 401。 |
 
 ### 4. 生产部署与单点登录（SSO）接入推荐
 
 TC Studio 前端为纯静态轻量单页应用（SPA），支持在请求头中自动携带 `Authorization: Bearer <token>`：
-* **Token 注入**：前端加载时会自动读取 `sessionStorage.getItem('tim_access_token')` 并附加到所有同源 `/api/` 请求中；
+* **Token 注入**：前端加载时会自动读取 `sessionStorage` 中的 `tc_studio_access_token`；
+  升级期间也会兼容读取旧的 `tim_access_token`，并附加到所有同源 `/api/` 请求中；
 * **生产推荐架构**：TC Studio 本身不内置 OAuth 授权码重定向页面。生产环境推荐前置部署 **[oauth2-proxy](https://oauth2-proxy.github.io/oauth2-proxy/)**、API 网关（如 APISIX/Traefik）或企业反向代理：
   ```text
   [ 浏览器客户端 ] 

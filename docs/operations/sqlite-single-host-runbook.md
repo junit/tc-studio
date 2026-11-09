@@ -30,8 +30,8 @@
 启动前设置：
 
 ```bash
-export APP_ENV=production
-export AUTH_ENABLED=true
+export TC_STUDIO_APP_ENV=production
+export TC_STUDIO_AUTH_ENABLED=true
 export TC_STUDIO_DATABASE_URL=sqlite:////var/lib/tc-studio/tc_studio.sqlite3
 export TC_STUDIO_CONFIG_PATH=/var/lib/tc-studio/config.json
 export TC_STUDIO_DATA_DIR=/var/lib/tc-studio/data
@@ -62,7 +62,9 @@ export TC_STUDIO_HISTORY_PATH=/var/lib/tc-studio/storage/history.json
 原始文件、RAG 原文档、技能源码以及批处理结果也必须落在同一个本机持久化卷上；
 不能让不同进程各自使用容器内默认的 `data/` 目录。
 
-`AUTH_ENABLED=false` 只允许显式的本地开发环境使用。生产和预发布环境缺少 `APP_ENV` 或 `AUTH_ENABLED` 时应保持 fail-closed。
+`TC_STUDIO_AUTH_ENABLED=false` 只允许显式的本地开发环境使用。生产和预发布环境缺少
+`TC_STUDIO_APP_ENV` 或 `TC_STUDIO_AUTH_ENABLED` 时应保持 fail-closed；旧的
+`APP_ENV`、`AUTH_ENABLED` 和 `ALLOW_INSECURE_LOCAL_AUTH` 仍兼容读取。
 
 ## Linux 多实例启动方式
 
@@ -101,8 +103,8 @@ fi
 环境文件至少应包含：
 
 ```bash
-APP_ENV=production
-AUTH_ENABLED=true
+TC_STUDIO_APP_ENV=production
+TC_STUDIO_AUTH_ENABLED=true
 TC_STUDIO_DATABASE_URL=sqlite:////var/lib/tc-studio/tc_studio.sqlite3
 TC_STUDIO_CONFIG_PATH=/var/lib/tc-studio/config.json
 TC_STUDIO_DATA_DIR=/var/lib/tc-studio/data
@@ -113,7 +115,7 @@ TC_STUDIO_HISTORY_PATH=/var/lib/tc-studio/storage/history.json
 ```
 
 本阶段把 OIDC/JWKS 验收后置，所以本手册的 Linux SQLite 探针会显式使用
-`APP_ENV=development`、`AUTH_ENABLED=false` 和临时本地认证；这只用于受控的本机
+`TC_STUDIO_APP_ENV=development`、`TC_STUDIO_AUTH_ENABLED=false` 和临时本地认证；这只用于受控的本机
 存储与进程验收。服务对公网或不可信用户开放前，必须先补齐生产 OIDC 配置并单独完成
 OIDC 回归验收，不能把本次本地认证结果当成身份系统验收。
 
@@ -387,10 +389,15 @@ ID、哈希和文件存在性做一次核验；SQLite 行存在时运行期不�
 
 `UNKNOWN` 是有意的安全边界。腾讯云请求可能已经成功，但进程可能在收到响应前退出；自动重试会把一次不确定请求变成重复写操作。人工核对完成后，再由业务方决定是否重新创建任务。
 
-文档批量同步的正文仍保存在 `storage/docs/*.json` 文件缓存中，写入使用临时文件、
-`fsync`、`os.replace` 和跨进程锁；任务句柄、租约、进度和取消标志保存在
-`sync_jobs`。因此两个 API 进程查询同一个同步任务会看到同一状态，取消请求不会在
-后台请求尚未退出时提前发布“已完成”。
+文档批量同步的正文仍保存在
+`${TC_STUDIO_STORAGE_DIR}/docs/*.json` 文件缓存中，写入使用临时文件、
+`fsync`、`os.replace` 和跨进程锁；没有运行期文件时，程序只读使用发布包内的
+`storage/docs/*.json` fallback。目录同步写入
+`${TC_STUDIO_STORAGE_DIR}/catalogs/*_full_catalog.json`，公共规范写入
+`${TC_STUDIO_STORAGE_DIR}/*_common_specs.json` 和 `*_data_types.json`，不会修改
+`/opt/tc-studio/core`。任务句柄、租约、进度和取消标志保存在 `sync_jobs`。
+因此两个 API 进程查询同一个同步任务会看到同一状态，目录注册器和公共规范缓存也会
+在发现运行期文件版本变化后刷新。
 
 ## 发布验收矩阵
 

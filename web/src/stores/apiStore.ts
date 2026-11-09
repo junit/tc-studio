@@ -1,4 +1,5 @@
 import { create } from 'zustand'
+import { readTcStorage, removeTcStorage, writeTcStorage } from '@/lib/storage'
 
 export interface ApiField {
   name: string
@@ -315,7 +316,7 @@ export function initializeFormData(api: ApiMeta): Record<string, any> {
 
 function getLocalApiHistory(apiId: string): InvokeHistoryItem[] {
   try {
-    const raw = localStorage.getItem(`tim_api_hist_${apiId}`)
+    const raw = readTcStorage(localStorage, `api_hist_${apiId}`)
     return raw ? JSON.parse(raw) : []
   } catch {
     return []
@@ -324,7 +325,7 @@ function getLocalApiHistory(apiId: string): InvokeHistoryItem[] {
 
 function saveLocalApiHistory(apiId: string, history: InvokeHistoryItem[]) {
   try {
-    localStorage.setItem(`tim_api_hist_${apiId}`, JSON.stringify(history.slice(0, 15)))
+    writeTcStorage(localStorage, `api_hist_${apiId}`, JSON.stringify(history.slice(0, 15)))
   } catch (e) {
     console.error('Failed to save api history to localStorage', e)
   }
@@ -332,7 +333,7 @@ function saveLocalApiHistory(apiId: string, history: InvokeHistoryItem[]) {
 
 function clearLocalApiHistory(apiId: string) {
   try {
-    localStorage.removeItem(`tim_api_hist_${apiId}`)
+    removeTcStorage(localStorage, `api_hist_${apiId}`)
   } catch {}
 }
 
@@ -347,7 +348,7 @@ export const CORE_FREQUENT_API_IDS = [
 
 function getRecentApiIds(): string[] {
   try {
-    const raw = localStorage.getItem('tim_recent_api_ids')
+    const raw = readTcStorage(localStorage, 'recent_api_ids')
     return raw ? JSON.parse(raw) : []
   } catch {
     return []
@@ -358,7 +359,7 @@ function recordRecentApiId(apiId: string) {
   try {
     const list = getRecentApiIds().filter((id) => id !== apiId)
     const updated = [apiId, ...list].slice(0, 20)
-    localStorage.setItem('tim_recent_api_ids', JSON.stringify(updated))
+    writeTcStorage(localStorage, 'recent_api_ids', JSON.stringify(updated))
   } catch {}
 }
 
@@ -379,7 +380,7 @@ interface PersistedTabsState {
 
 function getPersistedTabsState(): PersistedTabsState {
   try {
-    const raw = localStorage.getItem('tim_open_tabs_state')
+    const raw = readTcStorage(localStorage, 'open_tabs_state')
     if (raw) {
       const data = JSON.parse(raw)
       return {
@@ -410,13 +411,13 @@ function savePersistedTabsState(tabs: ApiTab[], activeTabId: string | null) {
       activeTabId,
       drafts,
     }
-    localStorage.setItem('tim_open_tabs_state', JSON.stringify(state))
+    writeTcStorage(localStorage, 'open_tabs_state', JSON.stringify(state))
   } catch {}
 }
 
 function getApiCallCounts(): Record<string, number> {
   try {
-    const raw = localStorage.getItem('tim_api_call_counts')
+    const raw = readTcStorage(localStorage, 'api_call_counts')
     return raw ? JSON.parse(raw) : {}
   } catch {
     return {}
@@ -427,7 +428,7 @@ function incrementApiCallCount(apiId: string) {
   try {
     const counts = getApiCallCounts()
     counts[apiId] = (counts[apiId] || 0) + 1
-    localStorage.setItem('tim_api_call_counts', JSON.stringify(counts))
+    writeTcStorage(localStorage, 'api_call_counts', JSON.stringify(counts))
   } catch {}
 }
 
@@ -467,7 +468,7 @@ export const useApiStore = create<ApiState>((set, get) => ({
   isSidebarOpen: typeof window !== 'undefined' ? window.innerWidth >= 1024 : true, // 大屏默认展开，小屏/移动端默认收起
   sidebarWidth: 320, // 侧边栏固定默认宽度 320px
   isPreviewMode: false,
-  activeServiceId: (typeof localStorage !== 'undefined' && localStorage.getItem('tim_active_service')) || 'im',
+  activeServiceId: (typeof localStorage !== 'undefined' && readTcStorage(localStorage, 'active_service')) || 'im',
   cloudServices: DEFAULT_CLOUD_SERVICES,
   recentApiIds: getRecentApiIds(),
 
@@ -499,7 +500,7 @@ export const useApiStore = create<ApiState>((set, get) => ({
 
   setActiveServiceId: (serviceId: string) => {
     try {
-      localStorage.setItem('tim_active_service', serviceId)
+      writeTcStorage(localStorage, 'active_service', serviceId)
     } catch {}
 
     const { tabs, apis, activeTabId } = get()
@@ -621,7 +622,7 @@ export const useApiStore = create<ApiState>((set, get) => ({
 
         // 2. 保持用户在全局服务切换器中选定的权威服务标识 (localStorage 作为 SSoT，绝不被 Tab 的服务类型逆向覆盖)
         const savedService =
-          (typeof localStorage !== 'undefined' && localStorage.getItem('tim_active_service')) || 'im'
+          (typeof localStorage !== 'undefined' && readTcStorage(localStorage, 'active_service')) || 'im'
         const activeService = savedService
 
         // 优先在 initialTabs 中寻找属于 savedService 的激活 Tab
@@ -652,7 +653,7 @@ export const useApiStore = create<ApiState>((set, get) => ({
         savePersistedTabsState(initialTabs, activeId)
 
         try {
-          localStorage.setItem('tim_active_service', activeService)
+        writeTcStorage(localStorage, 'active_service', activeService)
         } catch {}
 
         set({
@@ -686,7 +687,7 @@ export const useApiStore = create<ApiState>((set, get) => ({
     const targetService = api.service_type || 'im'
     if (get().activeServiceId !== targetService) {
       try {
-        localStorage.setItem('tim_active_service', targetService)
+        writeTcStorage(localStorage, 'active_service', targetService)
       } catch {}
     }
 
@@ -825,7 +826,7 @@ export const useApiStore = create<ApiState>((set, get) => ({
       const targetService = target.api.service_type || 'im'
       if (get().activeServiceId !== targetService) {
         try {
-          localStorage.setItem('tim_active_service', targetService)
+        writeTcStorage(localStorage, 'active_service', targetService)
         } catch {}
       }
 

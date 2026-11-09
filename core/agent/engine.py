@@ -1233,7 +1233,7 @@ def _create_code_executor(
     the spawn/RPC executor and is reported as lacking OS-level isolation.
     """
     mode = (get_env("CODE_EXECUTOR_MODE", default="fork") or "fork").strip().lower()
-    app_env = os.environ.get("APP_ENV", "development").strip().lower()
+    app_env = (get_env("APP_ENV", default="development") or "development").strip().lower()
     production = app_env in {"production", "prod", "staging"}
     linux_host = os.name == "posix" and sys.platform.startswith("linux")
     if mode not in {"fork", "spawn", "nsjail"}:

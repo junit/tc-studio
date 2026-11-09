@@ -53,6 +53,94 @@ def test_prefixed_legacy_namespace_wins_over_historical_unprefixed_alias():
     )
 
 
+def test_canonical_app_controls_win_over_legacy_unprefixed_aliases():
+    from core.namespace import get_env, reset_warning_state_for_tests
+
+    reset_warning_state_for_tests()
+    environment = {
+        "TC_STUDIO_APP_ENV": "production",
+        "APP_ENV": "development",
+        "TC_STUDIO_AUTH_ENABLED": "true",
+        "AUTH_ENABLED": "false",
+    }
+
+    assert get_env("APP_ENV", environ=environment) == "production"
+    assert get_env("AUTH_ENABLED", environ=environment) == "true"
+
+
+def test_auth_settings_reads_canonical_app_controls(tmp_path):
+    project_root = Path(__file__).resolve().parents[1]
+    environment = dict(os.environ)
+    environment["TC_STUDIO_APP_ENV"] = "production"
+    environment["APP_ENV"] = "development"
+    environment["TC_STUDIO_AUTH_ENABLED"] = "true"
+    environment["AUTH_ENABLED"] = "false"
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "from core.auth import AuthSettings; "
+                "settings = AuthSettings(); "
+                "print(settings.environment, settings.enabled)"
+            ),
+        ],
+        cwd=str(project_root),
+        env=environment,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.stdout.strip().endswith("production True")
+
+
+def test_auth_settings_reads_canonical_auth_controls(tmp_path):
+    project_root = Path(__file__).resolve().parents[1]
+    environment = dict(os.environ)
+    environment["TC_STUDIO_AUTH_PROVIDER"] = "oidc"
+    environment["AUTH_PROVIDER"] = "unsupported"
+    environment["TC_STUDIO_AUTH_REQUIRED_ROLE"] = "operator"
+    environment["AUTH_REQUIRED_ROLE"] = "legacy-role"
+    environment["TC_STUDIO_OIDC_JWKS_TTL_SECONDS"] = "60"
+    environment["OIDC_JWKS_TTL_SECONDS"] = "10"
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "from core.auth import AuthSettings; "
+                "settings = AuthSettings(); "
+                "print(settings.provider, settings.required_role, settings.jwks_ttl)"
+            ),
+        ],
+        cwd=str(project_root),
+        env=environment,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.stdout.strip().endswith("oidc operator 60")
+
+
+def test_direct_launch_defaults_do_not_shadow_legacy_app_controls(monkeypatch):
+    from core.namespace import set_default_env
+
+    monkeypatch.delenv("TC_STUDIO_APP_ENV", raising=False)
+    monkeypatch.delenv("TC_STUDIO_AUTH_ENABLED", raising=False)
+    monkeypatch.setenv("APP_ENV", "production")
+    monkeypatch.setenv("AUTH_ENABLED", "true")
+
+    set_default_env("APP_ENV", "development")
+    set_default_env("AUTH_ENABLED", "false")
+
+    assert os.environ["APP_ENV"] == "production"
+    assert os.environ["AUTH_ENABLED"] == "true"
+    assert "TC_STUDIO_APP_ENV" not in os.environ
+    assert "TC_STUDIO_AUTH_ENABLED" not in os.environ
+
+
 def test_existing_legacy_database_is_used_until_explicit_migration(tmp_path):
     from core.namespace import select_canonical_or_legacy_path
 

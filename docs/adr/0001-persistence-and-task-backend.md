@@ -30,8 +30,13 @@
 - `config.json`、`data/llm_config.json`：环境配置和大模型配置，其中可能包含密钥。
 - `withdraw_tasks.json/csv`、`withdraw_results.json/csv`：CLI 人工输入与导出文件；Web 批处理事实不依赖它们。
 - `.history.lock`、`.rag.lock`、JSONL `.idx`：跨进程锁和可重建索引，不是业务事实。
-- `storage/docs/*.json`、`storage/official_live_tree.json`、`storage/docs_cache/*`：官方目录、文档和同步缓存。
-- `core/*_catalog.json`、`core/live_common_specs.json`、`core/live_data_types.json`：随代码发布或由同步任务重建的目录数据。
+- `${TC_STUDIO_STORAGE_DIR}/docs/*.json`、`${TC_STUDIO_STORAGE_DIR}/official_live_tree.json`、
+  `${TC_STUDIO_STORAGE_DIR}/docs_cache/*`：官方目录、文档和同步缓存；默认开发目录仍是
+  仓库下的 `storage/`。
+- `core/*_catalog.json`、`core/live_common_specs.json`、`core/live_data_types.json`：
+  随代码发布的只读 fallback。运行期同步覆盖写入
+  `${TC_STUDIO_STORAGE_DIR}/catalogs/*_full_catalog.json` 和
+  `${TC_STUDIO_STORAGE_DIR}/*_common_specs.json` / `*_data_types.json`。
 - `core/task_runner.py` 的 `TaskRunner.tasks` 和 `core/sync_task_manager.py` 的任务字典：运行期对象缓存，不能作为跨进程事实来源。
 
 SQLite 过去只负责批处理幂等预留；当前阶段已经把任务事实、事件、同步任务状态和 BOT/RAG 结构化元数据纳入统一主库。它仍不能单独解决多主机、多 Pod 的队列调度和自动接管。
@@ -214,10 +219,10 @@ BOT/RAG 结构化元数据；单机多进程的共享状态、幂等、控制、
 | `uploads/*` | 本地 Blob 目录 | 对象存储 | 可能是图片、PDF、Office、导出文件，不适合塞进数据库。 |
 | `knowledge/files/*` | 本地 Blob 目录 | 对象存储 | RAG 原文件需要保留、下载和重新解析。 |
 | 大型批处理 CSV/ZIP 导出 | 本地 Blob 目录 | 对象存储 | 结果正文大，数据库只保存 URI、哈希、大小和状态。 |
-| `storage/docs_cache/*` | 文件缓存 | 文件缓存或对象存储 | 可从官方来源重建，不是业务事实。 |
-| `storage/docs/*.json` | 文件缓存 | PostgreSQL/对象存储均可 | 若只读和整包刷新，继续文件；若需要按记录查询、增量更新和多实例同步，再迁入 `catalog_documents`。 |
+| `${TC_STUDIO_STORAGE_DIR}/docs_cache/*` | 文件缓存 | 文件缓存或对象存储 | 可从官方来源重建，不是业务事实。 |
+| `${TC_STUDIO_STORAGE_DIR}/docs/*.json` | 文件缓存 | PostgreSQL/对象存储均可 | 若只读和整包刷新，继续文件；若需要按记录查询、增量更新和多实例同步，再迁入 `catalog_documents`。发布包 `storage/docs` 只作 fallback。 |
 | `official_live_tree.json` | 文件快照 | `catalog_snapshots` + Blob | 作为可回滚快照保存，不能成为唯一运行状态。 |
-| `core/*_catalog.json`、公共规范 JSON | 随版本发布或重建 | PostgreSQL 缓存表或版本化 Blob | 这是公共目录缓存，不是用户私有数据。 |
+| `core/*_catalog.json`、公共规范 JSON | 只读发布 fallback；运行期覆盖在 storage | PostgreSQL 缓存表或版本化 Blob | 这是公共目录缓存，不是用户私有数据。多进程读取运行期覆盖时按文件版本自动 reload。 |
 | `withdraw_tasks.json/csv`、`withdraw_results.json/csv` | CLI 输入/导出文件 | 对象存储或批处理 Blob | 这是人工操作的交换文件；Web 批处理已经以 SQLite 任务和结果索引为事实源。 |
 | `.history.lock`、`.rag.lock`、JSONL `.idx` | 锁/可重建索引 | 本地临时文件或进程协调组件 | 这些文件不承载业务事实，迁入 SQLite 反而会增加无意义的写放大。 |
 | 前端 `static/` | Git/发布包 | Git/发布包或 CDN | 不属于运行期业务数据。 |

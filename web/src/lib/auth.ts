@@ -1,5 +1,7 @@
+import { readTcStorage } from './storage'
+
 export function getAccessToken(): string {
-  const sessionToken = sessionStorage.getItem('tim_access_token') || ''
+  const sessionToken = readTcStorage(sessionStorage, 'access_token') || ''
   if (sessionToken) return sessionToken
   if (import.meta.env.DEV) return import.meta.env.VITE_OIDC_DEV_ACCESS_TOKEN || ''
   return ''

@@ -20,11 +20,12 @@ import { SettingsPanel } from '@/components/panels/SettingsPanel'
 import { DocsCenterPanel } from '@/components/panels/DocsCenterPanel'
 import { AgentPanel } from '@/components/panels/AgentPanel'
 import { useApiStore } from '@/stores/apiStore'
+import { readTcStorage, writeTcStorage } from '@/lib/storage'
 
 export type MainNavTab = 'sandbox' | 'docs' | 'batch' | 'agent' | 'settings'
 
 const VALID_TABS: MainNavTab[] = ['sandbox', 'docs', 'batch', 'agent', 'settings']
-const NAV_STORAGE_KEY = 'tim_active_main_nav_tab'
+const NAV_STORAGE_KEY = 'active_main_nav_tab'
 
 function getInitialNavTab(): MainNavTab {
   if (typeof window === 'undefined') return 'sandbox'
@@ -37,7 +38,7 @@ function getInitialNavTab(): MainNavTab {
 
   // 2. 读取持久化缓存
   try {
-    const saved = localStorage.getItem(NAV_STORAGE_KEY)
+    const saved = readTcStorage(localStorage, NAV_STORAGE_KEY)
     if (saved && VALID_TABS.includes(saved as MainNavTab)) {
       return saved as MainNavTab
     }
@@ -89,7 +90,7 @@ export function App() {
   // 持久化当前激活的顶部主导航 Tab 并静默同步 URL hash
   useEffect(() => {
     try {
-      localStorage.setItem(NAV_STORAGE_KEY, activeTab)
+      writeTcStorage(localStorage, NAV_STORAGE_KEY, activeTab)
       if (typeof window !== 'undefined' && window.location.hash.replace(/^#/, '') !== activeTab) {
         window.history.replaceState(null, '', `#${activeTab}`)
       }

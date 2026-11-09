@@ -1,4 +1,5 @@
 import { create } from 'zustand'
+import { readTcStorage, writeTcStorage } from '@/lib/storage'
 
 export type ThemeMode = 'light' | 'dark' | 'system'
 
@@ -11,7 +12,7 @@ interface ThemeState {
 
 function getInitialTheme(): ThemeMode {
   if (typeof window === 'undefined') return 'light'
-  const saved = localStorage.getItem('tim_theme') as ThemeMode
+  const saved = readTcStorage(localStorage, 'theme') as ThemeMode
   if (saved === 'light' || saved === 'dark' || saved === 'system') {
     return saved
   }
@@ -55,14 +56,14 @@ export const useThemeStore = create<ThemeState>((set, get) => {
     theme: initial,
     isDark,
     setTheme: (theme: ThemeMode) => {
-      localStorage.setItem('tim_theme', theme)
+      writeTcStorage(localStorage, 'theme', theme)
       const dark = applyThemeToDocument(theme)
       set({ theme, isDark: dark })
     },
     toggleTheme: () => {
       const current = get().theme
       const next: ThemeMode = current === 'dark' ? 'light' : 'dark'
-      localStorage.setItem('tim_theme', next)
+      writeTcStorage(localStorage, 'theme', next)
       const dark = applyThemeToDocument(next)
       set({ theme: next, isDark: dark })
     },

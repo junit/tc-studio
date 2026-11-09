@@ -63,6 +63,8 @@ from core.task_runner import (
     task_runner,
 )
 from core.persistence import SqliteAuditStore
+from core.namespace import get_env, set_default_env
+from core.runtime_paths import official_tree_read_paths
 from core.sync_task_manager import sync_task_manager
 from core.tree_syncer import fetch_official_hydration_tree, sync_catalog_from_live_tree
 
@@ -71,7 +73,13 @@ STATIC_DIR = os.path.join(BASE_DIR, "static")
 
 ALLOWED_ORIGINS = [
     origin.strip()
-    for origin in os.environ.get("CORS_ALLOWED_ORIGINS", "http://localhost:8000,http://127.0.0.1:8000").split(",")
+    for origin in (
+        get_env(
+            "CORS_ALLOWED_ORIGINS",
+            default="http://localhost:8000,http://127.0.0.1:8000",
+        )
+        or ""
+    ).split(",")
     if origin.strip()
 ]
 
@@ -786,13 +794,15 @@ def get_official_live_catalog_sync_status(
 
 @app.get("/api/docs/tree/raw")
 def get_raw_official_tree():
-    snapshot_path = os.path.join(BASE_DIR, "storage", "official_live_tree.json")
-    if os.path.exists(snapshot_path):
+    for snapshot in official_tree_read_paths():
+        snapshot_path = str(snapshot)
+        if not os.path.exists(snapshot_path):
+            continue
         try:
             with open(snapshot_path, encoding="utf-8") as f:
                 return {"status": "success", "data": json.load(f)}
         except (OSError, json.JSONDecodeError) as exc:
-            raise HTTPException(status_code=500, detail=f"读取官方目录树快照失败: {exc}") from exc
+            print(f"[WARN] 忽略损坏的官方目录树快照 {snapshot_path}: {exc}")
     try:
         raw_tree, _ = fetch_official_hydration_tree()
         return {"status": "success", "data": raw_tree}
@@ -1725,11 +1735,10 @@ if __name__ == "__main__":
     # ``AuthSettings`` is initialized when this module is imported, before
     # uvicorn starts the server.  A direct local ``python3 app.py`` launch
     # therefore needs an explicit development opt-in before reloading the
-    # settings.  ``setdefault`` preserves operator supplied production
-    # values, while the uvicorn/import and container paths remain fail-closed
-    # when they do not provide deployment configuration.
-    os.environ.setdefault("APP_ENV", "development")
-    os.environ.setdefault("AUTH_ENABLED", "false")
+    # settings.  ``set_default_env`` also respects legacy APP_ENV,
+    # AUTH_ENABLED, TIM_APP_ENV and TIM_AUTH_ENABLED values during migration.
+    set_default_env("APP_ENV", "development")
+    set_default_env("AUTH_ENABLED", "false")
     reload_auth_settings()
 
     print("\n" + "=" * 60)

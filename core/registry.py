@@ -11,6 +11,7 @@ import threading
 from typing import Dict, List, Optional, Type
 
 from apis.base import BaseTimApi, Field
+from core.runtime_paths import runtime_catalog_dir
 
 
 class DynamicTimApi(BaseTimApi):
@@ -55,12 +56,86 @@ class ApiRegistry:
         self._ordered_apis: List[BaseTimApi] = []
         self._discovered = False
         self._lock = threading.RLock()
+        self._catalog_signature: tuple[tuple[str, int, int], ...] = ()
+
+    @staticmethod
+    def _catalog_sources() -> dict[str, str]:
+        """Return static catalogs plus runtime overrides by filename."""
+
+        core_dir = os.path.dirname(__file__)
+        sources: dict[str, str] = {}
+        for filename in os.listdir(core_dir):
+            if filename.endswith("_full_catalog.json"):
+                sources[filename] = os.path.join(core_dir, filename)
+
+        runtime_dir = runtime_catalog_dir()
+        if runtime_dir.is_dir():
+            for path in runtime_dir.glob("*_full_catalog.json"):
+                sources[path.name] = str(path)
+        return sources
+
+    @classmethod
+    def _read_catalog_signature(cls) -> tuple[tuple[str, int, int], ...]:
+        signature: list[tuple[str, int, int]] = []
+        for path in cls._catalog_sources().values():
+            try:
+                stat = os.stat(path)
+            except OSError:
+                continue
+            signature.append((path, stat.st_mtime_ns, stat.st_size))
+        return tuple(sorted(signature))
+
+    @staticmethod
+    def _load_catalog_data(filename: str, catalog_path: str) -> list[dict] | None:
+        """Load one catalog and fall back to the package copy if needed."""
+
+        def validate(data: object, source: str) -> list[dict]:
+            if not isinstance(data, list):
+                raise ValueError(f"{source} root must be a JSON array")
+            if not data:
+                raise ValueError(f"{source} must not be empty")
+            if not all(isinstance(item, dict) for item in data):
+                raise ValueError(f"{source} contains a non-object entry")
+            return data
+
+        try:
+            with open(catalog_path, "r", encoding="utf-8") as stream:
+                return validate(json.load(stream), catalog_path)
+        except (OSError, ValueError) as exc:
+            package_path = os.path.join(os.path.dirname(__file__), filename)
+            if (
+                os.path.abspath(catalog_path) != os.path.abspath(package_path)
+                and os.path.exists(package_path)
+            ):
+                print(
+                    f"[WARN] Failed to load runtime catalog {catalog_path}: {exc}; "
+                    f"falling back to {package_path}"
+                )
+                with open(package_path, "r", encoding="utf-8") as stream:
+                    return validate(json.load(stream), package_path)
+
+            if os.path.abspath(catalog_path) != os.path.abspath(package_path):
+                print(f"[WARN] Ignoring invalid runtime catalog {catalog_path}: {exc}")
+                return None
+            raise
+
+    def _discover_if_changed(self) -> None:
+        with self._lock:
+            if not self._discovered:
+                self._discover_unlocked()
+                return
+            current_signature = self._read_catalog_signature()
+            if current_signature == self._catalog_signature:
+                return
+
+            shadow = ApiRegistry()
+            shadow._discover_unlocked()
+            self._apis = shadow._apis
+            self._ordered_apis = shadow._ordered_apis
+            self._catalog_signature = shadow._catalog_signature
 
     def discover(self):
-        with self._lock:
-            if self._discovered:
-                return
-            self._discover_unlocked()
+        self._discover_if_changed()
 
     def _discover_unlocked(self):
         # 1. 发现已有的自定义 python 类
@@ -88,17 +163,24 @@ class ApiRegistry:
                 print(f"[WARN] Failed to load module {full_module_name}: {e}")
 
         # 2. 动态扫描并读取所有云产品 API 目录 (支持 IM 166 个 API、云直播 CSS 261 项 API 3.0 及未来任意 *_full_catalog.json 插件)
-        core_dir = os.path.dirname(__file__)
-        catalog_files = []
-        if os.path.exists(os.path.join(core_dir, "tim_full_catalog.json")):
-            catalog_files.append(("im", os.path.join(core_dir, "tim_full_catalog.json")))
-        if os.path.exists(os.path.join(core_dir, "live_full_catalog.json")):
-            catalog_files.append(("live", os.path.join(core_dir, "live_full_catalog.json")))
-
-        for fn in sorted(os.listdir(core_dir)):
-            if fn.endswith("_full_catalog.json") and fn not in ("tim_full_catalog.json", "live_full_catalog.json"):
-                service_code = fn.replace("_full_catalog.json", "")
-                catalog_files.append((service_code, os.path.join(core_dir, fn)))
+        sources = self._catalog_sources()
+        preferred = ["tim_full_catalog.json", "live_full_catalog.json"]
+        catalog_files = [
+            (
+                "im" if filename == "tim_full_catalog.json" else filename.removesuffix("_full_catalog.json"),
+                sources[filename],
+            )
+            for filename in preferred
+            if filename in sources
+        ]
+        catalog_files.extend(
+            (
+                filename.removesuffix("_full_catalog.json"),
+                sources[filename],
+            )
+            for filename in sorted(sources)
+            if filename not in preferred
+        )
 
         ordered_list: List[BaseTimApi] = []
         used_custom_api_ids = set()
@@ -106,8 +188,10 @@ class ApiRegistry:
         for default_service_type, catalog_path in catalog_files:
             if not os.path.exists(catalog_path):
                 continue
-            with open(catalog_path, "r", encoding="utf-8") as f:
-                catalog_data = json.load(f)
+            filename = os.path.basename(catalog_path)
+            catalog_data = self._load_catalog_data(filename, catalog_path)
+            if catalog_data is None:
+                continue
 
             for item in catalog_data:
                 api_id = item.get("api_id")
@@ -193,6 +277,7 @@ class ApiRegistry:
 
         self._ordered_apis = ordered_list
         self._discovered = True
+        self._catalog_signature = self._read_catalog_signature()
 
     def get_api(self, api_id: str) -> Optional[BaseTimApi]:
         self.discover()
@@ -298,6 +383,7 @@ class ApiRegistry:
             self._apis = shadow._apis
             self._ordered_apis = shadow._ordered_apis
             self._discovered = True
+            self._catalog_signature = shadow._catalog_signature
 
 
 registry = ApiRegistry()

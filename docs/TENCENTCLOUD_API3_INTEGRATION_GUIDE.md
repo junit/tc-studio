@@ -104,14 +104,20 @@ TC Studio (原 TIM Studio) 早期仅面向腾讯云即时通信 IM（166 项自�
    - 使用 `ThreadPoolExecutor`（并发数建议 8~12，搭配 `random.uniform(0.1, 0.3)` 抖动延时，防止触发 WAF 限频）；
    - 提取 Markdown 正文中的“接口描述”、“请求参数表格”、“返回参数表格”与“示例代码”。
 3. **本地磁盘缓存**：
-   - 缓存目录：`storage/docs_cache/{service}/{doc_id}.json`；
+   - 缓存目录：`${TC_STUDIO_STORAGE_DIR}/docs_cache/{service}/{doc_id}.json`；
    - 存在缓存文件时跳过网络请求，支持断点续传与离线复现。
 
 ---
 
 ## 4. 阶段二：结构化数据模型与存储规范 (Schema & Storage)
 
-### 4.1 全量接口目录：`core/{service}_full_catalog.json`
+### 4.1 全量接口目录：发布包 fallback 与运行期覆盖
+
+随代码发布的 `core/{service}_full_catalog.json` 是只读 fallback。在线同步任务应将
+覆盖文件写入 `${TC_STUDIO_STORAGE_DIR}/catalogs/{service}_full_catalog.json`；
+注册中心优先读取运行期覆盖，缺少覆盖时才读取 `core/` 文件。这样 systemd 的
+`ProtectSystem=strict` 可以继续保持，运行期同步也不会修改 `/opt/tc-studio/core`。
+
 标准 JSON Array 格式，每个元素定义一个 API 节点：
 
 ```json
@@ -191,15 +197,23 @@ API 3.0 中大量参数是结构体对象或结构体数组（如 `WatermarkInfo
 }
 ```
 
-### 4.3 公共规范与错误码：`core/{service}_common_specs.json`
+### 4.3 公共规范与错误码：运行期缓存与发布 fallback
+
+发布包中的 `core/{service}_common_specs.json` 和 `core/{service}_data_types.json`
+只读使用。同步任务将公共规范和结构体字典写入
+`${TC_STUDIO_STORAGE_DIR}/{service}_common_specs.json` 与
+`${TC_STUDIO_STORAGE_DIR}/{service}_data_types.json`。
+
 由 [`core/common_specs_syncer.py`](file:///Users/wifibaby4u/IdeaProjects/tim/core/common_specs_syncer.py) 生成，必须包含：
 - `errors`：提取该业务专有错误码（如 `FailedOperation.StreamNotExist`）与 API 3.0 全局通用错误码；
 - `regions`：支持该业务的地域列表（`ap-guangzhou`, `ap-beijing` 等）；
 - `signature_rules`：TC3 HMAC-SHA256 规范；
 - `endpoints`：地域接入域名与默认接入域名。
 
-### 4.4 详情文档缓存存储：`storage/docs/{doc_id}.json`
-在进入 API 文档中心时，前端会优先读取 `storage/docs/{doc_id}.json`，实现极速毫秒级离线渲染。
+### 4.4 详情文档缓存存储：`${TC_STUDIO_STORAGE_DIR}/docs/{doc_id}.json`
+
+在进入 API 文档中心时，程序优先读取运行期 docs 缓存；运行期缓存缺失时只读使用
+发布包中的 `storage/docs/{doc_id}.json`，实现离线渲染。
 
 ---
 
@@ -249,15 +263,16 @@ class TencentCloudApi3Client:
 ## 6. 阶段四：注册中心动态发现与 SSoT 自适应 (Registry & SSoT)
 
 ### 6.1 目录自动热插拔扫描机制
-在 [`core/registry.py`](file:///Users/wifibaby4u/IdeaProjects/tim/core/registry.py#L85-L100) 中：
+在 [`core/registry.py`](file:///Users/wifibaby4u/IdeaProjects/tim/core/registry.py) 中：
 ```python
-core_dir = os.path.dirname(__file__)
-for fn in sorted(os.listdir(core_dir)):
+for fn in package_catalogs_and_runtime_overrides():
     if fn.endswith("_full_catalog.json"):
-        service_code = fn.replace("_full_catalog.json", "")
-        # 自动加载并注册到 _apis_by_id 与 _ordered_apis
+        # 运行期覆盖优先，缺少覆盖时读取 package catalog
+        # 自动加载并注册到 _apis 与 _ordered_apis
 ```
-任何新增业务只要遵循 `{service}_full_catalog.json` 命名并放在 `core/` 下，注册中心就能在启动或 `reload()` 时自动注册，无需改动任何注册表代码。
+任何新增业务只要遵循 `{service}_full_catalog.json` 命名并放在发布包 `core/` 或运行期
+`catalogs/` 下，注册中心就能在启动时自动注册；运行期文件变化后，其他进程在下次访问
+注册中心时也会自动 reload，无需改动注册表代码。
 
 ### 6.2 SSoT 服务摘要汇总：`get_services_summary()`
 注册中心对外提供唯一的统计口径方法：
@@ -373,15 +388,17 @@ export const CLOUD_SERVICES: CloudService[] = [
 ```bash
 # 步骤 1：确认官方概览文档 ID 并执行拉取
 python3 scripts/sync_trtc_catalog.py
-# -> 产出 core/trtc_full_catalog.json
+# -> 发布构建产出 core/trtc_full_catalog.json；线上同步覆盖写入
+#    ${TC_STUDIO_STORAGE_DIR}/catalogs/trtc_full_catalog.json
 
 # 步骤 2：抓取官方文档与结构体字典
 python3 scripts/audit_and_sync_trtc_docs.py
-# -> 产出 core/trtc_data_types.json 与 storage/docs/xxx.json
+# -> 产出 ${TC_STUDIO_STORAGE_DIR}/trtc_data_types.json 与
+#    ${TC_STUDIO_STORAGE_DIR}/docs/xxx.json
 
 # 步骤 3：同步错误码与公共规范
 python3 scripts/sync_trtc_common_specs.py
-# -> 产出 core/trtc_common_specs.json
+# -> 产出 ${TC_STUDIO_STORAGE_DIR}/trtc_common_specs.json
 
 # 步骤 4：在高危拦截表中登记敏感 Action
 # 编辑 core/agent/tools.py 中的 HIGH_RISK_ACTIONS，加入 trtc 高危行为

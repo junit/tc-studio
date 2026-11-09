@@ -44,6 +44,23 @@ _EXTRA_LEGACY_ENV_ALIASES: dict[str, tuple[str, ...]] = {
     f"{CANONICAL_ENV_PREFIX}ALLOW_UNCONFINED_CODE_EXECUTOR": (
         "ALLOW_UNCONFINED_CODE_EXECUTOR",
     ),
+    f"{CANONICAL_ENV_PREFIX}APP_ENV": ("APP_ENV",),
+    f"{CANONICAL_ENV_PREFIX}AUTH_ENABLED": ("AUTH_ENABLED",),
+    f"{CANONICAL_ENV_PREFIX}ALLOW_INSECURE_LOCAL_AUTH": (
+        "ALLOW_INSECURE_LOCAL_AUTH",
+    ),
+    f"{CANONICAL_ENV_PREFIX}CORS_ALLOWED_ORIGINS": ("CORS_ALLOWED_ORIGINS",),
+    f"{CANONICAL_ENV_PREFIX}ALLOW_PRIVATE_MODEL_HOSTS": (
+        "ALLOW_PRIVATE_MODEL_HOSTS",
+    ),
+    f"{CANONICAL_ENV_PREFIX}LOCAL_MODEL_ALLOWED_PORTS": (
+        "LOCAL_MODEL_ALLOWED_PORTS",
+    ),
+    f"{CANONICAL_ENV_PREFIX}AUTH_PROVIDER": ("AUTH_PROVIDER",),
+    f"{CANONICAL_ENV_PREFIX}AUTH_REQUIRED_ROLE": ("AUTH_REQUIRED_ROLE",),
+    f"{CANONICAL_ENV_PREFIX}OIDC_JWKS_TTL_SECONDS": (
+        "OIDC_JWKS_TTL_SECONDS",
+    ),
 }
 
 _warning_lock = threading.Lock()
@@ -144,6 +161,19 @@ def get_env(
         return value
 
     return default
+
+
+def set_default_env(name: str, value: str) -> None:
+    """Set a canonical default only when no canonical or legacy value exists.
+
+    Direct ``python app.py`` launches historically supplied local development
+    defaults.  The check must go through :func:`get_env`; a bare
+    ``os.environ.setdefault("TC_STUDIO_*", ...)`` would shadow an explicitly
+    configured legacy ``APP_ENV`` or ``TIM_APP_ENV`` value.
+    """
+
+    if get_env(name) is None:
+        os.environ.setdefault(canonical_env_name(name), value)
 
 
 def select_canonical_or_legacy_path(

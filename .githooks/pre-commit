@@ -1,0 +1,24 @@
+#!/bin/sh
+set -eu
+
+cd "$(git rev-parse --show-toplevel)"
+
+# Check the changes being committed, without rejecting unrelated working edits.
+git diff --cached --check
+
+# Backend-only and documentation commits do not need the frontend toolchain.
+if git diff --cached --quiet -- web/; then
+    exit 0
+fi
+
+if ! command -v pnpm >/dev/null 2>&1; then
+    echo "error: pnpm is required for frontend commits; see web/package.json for the pinned version" >&2
+    exit 1
+fi
+
+if [ ! -x web/node_modules/.bin/tsc ]; then
+    echo "error: frontend dependencies are missing; run pnpm --dir web install --frozen-lockfile" >&2
+    exit 1
+fi
+
+pnpm --dir web run typecheck

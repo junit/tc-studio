@@ -533,6 +533,25 @@ UID 1000 降权强故障探针；这不包含 OIDC、真实腾讯云副作用、
 
 ## 🤝 参与贡献
 
+开发环境首次克隆后，在仓库根目录启用本项目的 Git hook：
+
+```bash
+git config --local core.hooksPath .githooks
+pnpm --dir web install --frozen-lockfile
+git hook run pre-commit
+```
+
+`.githooks/pre-commit` 使用 `git diff --cached --check` 检查暂存内容；只有暂存了
+`web/` 改动时，才运行 `pnpm --dir web run typecheck`。类型检查读取当前工作区，
+与手工运行相同，不会构建或改写 `static/`。纯后端或文档提交不依赖 pnpm，未暂存的
+其他改动也不会因为 `git diff --exit-code` 被误拦截。
+
+`--local` 只修改当前仓库的 `.git/config`，用于覆盖机器上的全局 `core.hooksPath`；
+不会修改其他仓库的 hook。新克隆需要重新执行启用命令，hook 文件本身随代码版本化。
+本项目目前没有独立的前端 `lint` 脚本，hook 不调用不存在的命令。
+后端回归仍按需执行 `PYTHONPATH=. pytest -q`。临时跳过提交检查使用
+`git commit --no-verify`；它只对当前提交生效。
+
 欢迎提交 Issue 和 Pull Request！
 1. Fork 本项目
 2. 创建您的特性分支 (`git checkout -b feature/AmazingFeature`)

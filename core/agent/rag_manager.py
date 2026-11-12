@@ -35,7 +35,7 @@ from core.persistence import (
     SqliteBotMetadataStore,
     database_path as resolve_database_path,
 )
-from core.runtime_context import runtime_auth_scope, runtime_user_id
+from core.runtime_context import runtime_auth_scope, runtime_user_id, runtime_user_partition
 
 MAX_RAG_TEXT_CHARS = 2_000_000
 MAX_RAG_CHUNKS = 5_000
@@ -102,7 +102,7 @@ class RagManager:
         self._file_lock_state = threading.local()
 
     def _metadata_scope(self, bot_id: str) -> dict[str, str]:
-        """Resolve the owner scope for a private BOT's RAG metadata."""
+        """Resolve BOT ownership or the public BOT requester's personal scope."""
         bot_manager = None
         try:
             from core.agent.bot_manager import bot_manager
@@ -167,7 +167,7 @@ class RagManager:
             document_id = str(document["id"])
             stored_name = document.get("stored_name")
             blob_uri = (
-                f"local://data/bots/{bot_id}/knowledge/files/{stored_name}"
+                self._document_blob_uri(bot_id, str(stored_name))
                 if stored_name
                 else None
             )
@@ -189,13 +189,28 @@ class RagManager:
                 os.remove(self._get_chunks_path(bot_id))
 
     def _get_kb_dir(self, bot_id: str) -> str:
-        kb_dir = os.path.join(self.data_root, bot_id, "knowledge")
+        bot_root = os.path.join(self.data_root, bot_id)
+        from core.agent.bot_manager import bot_manager
+
+        bot = bot_manager.get_bot(bot_id)
+        partition = runtime_user_partition()
+        if bot and bot.visibility == "public" and partition is not None:
+            # Never import unowned pre-auth public knowledge into a signed-in
+            # user's scope. Its root directory stays quarantined.
+            bot_root = os.path.join(bot_root, "users", partition)
+        kb_dir = os.path.join(bot_root, "knowledge")
         os.makedirs(kb_dir, mode=0o700, exist_ok=True)
         os.chmod(kb_dir, 0o700)
         files_dir = os.path.join(kb_dir, "files")
         os.makedirs(files_dir, mode=0o700, exist_ok=True)
         os.chmod(files_dir, 0o700)
         return kb_dir
+
+    def _document_blob_uri(self, bot_id: str, stored_name: str) -> str:
+        path = self._safe_document_file_path(bot_id, stored_name)
+        if path is None:
+            raise ValueError("知识库文件路径无效")
+        return "local://" + os.path.relpath(path, os.path.dirname(os.path.abspath(self.data_root))).replace(os.sep, "/")
 
     def _get_docs_path(self, bot_id: str) -> str:
         return os.path.join(self._get_kb_dir(bot_id), "docs.json")
@@ -526,7 +541,7 @@ class RagManager:
                     bot_id=bot_id,
                     document=doc_meta,
                     chunks=chunks_data,
-                    blob_uri=f"local://data/bots/{bot_id}/knowledge/files/{stored_name}",
+                    blob_uri=self._document_blob_uri(bot_id, stored_name),
                     **self._metadata_scope(bot_id),
                 )
             except Exception:

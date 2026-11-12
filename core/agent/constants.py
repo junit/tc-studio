@@ -5,16 +5,10 @@
 
 from typing import Any, Dict, List
 
-# Python 沙箱允许导入的官方库白名单
-AUTHORIZED_IMPORTS: List[str] = [
-    "json",
-    "time",
-    "math",
-    "datetime",
-    "re",
-    "random",
-    "csv",
-]
+# Compatibility name; the reviewed effective policy lives in one module.
+from .sandbox_policy import AGENT_IMPORTS
+
+AUTHORIZED_IMPORTS: List[str] = list(AGENT_IMPORTS)
 
 # 沙箱执行输出与步骤限制
 DEFAULT_MAX_PRINT_OUTPUTS_LENGTH: int = 8000

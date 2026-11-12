@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import base64
+import hashlib
 import inspect
 import json
 import multiprocessing
@@ -30,6 +32,9 @@ from ..tim_client import TimClient
 from .bot_manager import BotIdConflict, BotManager
 from .constants import HIGH_RISK_API_KEYWORDS
 from .risk import api_identities, is_high_risk_api, resolve_api
+from .sandbox_policy import SKILL_IMPORTS, SKILL_MODULE_ATTRIBUTES
+from .executor_transport import decode_message, encode_message
+from .file_capabilities import FILE_OPERATION, FileCapabilityBroker, RemoteFile
 
 
 # Dependencies used by tools must not live on the tool instance.  smolagents
@@ -405,7 +410,7 @@ class TimGetDocTool(CloudGetDocTool):
 
 class EnhancePromptTool(Tool):
     name = "enhance_self_prompt"
-    description = "BOT 自主增强自己的提示词准则（Prompt Self-Enhancement）。用于固化业务要求、规范或偏好，使该 BOT 在后续相似任务中表现更专业有效。"
+    description = "记录当前用户的长期业务要求与偏好。公共 BOT 中只保存为当前用户的个人记忆；私有 BOT 中增强专属行为准则。"
     inputs = {
         "instruction": {
             "type": "string",
@@ -427,13 +432,25 @@ class EnhancePromptTool(Tool):
         bot_manager = _get_tool_dep(self, "bot_manager")
         bot_id = _get_tool_dep(self, "bot_id")
         bot = bot_manager.get_bot(bot_id)
-        return not bot or bot.visibility != "public" or runtime_is_admin.get()
+        return bool(bot and bot_manager.can_edit_bot_definition(bot))
 
     def forward(self, instruction: str, reason: str = "") -> str:
-        if not self._can_edit_definition():
-            return "❌ 公共 BOT 的行为准则仅允许管理员修改"
         bot_manager = _get_tool_dep(self, "bot_manager")
         bot_id = _get_tool_dep(self, "bot_id")
+        bot = bot_manager.get_bot(bot_id)
+        if not bot or not bot_manager.can_access_bot(bot):
+            return "❌ 无权访问指定 BOT"
+        if bot.visibility == "public":
+            # Automatic learning from a conversation must never publish that
+            # user's preferences to all users, even when the caller is admin.
+            instruction = str(instruction or "").strip()
+            if not instruction:
+                return "❌ 行为偏好不能为空"
+            key = f"behavior_preference_{hashlib.sha256(instruction.encode('utf-8')).hexdigest()[:16]}"
+            item = bot_manager.save_memory(bot_id, key, instruction)
+            return f"✅ 已保存为当前用户的个人行为偏好：{item.content}"
+        if not self._can_edit_definition():
+            return "❌ 无权修改该 BOT 的行为准则"
         guideline = bot_manager.add_learned_guideline(bot_id, instruction, reason)
         if guideline:
             return f"✅ 提示词已成功自我增强！新准则 ID: {guideline.id}，内容: {guideline.instruction}"
@@ -575,11 +592,11 @@ class SaveSkillTool(Tool):
         bot_manager = _get_tool_dep(self, "bot_manager")
         bot_id = _get_tool_dep(self, "bot_id")
         bot = bot_manager.get_bot(bot_id)
-        return not bot or bot.visibility != "public" or runtime_is_admin.get()
+        return bool(bot and bot_manager.can_access_bot(bot))
 
     def forward(self, name: str, description: str, python_code: str, input_schema: dict | None = None) -> str:
         if not self._can_edit_definition():
-            return "❌ 公共 BOT 的技能仅允许管理员修改"
+            return "❌ 无权修改该 BOT 中的个人技能"
         if len(python_code.encode("utf-8")) > MAX_SKILL_CODE_BYTES:
             return "❌ 技能代码超过 64 KiB 限制"
         try:
@@ -588,7 +605,10 @@ class SaveSkillTool(Tool):
             return f"❌ 技能代码预检失败: {exc}"
         bot_manager = _get_tool_dep(self, "bot_manager")
         bot_id = _get_tool_dep(self, "bot_id")
-        skill = bot_manager.save_skill(bot_id, name, description, python_code, input_schema)
+        try:
+            skill = bot_manager.save_skill(bot_id, name, description, python_code, input_schema)
+        except ValueError as exc:
+            return f"❌ 技能保存失败: {exc}"
         return f"⚡ 技能 [{skill.name}] 已成功保存到当前 BOT 的专属技能库！后续可通过 run_skill('{skill.name}') 直接调用。"
 
 
@@ -624,6 +644,8 @@ def build_sandbox_scope(
     cloud_client: Any | None = None,
     tim_client: Any | None = None,
     extra_scope: dict[str, Any] | None = None,
+    *,
+    include_live_urls: bool = True,
 ) -> dict[str, Any]:
     """
     通用沙箱环境作用域构建工厂 (Sandbox Scope Factory)
@@ -636,9 +658,9 @@ def build_sandbox_scope(
         "cloud_call": caller_tool.forward,
         "search_apis": search_tool.forward if search_tool else None,
         "get_doc": doc_tool.forward if doc_tool else None,
-        "gen_live_push_url": generate_live_push_url,
-        "gen_live_play_url": generate_live_play_urls,
     }
+    if include_live_urls:
+        scope.update(gen_live_push_url=generate_live_push_url, gen_live_play_url=generate_live_play_urls)
 
     # Raw clients carry signing keys and UserSig generation.  They must never
     # cross into model code; cloud calls stay behind CloudCallTool's policy
@@ -650,6 +672,8 @@ def build_sandbox_scope(
         svc_id = svc.get("id")
         if not svc_id:
             continue
+        if not re.fullmatch(r"[a-z][a-z0-9_]{0,63}", svc_id) or f"{svc_id}_call" in scope:
+            raise ValueError(f"非法或冲突的云服务能力名: {svc_id}")
         scope[f"{svc_id}_call"] = (lambda s=svc_id: lambda action_or_path, payload=None: caller_tool.forward(action_or_path, payload or {}, service=s))()
 
     # 向后兼容老指令别名
@@ -661,15 +685,7 @@ def build_sandbox_scope(
     return scope
 
 
-_SKILL_ALLOWED_IMPORTS = frozenset({
-    "csv",
-    "datetime",
-    "json",
-    "math",
-    "random",
-    "re",
-    "time",
-})
+_SKILL_ALLOWED_IMPORTS = SKILL_IMPORTS
 _SKILL_BLOCKED_NAMES = frozenset({
     "__import__",
     "__builtins__",
@@ -683,7 +699,6 @@ _SKILL_BLOCKED_NAMES = frozenset({
     "help",
     "input",
     "locals",
-    "open",
     "setattr",
     "vars",
 })
@@ -706,15 +721,7 @@ _SKILL_RLIMIT_NPROC = 32
 MAX_SKILL_CODE_BYTES = 64 * 1024
 _MISSING = object()
 
-_SAFE_MODULE_ATTRS = {
-    "csv": {"reader", "writer", "DictReader", "DictWriter", "QUOTE_ALL", "QUOTE_MINIMAL"},
-    "datetime": {"datetime", "date", "time", "timedelta", "timezone"},
-    "json": {"dumps", "loads", "dump", "load", "JSONDecodeError"},
-    "math": {"ceil", "floor", "sqrt", "pi", "fabs", "isfinite", "isnan"},
-    "random": {"randint", "randrange", "choice", "choices", "sample", "shuffle", "random", "uniform"},
-    "re": {"compile", "match", "search", "sub", "findall", "split", "escape", "IGNORECASE"},
-    "time": {"time", "sleep", "strftime", "localtime", "gmtime"},
-}
+_SAFE_MODULE_ATTRS = SKILL_MODULE_ATTRIBUTES
 
 
 class _SafeModuleProxy:
@@ -780,11 +787,15 @@ def _skill_safe_builtins() -> dict:
     return {
         name: value
         for name, value in builtins.__dict__.items()
-        if name not in _SKILL_BLOCKED_NAMES and name != "__import__" and not name.startswith("_")
+        if name not in _SKILL_BLOCKED_NAMES and name not in {"__import__", "open"} and not name.startswith("_")
     }
 
 
 def _safe_rpc_value(value: Any) -> Any:
+    # JSON-facing skill results carry binary data explicitly; the internal RPC
+    # transport still keeps bytes intact for file/PDF capability calls.
+    if isinstance(value, (bytes, bytearray)):
+        return {"encoding": "base64", "data": base64.b64encode(value).decode("ascii")}
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
     if isinstance(value, (list, tuple)):
@@ -795,14 +806,11 @@ def _safe_rpc_value(value: Any) -> Any:
 
 
 def _rpc_send(conn, message: dict[str, Any]) -> None:
-    conn.send_bytes(json.dumps(_safe_rpc_value(message), ensure_ascii=False).encode("utf-8"))
+    conn.send_bytes(encode_message(message, 8 * 1024 * 1024))
 
 
 def _rpc_recv(conn) -> dict[str, Any]:
-    payload = json.loads(conn.recv_bytes(2 * 1024 * 1024).decode("utf-8"))
-    if not isinstance(payload, dict):
-        raise RuntimeError("技能 RPC 消息格式无效")
-    return payload
+    return decode_message(conn.recv_bytes(8 * 1024 * 1024), 8 * 1024 * 1024)
 
 
 def _skill_rpc_call(conn, name: str, args: tuple, kwargs: dict):
@@ -812,7 +820,10 @@ def _skill_rpc_call(conn, name: str, args: tuple, kwargs: dict):
         if response.get("kind") != "response":
             continue
         if response.get("ok"):
-            return response.get("value")
+            value = response.get("value")
+            if name == "open":
+                return RemoteFile(lambda *items: _skill_rpc_call(conn, FILE_OPERATION, items, {}), value)
+            return value
         raise RuntimeError(response.get("error", "技能 RPC 调用失败"))
 
 
@@ -862,12 +873,12 @@ _SkillCloudClientProxy.__name__ = "UniversalCloudClient"
 
 def _skill_dependency(name: str, scope: dict):
     if name in ("client", "cloud_client"):
-        return scope["cloud_client"]
+        return scope.get("cloud_client", _MISSING)
     if name == "tim_client":
-        return scope["tim_client"]
+        return scope.get("tim_client", _MISSING)
     if name in ("cloud_call", "tim_call"):
-        return scope[name]
-    if name in scope and name in {"args", "kwargs", "result", "gen_live_push_url", "gen_live_play_url"}:
+        return scope.get(name, _MISSING)
+    if name in scope and not name.startswith("_"):
         return scope[name]
     if name.endswith("_call") and name in scope:
         return scope[name]
@@ -904,7 +915,7 @@ def _invoke_skill_callable(execute, args: dict, scope: dict):
     return execute(*positional, **keyword)
 
 
-def _skill_worker_entry(conn, code: str, args: dict, service_names: list):
+def _skill_worker_entry(conn, code: str, args: dict, function_names: list, constants: dict, cloud_enabled: bool):
     """Execute a skill in a killable worker with only RPC-backed capabilities."""
     try:
         with suppress(Exception):
@@ -934,24 +945,16 @@ def _skill_worker_entry(conn, code: str, args: dict, service_names: list):
 
         safe_builtins = _skill_safe_builtins()
         safe_builtins["__import__"] = safe_import
-        tim_client = _SkillTimClientProxy(conn)
-        cloud_client = _SkillCloudClientProxy(conn)
         scope = {
             "__builtins__": safe_builtins,
             "args": args,
             "kwargs": args,
             "result": None,
-            "tim_client": tim_client,
-            "cloud_client": cloud_client,
-            "cloud_call": _skill_rpc_callable(conn, "cloud_call"),
-            "tim_call": _skill_rpc_callable(conn, "tim_call"),
-            "im_call": _skill_rpc_callable(conn, "im_call"),
+            **constants,
+            **{name: _skill_rpc_callable(conn, name) for name in function_names},
         }
-        from ..live_util import generate_live_play_urls, generate_live_push_url
-        scope["gen_live_push_url"] = generate_live_push_url
-        scope["gen_live_play_url"] = generate_live_play_urls
-        for service_name in service_names:
-            scope[f"{service_name}_call"] = _skill_rpc_callable(conn, f"service:{service_name}")
+        if cloud_enabled:
+            scope.update(tim_client=_SkillTimClientProxy(conn), cloud_client=_SkillCloudClientProxy(conn))
 
         import builtins as _builtins
         _builtins.exec(code, scope, scope)  # noqa: S102
@@ -993,7 +996,8 @@ class RunSkillTool(Tool):
         bot_manager: BotManager,
         tim_client: TimClient,
         cloud_client: Any | None = None,
-        approval_requester: Any | None = None
+        approval_requester: Any | None = None,
+        capability_snapshot: Any | None = None,
     ):
         super().__init__()
         from ..cloud_client import UniversalCloudClient
@@ -1005,12 +1009,30 @@ class RunSkillTool(Tool):
             tim_client=tim_client,
             cloud_client=cloud_client if cloud_client is not None else UniversalCloudClient(),
             approval_requester=approval_requester,
+            capability_snapshot=capability_snapshot,
         )
 
-    def _dispatch_skill_rpc(self, caller_tool: CloudCallTool, request: dict):
+    def _dispatch_skill_rpc(self, caller_tool: CloudCallTool, request: dict, *, scope=None, broker=None):
         name = request.get("name", "")
         args = request.get("args", ())
         kwargs = request.get("kwargs", {})
+        if not isinstance(args, (list, tuple)) or not isinstance(kwargs, dict):
+            raise ValueError("技能能力参数无效")
+        if scope is not None:
+            if name == FILE_OPERATION and broker is not None and "open" in scope:
+                return broker.call(*args, **kwargs)
+            function = scope.get(name)
+            if callable(function):
+                value = function(*args, **kwargs)
+                return broker.register(value) if name == "open" else value
+            if name not in {"tim_client.call", "tim_client.invoke"} or "cloud_call" not in scope:
+                raise RuntimeError(f"技能不允许调用未注册能力: {name}")
+        else:
+            from .capabilities import load_capability_snapshot
+            snapshot = _get_tool_dep(self, "capability_snapshot") or load_capability_snapshot(_get_tool_dep(self, "bot_manager"))
+            snapshot.validate_scope(_get_tool_dep(self, "bot_manager"))
+            if not snapshot.enabled("cloud", "skill"):
+                raise RuntimeError("云 API 能力已禁用")
         if name == "cloud_call":
             return caller_tool.forward(*args, **kwargs)
         if name in ("tim_call", "im_call"):
@@ -1031,20 +1053,40 @@ class RunSkillTool(Tool):
             return caller_tool.forward(action_or_path, payload or {}, service=service)
         raise RuntimeError(f"技能不允许调用未注册能力: {name}")
 
-    def _run_isolated(self, skill_code: str, args: dict, caller_tool: CloudCallTool) -> dict:
-        from ..registry import registry
+    def _run_isolated(self, skill_code: str, args: dict, caller_tool: CloudCallTool, capability_snapshot=None) -> dict:
+        from .capabilities import CapabilityContext, CapabilitySession
+        context = CapabilityContext(
+            _get_tool_dep(self, "bot_id"), _get_tool_dep(self, "bot_manager"),
+            _get_tool_dep(self, "tim_client"), cloud_client=_get_tool_dep(self, "cloud_client"),
+            approval_requester=_get_tool_dep(self, "approval_requester"),
+            kind="skill", snapshot=capability_snapshot or _get_tool_dep(self, "capability_snapshot"),
+        )
+        def bind_skill_tools(*_args, **_kwargs):
+            from .capabilities import build_capability_tools
+            return [caller_tool if tool.name == "cloud_call" else tool
+                    for tool in build_capability_tools(context)]
 
-        try:
-            registry.discover()
-            service_names = [item.get("id") for item in registry.list_services() if item.get("id")]
-        except Exception:
-            service_names = []
+        with CapabilitySession(context, tools_builder=bind_skill_tools,
+                               shared_files=_get_tool_dep(self, "generated_files")) as session:
+            broker = FileCapabilityBroker()
+            first_file = len(session.files)
+            try:
+                result = self._run_skill_process(skill_code, args, caller_tool, session, broker)
+                if result.get("success") and len(session.files) > first_file:
+                    result["files"] = list(session.files[first_file:])
+                return result
+            finally:
+                broker.close_all()
+
+    def _run_skill_process(self, skill_code, args, caller_tool, session, broker):
+        functions = [name for name, value in session.scope.items() if callable(value)]
+        constants = {name: value for name, value in session.scope.items() if not callable(value)}
 
         context = multiprocessing.get_context("spawn")
         parent_conn, child_conn = context.Pipe()
         process = context.Process(
             target=_skill_worker_entry,
-            args=(child_conn, skill_code, args, service_names),
+            args=(child_conn, skill_code, args, functions, constants, "cloud_call" in session.scope),
             daemon=True,
         )
         approval_elapsed = 0.0
@@ -1081,7 +1123,9 @@ class RunSkillTool(Tool):
                     message = _rpc_recv(parent_conn)
                     if message.get("kind") == "call":
                         try:
-                            value = self._dispatch_skill_rpc(caller_tool, message)
+                            from ..runtime_context import capability_cancellation
+                            with capability_cancellation(lambda: time.monotonic() >= deadline or not process.is_alive()):
+                                value = self._dispatch_skill_rpc(caller_tool, message, scope=session.scope, broker=broker)
                             _rpc_send(parent_conn, {"kind": "response", "ok": True, "value": value})
                         except Exception as exc:
                             _rpc_send(parent_conn, {"kind": "response", "ok": False, "error": str(exc)})
@@ -1124,7 +1168,7 @@ class RunSkillTool(Tool):
         if not result_message:
             return {"success": False, "error": "技能隔离进程异常退出"}
         if result_message.get("ok"):
-            return {"success": True, "result": result_message.get("value")}
+            return {"success": True, "result": _safe_rpc_value(result_message.get("value"))}
         return {"success": False, "error": f"执行技能失败: {result_message.get('error', '未知错误')}"}
 
     def forward(self, name: str, kwargs: Any | None = None) -> dict:
@@ -1132,6 +1176,14 @@ class RunSkillTool(Tool):
             return {"success": False, "error": "当前用户缺少 operator 权限，禁止通过 Agent 运行技能"}
         bot_manager = _get_tool_dep(self, "bot_manager")
         bot_id = _get_tool_dep(self, "bot_id")
+        from .capabilities import CapabilityPolicyError, load_capability_snapshot
+        try:
+            snapshot = _get_tool_dep(self, "capability_snapshot") or load_capability_snapshot(bot_manager)
+            snapshot.validate_scope(bot_manager)
+            if not snapshot.enabled("skills"):
+                return {"success": False, "error": "技能库能力已禁用"}
+        except CapabilityPolicyError as exc:
+            return {"success": False, "error": str(exc)}
         skill = bot_manager.get_skill(bot_id, name)
         if not skill:
             return {"error": f"未找到技能: {name}"}
@@ -1144,18 +1196,18 @@ class RunSkillTool(Tool):
                 ),
             }
 
-        args = kwargs
+        args = {} if kwargs is None else kwargs
         if isinstance(args, str):
             try:
                 args = json.loads(args.strip())
             except Exception:
                 try:
                     parsed = ast.literal_eval(args.strip())
-                    args = parsed if isinstance(parsed, dict) else {}
+                    args = parsed
                 except Exception:
-                    args = {}
+                    return {"success": False, "error": "技能参数必须是有效的 JSON 对象"}
         if not isinstance(args, dict):
-            args = args or {}
+            return {"success": False, "error": "技能参数必须是 JSON 对象"}
 
         try:
             _validate_skill_ast(skill.code)
@@ -1170,7 +1222,10 @@ class RunSkillTool(Tool):
             tim_client=_get_tool_dep(self, "tim_client"),
             cloud_client=_get_tool_dep(self, "cloud_client"),
         )
-        return self._run_isolated(skill.code, args, caller_tool)
+        try:
+            return self._run_isolated(skill.code, args, caller_tool, snapshot)
+        except (ValueError, RuntimeError) as exc:
+            return {"success": False, "error": f"技能能力初始化失败: {exc}"}
 
 
 class CreateBotTool(Tool):
@@ -1247,7 +1302,7 @@ class CreateBotTool(Tool):
                 description=target_desc,
                 base_prompt=target_prompt,
                 suggested_prompts=target_suggested,
-                owner_id=None if runtime_user_id.get() == "local" else runtime_user_id.get(),
+                owner_id=(None if runtime_user_id.get() == "local" and not runtime_auth_scope.get().issuer and not runtime_auth_scope.get().tenant_id else runtime_user_id.get()),
             )
         except BotIdConflict:
             return {
@@ -1426,6 +1481,8 @@ class CallAgentTool(Tool):
         caller_name = caller_bot.name if caller_bot else bot_id
 
         try:
+            snapshot = _get_tool_dep(self, "capability_snapshot")
+            snapshot_kwargs = {"capability_snapshot": snapshot} if snapshot is not None else {}
             result = engine.execute_subtask(
                 caller_bot_id=bot_id,
                 target_bot_id=target_bot.id,
@@ -1433,6 +1490,7 @@ class CallAgentTool(Tool):
                 call_chain=list(call_chain),
                 approval_requester=approval_requester,
                 orchestration_recorder=orchestration_recorder,
+                **snapshot_kwargs,
             )
             elapsed = round(time.time() - t0, 2)
             preview = result.strip()
@@ -1665,52 +1723,17 @@ def build_bot_tools(
     cloud_client: Any | None = None,
     orchestration_recorder: Any | None = None,
     include_knowledge_tool: bool = True,
+    *,
+    capability_snapshot=None,
+    capability_context: str = "agent",
 ) -> list[Tool]:
-    """为指定 BOT 组装能力工具集（涵盖云直播 API 3.0 与即时通信 IM REST API）"""
-    tools = [
-        CloudCallTool(
-            approval_requester=approval_requester,
-            bot_manager=bot_manager,
-            tim_client=tim_client,
-            cloud_client=cloud_client
-        ),
-        CloudSearchApisTool(),
-        CloudGetDocTool(),
-        TimCallTool(
-            tim_client,
-            approval_requester=approval_requester,
-            bot_manager=bot_manager,
-            cloud_client=cloud_client
-        ),
-        TimSearchApisTool(),
-        TimGetDocTool(),
-        EnhancePromptTool(bot_id, bot_manager),
-        SaveMemoryTool(bot_id, bot_manager),
-        RecallMemoryTool(bot_id, bot_manager),
-        DeleteMemoryTool(bot_id, bot_manager),
-        SaveSkillTool(bot_id, bot_manager),
-        ListSkillsTool(bot_id, bot_manager),
-        RunSkillTool(
-            bot_id,
-            bot_manager,
-            tim_client,
-            cloud_client=cloud_client,
-            approval_requester=approval_requester
-        ),
-        ListAgentsTool(bot_manager),
-        CallAgentTool(
-            bot_id,
-            bot_manager,
-            engine,
-            call_chain,
-            approval_requester,
-            orchestration_recorder,
-        ),
-        ReadFileTool(bot_id, bot_manager),
-    ]
-    if include_knowledge_tool:
-        tools.append(SearchKnowledgeTool(bot_id))
-    # 核心限制：仅内建全能助手 (default_assistant) 独享新建智能体的能力
-    if bot_id == "default_assistant":
-        tools.append(CreateBotTool(bot_manager))
-    return tools
+    """Compatibility entry point; registration and policy belong to the catalog."""
+    from .capabilities import CapabilityContext, build_capability_tools
+
+    return build_capability_tools(CapabilityContext(
+        bot_id, bot_manager, tim_client, cloud_client=cloud_client, engine=engine,
+        call_chain=call_chain, approval_requester=approval_requester,
+        orchestration_recorder=orchestration_recorder,
+        include_knowledge_tool=include_knowledge_tool,
+        kind=capability_context, snapshot=capability_snapshot,
+    ))

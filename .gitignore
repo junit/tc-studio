@@ -82,6 +82,10 @@ pnpm-debug.log*
 .ccg/
 artifacts/
 
+# Local generated reports and PDF preview scratch files
+/output/
+/tmp/pdfs/
+
 # OS generated files
 .DS_Store
 .DS_Store?

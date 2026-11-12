@@ -357,6 +357,17 @@ class AuthenticationMiddleware:
         if request.method == "OPTIONS" or not request.url.path.startswith("/api/"):
             await self.app(scope, receive, send)
             return
+
+        async def send_private(message: dict[str, Any]) -> None:
+            if message.get("type") == "http.response.start":
+                # The same public BOT URL returns different private state for
+                # each identity. Neither browsers nor shared proxies may cache it.
+                headers = [(key, value) for key, value in message.get("headers", [])
+                           if key.lower() != b"cache-control"]
+                headers.append((b"cache-control", b"no-store"))
+                headers.append((b"vary", b"Authorization"))
+                message = {**message, "headers": headers}
+            await send(message)
         try:
             user = authenticate_request(request)
         except HTTPException as exc:
@@ -365,7 +376,7 @@ class AuthenticationMiddleware:
                 status_code=exc.status_code,
                 headers=exc.headers,
             )
-            await response(scope, receive, send)
+            await response(scope, receive, send_private)
             return
 
         request.state.current_user = user
@@ -374,7 +385,7 @@ class AuthenticationMiddleware:
         admin_token = runtime_is_admin.set(user.is_admin)
         operator_token = runtime_is_operator.set(user.is_operator)
         try:
-            await self.app(scope, receive, send)
+            await self.app(scope, receive, send_private)
         finally:
             runtime_is_admin.reset(admin_token)
             runtime_is_operator.reset(operator_token)

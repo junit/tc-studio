@@ -862,8 +862,13 @@ def test_file_hub_and_regenerate_api(temp_bot_manager):
     uploads_dir = os.path.join(b_dir, "uploads")
     os.makedirs(uploads_dir, exist_ok=True)
     f1 = os.path.join(uploads_dir, "f_1001_report.xlsx")
-    with open(f1, "w") as f:
-        f.write("dummy-excel-data")
+    from openpyxl import Workbook
+
+    workbook = Workbook()
+    workbook.active.append(["流名", "帧率"])
+    workbook.active.append(["stream-a", 25])
+    workbook.save(f1)
+    workbook.close()
 
     with patch("apis.agent.bot_manager", temp_bot_manager):
         # 查询文件列表
@@ -1665,8 +1670,13 @@ def test_bot_file_rescue_and_listing(temp_bot_manager):
 
     # 1. 模拟在 uploads 目录下生成报表
     test_excel = os.path.join(uploads_dir, "用户留存分析.xlsx")
-    with open(test_excel, "wb") as f:
-        f.write(b"fake excel content")
+    from openpyxl import Workbook
+
+    workbook = Workbook()
+    workbook.active.append(["用户", "留存率"])
+    workbook.active.append(["张三", 0.8])
+    workbook.save(test_excel)
+    workbook.close()
 
     files = temp_bot_manager.list_bot_files("default_assistant")
     assert any(f["name"] == "用户留存分析.xlsx" for f in files)

@@ -239,15 +239,17 @@ def test_run_skill_approval_wait_does_not_consume_timeout(tmp_path, monkeypatch)
 
 
 def test_run_skill_worker_blocks_host_capabilities(tmp_path):
-    """技能 worker 只能使用受限能力，不能借 open/pathlib/reflection 访问宿主机。"""
+    """受限 open 可读工作区，不能借 open/pathlib/reflection 访问宿主文件。"""
     from core.agent.bot_manager import BotManager
 
     mgr = BotManager(data_dir=str(tmp_path / "data"))
     bot = mgr.create_bot("test_worker_boundary", "安全测试")
     runner = RunSkillTool(bot.id, mgr, TimClient())
 
+    outside = tmp_path / "outside-host.txt"
+    outside.write_text("PRIVATE_HOST_SENTINEL", encoding="utf-8")
     blocked_skills = {
-        "open_host": "def execute():\n    return open('/etc/hosts').read()",
+        "open_host": f"def execute():\n    return open({str(outside)!r}).read()",
         "pathlib_host": "import pathlib\ndef execute():\n    return pathlib.Path('/etc/hosts').read_text()",
         "reflection": "def execute():\n    return getattr(object, '__subclasses__')()",
     }
@@ -255,7 +257,11 @@ def test_run_skill_worker_blocks_host_capabilities(tmp_path):
         mgr.save_skill(bot.id, name, name, code)
         result = runner.forward(name)
         assert result["success"] is False
-        assert "安全拦截" in result["error"]
+        if name == "open_host":
+            assert "无法访问沙箱文件" in result["error"]
+            assert "PRIVATE_HOST_SENTINEL" not in str(result)
+        else:
+            assert "安全拦截" in result["error"]
 
     # Module internals and builtins loader must be rejected before execution.
     for name, code in {

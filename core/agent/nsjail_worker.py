@@ -14,7 +14,9 @@ import struct
 import sys
 from typing import Any
 
-from smolagents import local_python_executor
+from .executor_transport import decode_message, encode_message
+from .sandbox_policy import create_local_evaluator
+from .file_capabilities import FILE_OPERATION, RemoteFile
 
 
 MAX_IPC_BYTES = 8 * 1024 * 1024
@@ -69,9 +71,7 @@ def _state_snapshot(state: dict[str, Any]) -> dict[str, Any]:
 
 
 def _send(sock: socket.socket, message: dict[str, Any]) -> None:
-    payload = json.dumps(_wire_value(message, budget=[MAX_IPC_BYTES]), ensure_ascii=False, allow_nan=False).encode("utf-8")
-    if len(payload) > MAX_IPC_BYTES:
-        raise RuntimeError("nsjail worker IPC message exceeds limit")
+    payload = encode_message(message, MAX_IPC_BYTES)
     sock.sendall(struct.pack("!I", len(payload)) + payload)
 
 
@@ -80,10 +80,7 @@ def _recv(sock: socket.socket) -> dict[str, Any]:
     size = struct.unpack("!I", header)[0]
     if size > MAX_IPC_BYTES:
         raise RuntimeError("nsjail worker IPC message exceeds limit")
-    message = json.loads(_read_exact(sock, size).decode("utf-8"))
-    if not isinstance(message, dict):
-        raise RuntimeError("invalid nsjail worker IPC message")
-    return message
+    return decode_message(_read_exact(sock, size), MAX_IPC_BYTES)
 
 
 def _read_exact(sock: socket.socket, size: int) -> bytes:
@@ -151,13 +148,19 @@ class RpcFunctionProxy:
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         client = object.__getattribute__(self, "_client")
         name = object.__getattribute__(self, "__name__")
-        return client.call("function_call", name, args, kwargs)
+        result = client.call("function_call", name, args, kwargs)
+        if name == "open":
+            def file_operation(*values):
+                return client.call("function_call", FILE_OPERATION, values, {})
+
+            return RemoteFile(file_operation, result)
+        return result
 
 
 def run_worker(fd: int, authorized_imports: list[str]) -> None:
     sock = socket.socket(fileno=fd)
     client = _RpcClient(sock)
-    executor = local_python_executor.LocalPythonExecutor(
+    executor = create_local_evaluator(
         authorized_imports,
         timeout_seconds=None,
     )
@@ -194,7 +197,7 @@ def run_worker(fd: int, authorized_imports: list[str]) -> None:
                     sock,
                     {
                         "kind": "result",
-                        "output": result.output,
+                        "output": _wire_value(result.output),
                         "logs": result.logs,
                         "is_final_answer": result.is_final_answer,
                         "state": _state_snapshot(executor.state),

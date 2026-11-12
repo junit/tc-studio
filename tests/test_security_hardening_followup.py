@@ -92,23 +92,29 @@ def test_legacy_state_migration_api_is_admin_only_and_requires_target(tmp_path, 
         app.dependency_overrides.pop(agent_api.current_user, None)
 
 
-def test_public_bot_excludes_private_knowledge_from_tools_and_prompt(tmp_path, monkeypatch):
+def test_public_bot_prompt_contains_only_current_users_personal_knowledge(tmp_path, monkeypatch):
     from core.agent.engine import AgentEngine
     from core.agent.tools import build_bot_tools
     from core.agent.bot_manager import BotManager
     from core.tim_client import TimClient
+    from core.agent.rag_manager import RagManager
+    from core.runtime_context import runtime_user_id
+    import core.agent.bot_manager as bot_module
     import core.agent.rag_manager as rag_module
 
     manager = BotManager(data_dir=str(tmp_path / "data"))
     public_bot = manager.create_bot("public-kb", "Public KB", visibility="public")
     private_bot = manager.create_bot("private-kb", "Private KB", visibility="private", owner_id="alice")
 
-    fake_rag = SimpleNamespace(
-        list_documents=lambda _bot_id: [{"name": "internal-secret.md", "enabled": True}],
-        search=lambda *_args, **_kwargs: [{"doc_name": "internal-secret.md", "content": "secret"}],
-        format_chunks_for_prompt=lambda _chunks: "internal-secret.md secret",
-    )
-    monkeypatch.setattr(rag_module, "rag_manager", fake_rag)
+    rag = RagManager(data_root=manager.bots_dir)
+    monkeypatch.setattr(bot_module, "bot_manager", manager)
+    monkeypatch.setattr(rag_module, "rag_manager", rag)
+    token = runtime_user_id.set("alice")
+    try:
+        rag.add_document(public_bot.id, "alice-secret.md", b"alice personal secret")
+        rag.add_document(private_bot.id, "internal-secret.md", b"private bot secret")
+    finally:
+        runtime_user_id.reset(token)
 
     public_tools = build_bot_tools(
         public_bot.id,
@@ -125,25 +131,35 @@ def test_public_bot_excludes_private_knowledge_from_tools_and_prompt(tmp_path, m
     assert any(tool.name == "search_knowledge" for tool in private_tools)
 
     engine = AgentEngine(manager)
-    assert "internal-secret.md" not in engine.assemble_system_prompt(public_bot)
+    assert "alice-secret.md" not in engine.assemble_system_prompt(public_bot)
     assert "internal-secret.md" in engine.assemble_system_prompt(private_bot)
+    token = runtime_user_id.set("alice")
+    try:
+        assert "alice-secret.md" in engine.assemble_system_prompt(public_bot)
+        assert "internal-secret.md" not in engine.assemble_system_prompt(public_bot)
+    finally:
+        runtime_user_id.reset(token)
 
 
-def test_public_bot_knowledge_upload_is_blocked(tmp_path):
+def test_public_bot_personal_knowledge_upload_is_allowed(tmp_path, monkeypatch):
     from fastapi.testclient import TestClient
 
     from apis import agent as agent_api
     from app import app
     from core.agent.bot_manager import BotManager
+    from core.agent.rag_manager import RagManager
+    import core.agent.bot_manager as bot_module
 
     manager = BotManager(data_dir=str(tmp_path / "data"))
     bot = manager.create_bot("public-upload", "Public upload", visibility="public")
+    monkeypatch.setattr(bot_module, "bot_manager", manager)
+    monkeypatch.setattr(agent_api, "rag_manager", RagManager(data_root=manager.bots_dir))
     with patch.object(agent_api, "bot_manager", manager):
         response = TestClient(app).post(
             f"/api/agent/bots/{bot.id}/knowledge/upload",
             files={"file": ("secret.txt", b"private content", "text/plain")},
         )
-    assert response.status_code == 403
+    assert response.status_code == 200
 
 
 def test_batch_delay_rejects_nan_and_infinity():

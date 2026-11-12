@@ -288,6 +288,27 @@ CREATE TABLE IF NOT EXISTS app_settings (
 CREATE INDEX IF NOT EXISTS idx_app_settings_scope
     ON app_settings(issuer, tenant_id, updated_at);
 
+CREATE TABLE IF NOT EXISTS web_request_leases (
+    lease_id TEXT PRIMARY KEY,
+    issuer TEXT NOT NULL,
+    tenant_id TEXT NOT NULL,
+    owner_subject TEXT NOT NULL,
+    expires_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_web_leases_expiry ON web_request_leases(expires_at);
+CREATE INDEX IF NOT EXISTS idx_web_leases_scope ON web_request_leases(issuer, tenant_id);
+
+CREATE TABLE IF NOT EXISTS web_request_rates (
+    scope_type TEXT NOT NULL,
+    issuer TEXT NOT NULL,
+    tenant_id TEXT NOT NULL,
+    owner_subject TEXT NOT NULL,
+    window_start INTEGER NOT NULL,
+    request_count INTEGER NOT NULL,
+    PRIMARY KEY (scope_type, issuer, tenant_id, owner_subject, window_start)
+);
+CREATE INDEX IF NOT EXISTS idx_web_rates_window ON web_request_rates(window_start);
+
 CREATE TABLE IF NOT EXISTS audit_events (
     event_id TEXT PRIMARY KEY,
     issuer TEXT NOT NULL DEFAULT '',
@@ -882,6 +903,75 @@ def _sanitize_audit_metadata(value: Any, *, depth: int = 0) -> Any:
     if value is None or isinstance(value, (bool, int, float)):
         return value
     return str(value)[:512]
+
+
+class WebRequestLimitError(RuntimeError):
+    pass
+
+
+class SqliteWebRequestLimiter:
+    """Short transactions only; no connection/lock survives network I/O.
+
+    Limits apply to this database across service processes. The hard global
+    ceiling is independent of the tenant's editable policy.
+    """
+
+    def __init__(self, path: str):
+        self.path = database_path(path)
+
+    def acquire(self, *, issuer: str, tenant_id: str, subject: str, concurrency: int,
+                per_minute: int, lifetime: int) -> str:
+        import uuid
+
+        now = time.time()
+        window = int(now // 60) * 60
+        lease = uuid.uuid4().hex
+        connection = open_database(self.path)
+        try:
+            connection.execute("PRAGMA busy_timeout = 250")
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute("DELETE FROM web_request_leases WHERE expires_at <= ?", (now,))
+            connection.execute("DELETE FROM web_request_rates WHERE window_start < ?", (window - 60,))
+            total = connection.execute("SELECT COUNT(*) FROM web_request_leases").fetchone()[0]
+            scoped = connection.execute(
+                "SELECT COUNT(*) FROM web_request_leases WHERE issuer = ? AND tenant_id = ?",
+                (issuer, tenant_id),
+            ).fetchone()[0]
+            if total >= 8 or scoped >= concurrency:
+                raise WebRequestLimitError("网页读取并发已达上限，请稍后重试")
+            scopes = (("global", "", "", "", 240),
+                      ("tenant", issuer, tenant_id, "", per_minute),
+                      ("user", issuer, tenant_id, subject, per_minute))
+            for kind, iss, tenant, owner, limit in scopes:
+                key = (kind, iss, tenant, owner, window)
+                row = connection.execute(
+                    "SELECT request_count FROM web_request_rates WHERE scope_type = ? AND issuer = ? "
+                    "AND tenant_id = ? AND owner_subject = ? AND window_start = ?", key,
+                ).fetchone()
+                if row and row[0] >= limit:
+                    raise WebRequestLimitError("网页读取每分钟配额已用完，请稍后重试")
+                connection.execute(
+                    "INSERT INTO web_request_rates VALUES (?, ?, ?, ?, ?, 1) "
+                    "ON CONFLICT(scope_type, issuer, tenant_id, owner_subject, window_start) "
+                    "DO UPDATE SET request_count = request_count + 1", key,
+                )
+            connection.execute("INSERT INTO web_request_leases VALUES (?, ?, ?, ?, ?)",
+                               (lease, issuer, tenant_id, subject, now + lifetime + 5))
+            connection.commit()
+            return lease
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def release(self, lease: str) -> None:
+        connection = open_database(self.path)
+        try:
+            connection.execute("PRAGMA busy_timeout = 250")
+            connection.execute("DELETE FROM web_request_leases WHERE lease_id = ?", (lease,))
+        finally:
+            connection.close()
 
 
 class SqliteAppSettingsStore:
@@ -2068,6 +2158,7 @@ class SqliteBotMetadataStore:
             definition["tenant_id"] = str(row["tenant_id"] or "")
             definition["created_at"] = str(row["created_at"])
             definition["updated_at"] = str(row["updated_at"])
+            guideline_owner = "" if row["visibility"] != "public" and row["owner_subject"] == "local" and not row["issuer"] and not row["tenant_id"] else str(row["owner_subject"] or "")
             guideline_rows = connection.execute(
                 """
                 SELECT guideline_id, instruction, reason, created_at
@@ -2080,7 +2171,7 @@ class SqliteBotMetadataStore:
                     str(row["bot_id"]),
                     str(row["issuer"] or ""),
                     str(row["tenant_id"] or ""),
-                    str(row["owner_subject"] or ""),
+                    guideline_owner,
                 ),
             ).fetchall()
             definition["learned_guidelines"] = [
@@ -2107,6 +2198,7 @@ class SqliteBotMetadataStore:
                 definition["tenant_id"] = str(row["tenant_id"] or "")
                 definition["created_at"] = str(row["created_at"])
                 definition["updated_at"] = str(row["updated_at"])
+                guideline_owner = "" if row["visibility"] != "public" and row["owner_subject"] == "local" and not row["issuer"] and not row["tenant_id"] else str(row["owner_subject"] or "")
                 guideline_rows = connection.execute(
                     """
                     SELECT guideline_id, instruction, reason, created_at
@@ -2119,7 +2211,7 @@ class SqliteBotMetadataStore:
                         str(row["bot_id"]),
                         str(row["issuer"] or ""),
                         str(row["tenant_id"] or ""),
-                        str(row["owner_subject"] or ""),
+                        guideline_owner,
                     ),
                 ).fetchall()
                 definition["learned_guidelines"] = [
@@ -2128,6 +2220,33 @@ class SqliteBotMetadataStore:
                 ]
                 result.append(definition)
             return result
+        finally:
+            connection.close()
+
+    def increment_bot_stats(self, bot_id: str, metrics: Mapping[str, Any]) -> None:
+        """Atomically update counters without rewriting a stale BOT definition."""
+        connection = self._open()
+        try:
+            connection.execute(
+                """
+                UPDATE bots SET definition_json = json_set(
+                    definition_json, '$.stats', json_object(
+                        'total_runs', COALESCE(json_extract(definition_json, '$.stats.total_runs'), 0) + 1,
+                        'total_tokens', COALESCE(json_extract(definition_json, '$.stats.total_tokens'), 0) + ?,
+                        'total_code_executions', COALESCE(json_extract(definition_json, '$.stats.total_code_executions'), 0) + ?,
+                        'total_duration_seconds', ROUND(COALESCE(json_extract(definition_json, '$.stats.total_duration_seconds'), 0) + ?, 2)
+                    )
+                ), updated_at = ? WHERE bot_id = ?
+                """,
+                (
+                    max(0, int(metrics.get('total_tokens', 0))),
+                    max(0, int(metrics.get('code_executions', 0))),
+                    max(0.0, float(metrics.get('elapsed_seconds', 0.0))),
+                    datetime.now(timezone.utc).isoformat(),
+                    str(bot_id),
+                ),
+            )
+            connection.commit()
         finally:
             connection.close()
 
@@ -3185,7 +3304,7 @@ class SqliteBotMetadataStore:
                 WHERE bot_id = ? AND issuer = ? AND tenant_id = ?
                   AND owner_subject = ? AND deleted_at IS NULL
                   AND (stored_name = ? OR original_name = ?)
-                ORDER BY created_at DESC
+                ORDER BY CASE WHEN stored_name = ? THEN 0 ELSE 1 END, created_at DESC
                 LIMIT 1
                 """,
                 (
@@ -3193,6 +3312,7 @@ class SqliteBotMetadataStore:
                     issuer,
                     tenant_id,
                     owner_subject,
+                    str(filename),
                     str(filename),
                     str(filename),
                 ),
@@ -3210,21 +3330,23 @@ class SqliteBotMetadataStore:
         tenant_id: str = "",
         owner_subject: str = "",
     ) -> bool:
+        record = self.find_file(bot_id, filename, issuer=issuer, tenant_id=tenant_id, owner_subject=owner_subject)
+        if record is None:
+            return False
         connection = self._open()
         try:
             cursor = connection.execute(
                 """
                 DELETE FROM bot_files
                 WHERE bot_id = ? AND issuer = ? AND tenant_id = ?
-                  AND owner_subject = ? AND (stored_name = ? OR original_name = ?)
+                  AND owner_subject = ? AND file_id = ?
                 """,
                 (
                     str(bot_id),
                     issuer,
                     tenant_id,
                     owner_subject,
-                    str(filename),
-                    str(filename),
+                    record["file_id"],
                 ),
             )
             connection.commit()

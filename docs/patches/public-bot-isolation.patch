@@ -1,0 +1,1138 @@
+diff --git a/apis/agent.py b/apis/agent.py
+--- a/apis/agent.py
++++ b/apis/agent.py
+@@ -73,13 +73,12 @@
+         tenant_id=user.tenant_id,
+     ):
+         raise HTTPException(status_code=404, detail="BOT 不存在")
+-    if user.is_admin:
++    if bot_manager.can_edit_bot_definition(
++        bot, user_id=user.subject, is_admin=user.is_admin,
++        issuer=user.issuer, tenant_id=user.tenant_id,
++    ):
+         return user
+-    if bot.visibility == "public":
+-        raise HTTPException(status_code=403, detail="公共 BOT 定义仅管理员可修改")
+-    if bot.owner_id == user.subject:
+-        return user
+-    raise HTTPException(status_code=403, detail="无权修改该 BOT")
++    raise HTTPException(status_code=403, detail="无权修改该 BOT 定义；全局公共模板不属于租户管理员")
+
+
+ def require_scoped_admin(bot_id: str, user: CurrentUser = Depends(current_user)) -> CurrentUser:
+@@ -95,6 +94,11 @@
+         raise HTTPException(status_code=404, detail="BOT 不存在")
+     if not user.is_admin:
+         raise HTTPException(status_code=403, detail="需要管理员权限")
++    if not bot_manager.can_edit_bot_definition(
++        bot, user_id=user.subject, is_admin=True,
++        issuer=user.issuer, tenant_id=user.tenant_id,
++    ):
++        raise HTTPException(status_code=403, detail="无权管理其他认证范围的 BOT 定义与旧版状态")
+     return user
+
+
+@@ -802,8 +806,8 @@
+
+
+ class SaveSkillPayload(BaseModel):
+-    name: str = Field(..., description="技能名称")
+-    description: str = Field(..., description="功能描述")
++    name: str = Field(..., min_length=1, max_length=128, description="技能名称")
++    description: str = Field(..., max_length=MAX_BOT_DESCRIPTION_CHARS, description="功能描述")
+     python_code: str = Field(..., max_length=MAX_SKILL_CODE_BYTES, description="Python 代码")
+     input_schema: Optional[Dict[str, Any]] = Field(default_factory=dict, description="入参模式说明")
+
+@@ -1176,6 +1180,7 @@
+ def _format_bot_response(bot):
+     """格式化智能体返回体，包含记忆、技能与实时合成的系统提示词以及四层分级记忆运行期透视"""
+     data = bot.model_dump()
++    data["permissions"] = {"can_edit_definition": bot_manager.can_edit_bot_definition(bot)}
+     data["skills"] = [s.model_dump() for s in bot_manager.list_skills(bot.id)]
+     data["memories"] = [m.model_dump() for m in bot_manager.list_memories(bot.id)]
+     data["history_count"] = len(bot_manager.get_history(bot.id))
+@@ -1241,7 +1246,7 @@
+     return {"bot": _format_bot_response(bot)}
+
+
+-@router.post("/bots/{bot_id}/suggested-prompts", dependencies=[Depends(require_bot_access)])
++@router.post("/bots/{bot_id}/suggested-prompts", dependencies=[Depends(require_bot_definition_editor)])
+ def refresh_bot_suggested_prompts(bot_id: str):
+     """根据智能体人设，通过大模型动态重新生成推荐指令（换一换）"""
+     bot = bot_manager.get_bot(bot_id)
+@@ -2570,7 +2575,7 @@
+     return {"skills": [s.model_dump() for s in skills]}
+
+
+-@router.post("/bots/{bot_id}/skills", dependencies=[Depends(require_bot_definition_editor)])
++@router.post("/bots/{bot_id}/skills", dependencies=[Depends(require_bot_access)])
+ def create_or_save_skill(bot_id: str, payload: SaveSkillPayload):
+     """用户或前端一键将验证通过的脚本沉淀为专属技能"""
+     bot = bot_manager.get_bot(bot_id)
+@@ -2580,13 +2585,16 @@
+         _validate_skill_ast(payload.python_code)
+     except (SyntaxError, ValueError) as exc:
+         raise HTTPException(status_code=400, detail=f"技能代码预检失败: {exc}") from exc
+-    skill = bot_manager.save_skill(
+-        bot_id=bot_id,
+-        name=payload.name,
+-        description=payload.description,
+-        code=payload.python_code,
+-        input_schema=payload.input_schema
+-    )
++    try:
++        skill = bot_manager.save_skill(
++            bot_id=bot_id,
++            name=payload.name,
++            description=payload.description,
++            code=payload.python_code,
++            input_schema=payload.input_schema
++        )
++    except ValueError as exc:
++        raise HTTPException(status_code=422, detail=str(exc)) from exc
+     return {"success": True, "skill": skill.model_dump()}
+
+
+@@ -2640,7 +2648,7 @@
+     return res
+
+
+-@router.delete("/bots/{bot_id}/skills/{name}", dependencies=[Depends(require_bot_definition_editor)])
++@router.delete("/bots/{bot_id}/skills/{name}", dependencies=[Depends(require_bot_access)])
+ def delete_bot_skill(bot_id: str, name: str):
+     """删除技能"""
+     ok = bot_manager.delete_skill(bot_id, name)
+@@ -2754,8 +2762,8 @@
+
+ @router.get("/bots/{bot_id}/orchestrations", dependencies=[Depends(require_bot_access)])
+ def get_bot_orchestrations(bot_id: str, limit: int = Query(default=20, ge=1, le=100), user: CurrentUser = Depends(current_user)):
+-    """获取当前用户可见的协同调用流水；管理员可查看全局记录。"""
+-    all_events = bot_manager.get_orchestrations(limit=200, user_id=user.subject, is_admin=user.is_admin)
++    """获取当前用户的协同流水；管理员全范围观测使用单独的 topology 入口。"""
++    all_events = bot_manager.get_orchestrations(limit=200, user_id=user.subject, is_admin=False)
+     related = [e for e in all_events if e.get("caller_bot_id") == bot_id or e.get("target_bot_id") == bot_id]
+     return {"orchestrations": related[:limit]}
+
+diff --git a/core/agent/bot_manager.py b/core/agent/bot_manager.py
+--- a/core/agent/bot_manager.py
++++ b/core/agent/bot_manager.py
+@@ -20,7 +20,7 @@
+ except ImportError:  # pragma: no cover - Windows keeps the thread lock fallback
+     fcntl = None
+
+-from core.runtime_context import runtime_auth_scope, runtime_user_id, runtime_user_partition
++from core.runtime_context import runtime_auth_scope, runtime_is_admin, runtime_user_id, runtime_user_partition
+ from core.namespace import (
+     CANONICAL_DATABASE_FILENAME,
+     LEGACY_DATABASE_FILENAME,
+@@ -41,7 +41,6 @@
+ from .file_parser import format_file_size, get_file_category_and_type
+ from .models import (
+     BotConfig,
+-    BotStats,
+     LearnedGuideline,
+     LLMConfig,
+     MemoryItem,
+@@ -58,6 +57,8 @@
+ MAX_MEMORY_CONTENT_CHARS = 16_384
+ MAX_GUIDELINE_INSTRUCTION_CHARS = 16_384
+ MAX_GUIDELINE_REASON_CHARS = 4_096
++MAX_SKILLS_PER_SCOPE = 100
++MAX_SKILL_METADATA_BYTES = 32 * 1024
+
+
+ class BotIdConflict(ValueError):
+@@ -385,6 +386,45 @@
+         if bot.visibility == "public" and not bot_issuer and not bot_tenant:
+             return True
+         return bot_issuer == str(issuer or "") and bot_tenant == str(tenant_id or "")
++
++    @classmethod
++    def can_access_bot(
++        cls,
++        bot: BotConfig,
++        *,
++        user_id: str | None = None,
++        is_admin: bool | None = None,
++        issuer: str | None = None,
++        tenant_id: str | None = None,
++    ) -> bool:
++        scope = runtime_auth_scope.get()
++        subject = runtime_user_id.get() if user_id is None else user_id
++        admin = runtime_is_admin.get() if is_admin is None else is_admin
++        return cls.bot_scope_matches(
++            bot,
++            issuer=scope.issuer if issuer is None else issuer,
++            tenant_id=scope.tenant_id if tenant_id is None else tenant_id,
++        ) and (admin or bot.visibility == "public" or bot.owner_id == subject)
++
++    @classmethod
++    def can_edit_bot_definition(
++        cls,
++        bot: BotConfig,
++        *,
++        user_id: str | None = None,
++        is_admin: bool | None = None,
++        issuer: str | None = None,
++        tenant_id: str | None = None,
++    ) -> bool:
++        """Global templates can be used across tenants, but not edited by them."""
++        scope = runtime_auth_scope.get()
++        active_issuer = scope.issuer if issuer is None else issuer
++        active_tenant = scope.tenant_id if tenant_id is None else tenant_id
++        if str(bot.issuer or "") != str(active_issuer or "") or str(bot.tenant_id or "") != str(active_tenant or ""):
++            return False
++        subject = runtime_user_id.get() if user_id is None else user_id
++        admin = runtime_is_admin.get() if is_admin is None else is_admin
++        return admin or (bot.visibility != "public" and bot.owner_id == subject)
+
+     def _legacy_bot_data(self, bot_id: str) -> dict[str, Any] | None:
+         bot_json = os.path.join(self._bot_dir(bot_id), "bot.json")
+@@ -1028,6 +1068,7 @@
+             # 统一通过 SQLite 保存定义，旧 bot.json 只作为迁移源。
+             existing = self.get_bot(default_id)
+             if existing:
++                previous_definition = existing.model_dump()
+                 existing.visibility = "public"
+                 if (
+                     "166" in existing.description
+@@ -1038,7 +1079,8 @@
+                     existing.description = default_desc
+                     existing.base_prompt = default_prompt
+                     existing.suggested_prompts = default_prompts
+-                self.save_bot(existing)
++                if existing.model_dump() != previous_definition:
++                    self.save_bot(existing)
+
+         # 确保云直播专属巡检官内置就绪
+         live_id = "css_live_operator"
+@@ -1554,6 +1596,8 @@
+         bot = self.get_bot(bot_id)
+         if not bot:
+             return None
++        if not self.can_edit_bot_definition(bot):
++            raise PermissionError("无权修改该 BOT 的共享定义")
+         instruction = str(instruction or "").strip()
+         reason = str(reason or "").strip()
+         if not instruction:
+@@ -1582,6 +1626,8 @@
+         bot = self.get_bot(bot_id)
+         if not bot:
+             return False
++        if not self.can_edit_bot_definition(bot):
++            raise PermissionError("无权修改该 BOT 的共享定义")
+         return self.metadata_store.delete_guideline(
+             bot_id,
+             guideline_id,
+@@ -1685,14 +1731,82 @@
+     # 技能自沉淀系统 (Self-Evolving Skills)
+     # -------------------------------------------------------------
+     def _skills_dir(self, bot_id: str) -> str:
+-        s_dir = os.path.join(self._bot_dir(bot_id), "skills")
+-        os.makedirs(s_dir, exist_ok=True)  # pi-lens-ignore: unchecked-throwing-call-python -- persistence boundary
++        s_dir = os.path.join(self._runtime_dir(bot_id), "skills")
++        os.makedirs(s_dir, mode=0o700, exist_ok=True)
++        os.chmod(s_dir, 0o700)
+         return s_dir
++
++    def _skill_source_path(self, bot_id: str, metadata: dict[str, Any]) -> str:
++        """Resolve an immutable source within this identity's skill directory.
++
++        Old name.py files inside this same identity's directory may be imported
++        only with a matching recorded hash. Unowned root files are never a
++        source for authenticated public users, even with an old scoped SQL row.
++        """
++        directory = self._skills_dir(bot_id)
++        expected = str(metadata.get("code_sha256") or "").lower()
++        name = str(metadata.get("name") or "")
++        if not re.fullmatch(r"[a-zA-Z0-9_]{1,128}", name):
++            raise ValueError("技能名称不合法")
++        if not re.fullmatch(r"[0-9a-f]{64}", expected):
++            return os.path.join(directory, f"{name}.py")
++        destination = os.path.join(directory, f"s_{expected}.py")
++        if os.path.isfile(destination):
++            return destination
++        # This fallback is only reachable with an existing scoped SQL row.
++        old_path = os.path.join(directory, f"{name}.py")
++        if not os.path.islink(old_path) and os.path.isfile(old_path):
++            with open(old_path, "rb") as source:
++                code = source.read(64 * 1024 + 1)
++            if len(code) <= 64 * 1024 and hashlib.sha256(code).hexdigest() == expected:
++                self._write_skill_source(destination, code)
++        return destination
++
++    @staticmethod
++    def _write_skill_source(destination: str, code: bytes) -> None:
++        """Publish complete, content-addressed bytes before committing SQL."""
++        temporary = f"{destination}.{uuid.uuid4().hex}.tmp"
++        try:
++            fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
++            with os.fdopen(fd, "wb") as source:
++                source.write(code)
++                source.flush()
++                os.fsync(source.fileno())
++            try:
++                os.link(temporary, destination)
++                if os.name != "nt":
++                    directory_fd = os.open(os.path.dirname(destination), os.O_RDONLY)
++                    try:
++                        os.fsync(directory_fd)
++                    finally:
++                        os.close(directory_fd)
++            except FileExistsError:
++                if os.path.islink(destination):
++                    raise ValueError("技能源码不允许使用符号链接")
++                with open(destination, "rb") as existing:
++                    if existing.read(len(code) + 1) != code:
++                        raise ValueError("技能源码完整性校验失败")
++        finally:
++            with suppress(OSError):
++                os.remove(temporary)
++
++    def _prune_skill_source(self, bot_id: str, digest: str) -> None:
++        if not re.fullmatch(r"[0-9a-f]{64}", digest):
++            return
++        scope = self._metadata_scope(bot_id)
++        if any(item.get("code_sha256") == digest for item in self.metadata_store.list_skills(bot_id, **scope)):
++            return
++        with suppress(OSError):
++            os.remove(os.path.join(self._skills_dir(bot_id), f"s_{digest}.py"))
+
+     def list_skills(self, bot_id: str) -> list[SkillItem]:
+         bot = self.get_bot(bot_id)
+-        if not bot:
++        if not bot or not self.can_access_bot(bot):
+             return []
++        with self._history_storage_lock(bot_id):
++            return self._list_skills_unlocked(bot_id, bot)
++
++    def _list_skills_unlocked(self, bot_id: str, bot: BotConfig) -> list[SkillItem]:
+         scope = self._metadata_scope(bot_id, bot=bot)
+         rows = self.metadata_store.list_skills(bot_id, **scope)
+         if not rows:
+@@ -1706,11 +1820,15 @@
+                     with open(os.path.join(s_dir, file), "r", encoding="utf-8") as f:
+                         meta = json.load(f)
+                     name = str(meta.get("name") or "")
++                    if not re.fullmatch(r"[a-zA-Z0-9_]{1,128}", name):
++                        continue
+                     py_file = os.path.join(s_dir, f"{name}.py")
+                     code = ""
+-                    if os.path.isfile(py_file):
+-                        with open(py_file, "r", encoding="utf-8") as pf:
+-                            code = pf.read()
++                    if os.path.isfile(py_file) and not os.path.islink(py_file):
++                        with open(py_file, "r", encoding="utf-8", newline="") as pf:
++                            code = pf.read(64 * 1024 + 1)
++                    if len(code.encode("utf-8")) > 64 * 1024:
++                        continue
+                     self.metadata_store.upsert_skill(
+                         bot_id=bot_id,
+                         skill=meta,
+@@ -1718,21 +1836,22 @@
+                         code_sha256=hashlib.sha256(code.encode("utf-8")).hexdigest() if code else None,
+                         **scope,
+                     )
++                    os.remove(os.path.join(s_dir, file))
+                 except Exception:
+                     continue
+             rows = self.metadata_store.list_skills(bot_id, **scope)
+         result = []
+-        s_dir = self._skills_dir(bot_id)
+         for meta in rows:
+             try:
+-                name = str(meta.get("name") or "")
+-                py_file = os.path.join(s_dir, f"{name}.py")
++                py_file = self._skill_source_path(bot_id, meta)
+                 code = ""
+-                if os.path.isfile(py_file):
+-                    with open(py_file, "r", encoding="utf-8") as pf:
+-                        code = pf.read()
++                if os.path.isfile(py_file) and not os.path.islink(py_file):
++                    with open(py_file, "r", encoding="utf-8", newline="") as pf:
++                        code = pf.read(64 * 1024 + 1)
+                 meta["code"] = code
+                 self._populate_skill_integrity(meta, code, py_file)
++                if meta["integrity_status"] != "verified":
++                    meta["code"] = ""
+                 result.append(SkillItem(**meta))
+             except Exception:
+                 continue
+@@ -1745,7 +1864,7 @@
+         code_path: str,
+     ) -> None:
+         expected = str(metadata.get("code_sha256") or "").strip().lower()
+-        if not os.path.isfile(code_path):
++        if not os.path.isfile(code_path) or os.path.islink(code_path):
+             metadata["integrity_status"] = "missing"
+             metadata["integrity_error"] = "技能源码文件不存在"
+             return
+@@ -1763,34 +1882,34 @@
+
+     def get_skill(self, bot_id: str, name: str) -> SkillItem | None:
+         bot = self.get_bot(bot_id)
+-        if not bot:
++        if not bot or not self.can_access_bot(bot):
+             return None
+-        s_dir = self._skills_dir(bot_id)
+         clean_name = re.sub(r"[^a-zA-Z0-9_]", "_", name)
+-        py_file = os.path.join(s_dir, f"{clean_name}.py")
+-        scope = self._metadata_scope(bot_id, bot=bot)
+-        meta = self.metadata_store.get_skill(bot_id, clean_name, **scope)
+-        if meta is None:
+-            self.list_skills(bot_id)
+-            meta = self.metadata_store.get_skill(bot_id, clean_name, **scope)
+-        if meta is None:
+-            return None
+-        code = ""
+-        if os.path.exists(py_file):
+-            with open(py_file, "r", encoding="utf-8") as pf:  # pi-lens-ignore: unchecked-throwing-call-python -- persistence boundary
+-                code = pf.read()
+-        meta["code"] = code
+-        self._populate_skill_integrity(meta, code, py_file)
+-        return SkillItem(**meta)
++        return next((skill for skill in self.list_skills(bot_id) if skill.name == clean_name), None)
+
+     def save_skill(self, bot_id: str, name: str, description: str, code: str, input_schema: dict | None = None) -> SkillItem:
+-        with self._lock:
++        with self._history_storage_lock(bot_id), self._lock:
+             bot = self.get_bot(bot_id)
+             if not bot:
+                 raise ValueError("BOT 不存在")
++            if not self.can_access_bot(bot):
++                raise PermissionError("无权访问该 BOT 的技能")
+             s_dir = self._skills_dir(bot_id)
+             clean_name = re.sub(r"[^a-zA-Z0-9_]", "_", name)
+-            py_file = os.path.join(s_dir, f"{clean_name}.py")
++            if not re.fullmatch(r"[a-zA-Z0-9_]{1,128}", clean_name):
++                raise ValueError("技能名称长度必须为 1 到 128 个字符")
++            code_bytes = code.encode("utf-8")
++            if len(code_bytes) > 64 * 1024:
++                raise ValueError("技能代码超过 64 KiB 限制")
++            digest = hashlib.sha256(code_bytes).hexdigest()
++            py_file = os.path.join(s_dir, f"s_{digest}.py")
++            scope = self._metadata_scope(bot_id, bot=bot)
++            previous = self.metadata_store.get_skill(bot_id, clean_name, **scope)
++            if previous is None and len(self.metadata_store.list_skills(bot_id, **scope)) >= MAX_SKILLS_PER_SCOPE:
++                raise ValueError(f"每个 BOT 的个人技能最多 {MAX_SKILLS_PER_SCOPE} 项，请先删除不再使用的技能")
++            metadata = {"description": description, "input_schema": input_schema or {}}
++            if len(json.dumps(metadata, ensure_ascii=False).encode("utf-8")) > MAX_SKILL_METADATA_BYTES:
++                raise ValueError("技能描述和入参定义不能超过 32 KiB")
+
+             skill = SkillItem(
+                 name=clean_name,
+@@ -1800,15 +1919,8 @@
+                 created_at=now_iso(),
+                 integrity_status="verified",
+             )
+-            temp_path = f"{py_file}.{os.getpid()}.{threading.get_ident()}.tmp"
++            self._write_skill_source(py_file, code_bytes)
+             try:
+-                fd = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+-                with os.fdopen(fd, "w", encoding="utf-8") as f:  # pi-lens-ignore: unchecked-throwing-call-python -- persistence boundary
+-                    f.write(code)
+-                    f.flush()
+-                    os.fsync(f.fileno())
+-                os.chmod(temp_path, 0o600)
+-                os.replace(temp_path, py_file)
+                 self.metadata_store.upsert_skill(
+                     bot_id=bot_id,
+                     skill={
+@@ -1817,34 +1929,39 @@
+                         "input_schema": skill.input_schema,
+                         "created_at": skill.created_at,
+                     },
+-                    code_uri=f"local://data/bots/{bot_id}/skills/{clean_name}.py",
+-                    code_sha256=hashlib.sha256(code.encode("utf-8")).hexdigest(),
+-                    **self._metadata_scope(bot_id, bot=bot),
++                    code_uri=f"local://{os.path.relpath(py_file, self.data_dir).replace(os.sep, '/')}",
++                    code_sha256=digest,
++                    **scope,
+                 )
+             except Exception:
+-                with suppress(OSError):
+-                    os.remove(temp_path)
++                with suppress(Exception):
++                    self._prune_skill_source(bot_id, digest)
+                 raise
++            if previous:
++                self._prune_skill_source(bot_id, str(previous.get("code_sha256") or ""))
+             return skill
+
+     def delete_skill(self, bot_id: str, name: str) -> bool:
+-        with self._lock:
++        with self._history_storage_lock(bot_id), self._lock:
+             bot = self.get_bot(bot_id)
+-            if not bot:
++            if not bot or not self.can_access_bot(bot):
+                 return False
+             s_dir = self._skills_dir(bot_id)
+             clean_name = re.sub(r"[^a-zA-Z0-9_]", "_", name)
+-            py_file = os.path.join(s_dir, f"{clean_name}.py")
++            existing = self.get_skill(bot_id, clean_name)
++            if existing is None:
++                return False
++            scope = self._metadata_scope(bot_id, bot=bot)
++            metadata = self.metadata_store.get_skill(bot_id, clean_name, **scope)
+             removed = self.metadata_store.delete_skill(
+                 bot_id,
+                 clean_name,
+-                **self._metadata_scope(bot_id, bot=bot),
++                **scope,
+             )
+             with suppress(OSError):
+                 os.remove(os.path.join(s_dir, f"{clean_name}.json"))
+-            if os.path.exists(py_file):
+-                os.remove(py_file)  # pi-lens-ignore: unchecked-throwing-call-python -- persistence boundary
+-                removed = True
++            if removed and metadata:
++                self._prune_skill_source(bot_id, str(metadata.get("code_sha256") or ""))
+             return removed
+
+     # -------------------------------------------------------------
+@@ -2050,17 +2167,7 @@
+     # -------------------------------------------------------------
+     def record_run_stats(self, bot_id: str, metrics: dict[str, Any]):
+         """记录单次对话运行产生的消耗与耗时，持久化累计指标"""
+-        with self._lock:
+-            bot = self.get_bot(bot_id)
+-            if not bot:
+-                return
+-            if not hasattr(bot, "stats") or bot.stats is None:
+-                bot.stats = BotStats()
+-            bot.stats.total_runs += 1
+-            bot.stats.total_tokens += int(metrics.get("total_tokens", 0))
+-            bot.stats.total_code_executions += int(metrics.get("code_executions", 0))
+-            bot.stats.total_duration_seconds += round(float(metrics.get("elapsed_seconds", 0.0)), 2)
+-            self.save_bot(bot)
++        self.metadata_store.increment_bot_stats(bot_id, metrics)
+
+     # -------------------------------------------------------------
+     # 消息回溯、重新生成与历史截断
+diff --git a/core/agent/tools.py b/core/agent/tools.py
+--- a/core/agent/tools.py
++++ b/core/agent/tools.py
+@@ -6,6 +6,7 @@
+
+ import ast
+ import asyncio
++import hashlib
+ import inspect
+ import json
+ import multiprocessing
+@@ -405,7 +406,7 @@
+
+ class EnhancePromptTool(Tool):
+     name = "enhance_self_prompt"
+-    description = "BOT 自主增强自己的提示词准则（Prompt Self-Enhancement）。用于固化业务要求、规范或偏好，使该 BOT 在后续相似任务中表现更专业有效。"
++    description = "记录当前用户的长期业务要求与偏好。公共 BOT 中只保存为当前用户的个人记忆；私有 BOT 中增强专属行为准则。"
+     inputs = {
+         "instruction": {
+             "type": "string",
+@@ -427,13 +428,25 @@
+         bot_manager = _get_tool_dep(self, "bot_manager")
+         bot_id = _get_tool_dep(self, "bot_id")
+         bot = bot_manager.get_bot(bot_id)
+-        return not bot or bot.visibility != "public" or runtime_is_admin.get()
++        return bool(bot and bot_manager.can_edit_bot_definition(bot))
+
+     def forward(self, instruction: str, reason: str = "") -> str:
+-        if not self._can_edit_definition():
+-            return "❌ 公共 BOT 的行为准则仅允许管理员修改"
+         bot_manager = _get_tool_dep(self, "bot_manager")
+         bot_id = _get_tool_dep(self, "bot_id")
++        bot = bot_manager.get_bot(bot_id)
++        if not bot or not bot_manager.can_access_bot(bot):
++            return "❌ 无权访问指定 BOT"
++        if bot.visibility == "public":
++            # Automatic learning from a conversation must never publish that
++            # user's preferences to all users, even when the caller is admin.
++            instruction = str(instruction or "").strip()
++            if not instruction:
++                return "❌ 行为偏好不能为空"
++            key = f"behavior_preference_{hashlib.sha256(instruction.encode('utf-8')).hexdigest()[:16]}"
++            item = bot_manager.save_memory(bot_id, key, instruction)
++            return f"✅ 已保存为当前用户的个人行为偏好：{item.content}"
++        if not self._can_edit_definition():
++            return "❌ 无权修改该 BOT 的行为准则"
+         guideline = bot_manager.add_learned_guideline(bot_id, instruction, reason)
+         if guideline:
+             return f"✅ 提示词已成功自我增强！新准则 ID: {guideline.id}，内容: {guideline.instruction}"
+@@ -575,11 +588,11 @@
+         bot_manager = _get_tool_dep(self, "bot_manager")
+         bot_id = _get_tool_dep(self, "bot_id")
+         bot = bot_manager.get_bot(bot_id)
+-        return not bot or bot.visibility != "public" or runtime_is_admin.get()
++        return bool(bot and bot_manager.can_access_bot(bot))
+
+     def forward(self, name: str, description: str, python_code: str, input_schema: dict | None = None) -> str:
+         if not self._can_edit_definition():
+-            return "❌ 公共 BOT 的技能仅允许管理员修改"
++            return "❌ 无权修改该 BOT 中的个人技能"
+         if len(python_code.encode("utf-8")) > MAX_SKILL_CODE_BYTES:
+             return "❌ 技能代码超过 64 KiB 限制"
+         try:
+@@ -588,7 +601,10 @@
+             return f"❌ 技能代码预检失败: {exc}"
+         bot_manager = _get_tool_dep(self, "bot_manager")
+         bot_id = _get_tool_dep(self, "bot_id")
+-        skill = bot_manager.save_skill(bot_id, name, description, python_code, input_schema)
++        try:
++            skill = bot_manager.save_skill(bot_id, name, description, python_code, input_schema)
++        except ValueError as exc:
++            return f"❌ 技能保存失败: {exc}"
+         return f"⚡ 技能 [{skill.name}] 已成功保存到当前 BOT 的专属技能库！后续可通过 run_skill('{skill.name}') 直接调用。"
+
+
+@@ -1247,7 +1263,7 @@
+                 description=target_desc,
+                 base_prompt=target_prompt,
+                 suggested_prompts=target_suggested,
+-                owner_id=None if runtime_user_id.get() == "local" else runtime_user_id.get(),
++                owner_id=(None if runtime_user_id.get() == "local" and not runtime_auth_scope.get().issuer and not runtime_auth_scope.get().tenant_id else runtime_user_id.get()),
+             )
+         except BotIdConflict:
+             return {
+diff --git a/core/agent/engine.py b/core/agent/engine.py
+--- a/core/agent/engine.py
++++ b/core/agent/engine.py
+@@ -2184,7 +2184,7 @@
+             "   - **绝对禁止**在给用户的回复中询问“是否需要沉淀为技能”、“是否记录为记忆”等确认语或提示框。\n"
+             "   - 用户无需分心做任何维护决策，由你在解决问题和对话过程中自主决策、自主进化。\n"
+             "2. **自主沉淀技能 (save_skill)**：当你编写并成功执行了一个具备高复用价值的复杂业务流（多步 API 串联、批量数据清洗与操作），请直接自主调用 `save_skill` 工具将其保存到技能库，供日后直接调用。\n"
+-            "3. **自主自我增强提示词 (enhance_self_prompt)**：当用户在交流中表达了长期习惯、操作偏好、默认规则或约束（例如“禁言默认1小时”、“处理群消息前先打印日志”），请在思考或执行时自主调用 `enhance_self_prompt` 工具将其固化为行为准则，无需向用户索要确认。\n"
++            "3. **自主记录行为偏好 (enhance_self_prompt)**：当用户表达长期习惯、操作偏好、默认规则或约束时，调用该工具记录。公共 BOT 中只保存为当前用户的个人记忆，管理员对话也不例外；共享人设和共享准则只能通过明确的定义管理操作修改。\n"
+             "4. **自主事实记忆记录 (save_memory)**：当用户提及了关键实体标识（群 ID、特定管理员、环境配置、常用关键词等），请自主调用 `save_memory` 工具将其存入长期记忆。\n"
+             "5. **回复精炼专注**：给用户的最终回答只需清晰告知任务执行结果或解答用户的问题，无需赘述你私下沉淀了什么技能或准则，保持极简专业。\n"
+         )
+@@ -3114,6 +3114,7 @@
+                     all_history=self.manager.get_history(bot_id, limit=500),
+                     saved_state=self._get_sandbox(self._sandbox_key(bot_id)),
+                     max_context_turns=effective_context_turns,
++                    manager=self.manager,
+                 )
+             except Exception as mex:
+                 logger.warning("Memory manager on_turn_completed error: %s", str(mex))
+diff --git a/core/auth.py b/core/auth.py
+--- a/core/auth.py
++++ b/core/auth.py
+@@ -357,6 +357,17 @@
+         if request.method == "OPTIONS" or not request.url.path.startswith("/api/"):
+             await self.app(scope, receive, send)
+             return
++
++        async def send_private(message: dict[str, Any]) -> None:
++            if message.get("type") == "http.response.start":
++                # The same public BOT URL returns different private state for
++                # each identity. Neither browsers nor shared proxies may cache it.
++                headers = [(key, value) for key, value in message.get("headers", [])
++                           if key.lower() != b"cache-control"]
++                headers.append((b"cache-control", b"no-store"))
++                headers.append((b"vary", b"Authorization"))
++                message = {**message, "headers": headers}
++            await send(message)
+         try:
+             user = authenticate_request(request)
+         except HTTPException as exc:
+@@ -365,7 +376,7 @@
+                 status_code=exc.status_code,
+                 headers=exc.headers,
+             )
+-            await response(scope, receive, send)
++            await response(scope, receive, send_private)
+             return
+
+         request.state.current_user = user
+@@ -374,7 +385,7 @@
+         admin_token = runtime_is_admin.set(user.is_admin)
+         operator_token = runtime_is_operator.set(user.is_operator)
+         try:
+-            await self.app(scope, receive, send)
++            await self.app(scope, receive, send_private)
+         finally:
+             runtime_is_admin.reset(admin_token)
+             runtime_is_operator.reset(operator_token)
+diff --git a/core/persistence.py b/core/persistence.py
+--- a/core/persistence.py
++++ b/core/persistence.py
+@@ -2130,6 +2130,33 @@
+                 ]
+                 result.append(definition)
+             return result
++        finally:
++            connection.close()
++
++    def increment_bot_stats(self, bot_id: str, metrics: Mapping[str, Any]) -> None:
++        """Atomically update counters without rewriting a stale BOT definition."""
++        connection = self._open()
++        try:
++            connection.execute(
++                """
++                UPDATE bots SET definition_json = json_set(
++                    definition_json, '$.stats', json_object(
++                        'total_runs', COALESCE(json_extract(definition_json, '$.stats.total_runs'), 0) + 1,
++                        'total_tokens', COALESCE(json_extract(definition_json, '$.stats.total_tokens'), 0) + ?,
++                        'total_code_executions', COALESCE(json_extract(definition_json, '$.stats.total_code_executions'), 0) + ?,
++                        'total_duration_seconds', ROUND(COALESCE(json_extract(definition_json, '$.stats.total_duration_seconds'), 0) + ?, 2)
++                    )
++                ), updated_at = ? WHERE bot_id = ?
++                """,
++                (
++                    max(0, int(metrics.get('total_tokens', 0))),
++                    max(0, int(metrics.get('code_executions', 0))),
++                    max(0.0, float(metrics.get('elapsed_seconds', 0.0))),
++                    datetime.now(timezone.utc).isoformat(),
++                    str(bot_id),
++                ),
++            )
++            connection.commit()
+         finally:
+             connection.close()
+
+diff --git a/tests/test_public_bot_isolation_audit.py b/tests/test_public_bot_isolation_audit.py
+--- /dev/null
++++ b/tests/test_public_bot_isolation_audit.py
+@@ -0,0 +1,428 @@
++"""End-to-end resource boundaries for shared BOT definitions and personal state."""
++
++from contextlib import contextmanager
++import json
++from pathlib import Path
++from types import SimpleNamespace
++
++from fastapi.testclient import TestClient
++import pytest
++
++from core.agent.bot_manager import BotManager
++from core.agent.engine import AgentEngine
++from core.agent.rag_manager import RagManager
++from core.agent.tools import EnhancePromptTool, SaveSkillTool
++from core.auth import CurrentUser
++from core.runtime_context import (
++    runtime_auth_scope, runtime_is_admin, runtime_is_operator, runtime_user_id,
++)
++
++
++def identity(subject, issuer='https://issuer-a', tenant='tenant-a', *, admin=False):
++    return CurrentUser(subject, frozenset({'admin', 'operator'} if admin else {'operator'}),
++                       claims={'iss': issuer, 'tenant_id': tenant})
++
++
++@contextmanager
++def acting_as(user):
++    scope = runtime_auth_scope.set(user.auth_scope)
++    subject = runtime_user_id.set(user.subject)
++    admin = runtime_is_admin.set(user.is_admin)
++    operator = runtime_is_operator.set(user.is_operator)
++    try:
++        yield
++    finally:
++        runtime_is_operator.reset(operator)
++        runtime_is_admin.reset(admin)
++        runtime_user_id.reset(subject)
++        runtime_auth_scope.reset(scope)
++
++
++@pytest.fixture
++def resources(tmp_path, monkeypatch):
++    import app as app_module
++    import apis.agent as routes
++    import core.auth as auth
++    import core.agent.bot_manager as bot_module
++    import core.agent.rag_manager as rag_module
++
++    manager = BotManager(data_dir=str(tmp_path / 'data'))
++    engine = AgentEngine(manager)
++    rag = RagManager(data_root=manager.bots_dir)
++    monkeypatch.setattr(bot_module, 'bot_manager', manager)
++    monkeypatch.setattr(rag_module, 'rag_manager', rag)
++    monkeypatch.setattr(routes, 'bot_manager', manager)
++    monkeypatch.setattr(routes, 'agent_engine', engine)
++    monkeypatch.setattr(routes, 'rag_manager', rag)
++    state = SimpleNamespace(user=identity('alice'))
++    monkeypatch.setattr(auth, 'authenticate_request', lambda _request: state.user)
++    return manager, engine, rag, TestClient(app_module.app), state
++
++
++def test_public_skill_source_and_deletion_are_user_partitioned(resources):
++    manager, _, _, _, _ = resources
++    alice, bob = identity('alice', admin=True), identity('bob', admin=True)
++    with acting_as(alice):
++        manager.save_skill('default_assistant', 'diagnose', 'alice private workflow', "result = 'alice secret'")
++        alice_dir = manager._skills_dir('default_assistant')
++    with acting_as(bob):
++        manager.save_skill('default_assistant', 'diagnose', 'bob private workflow', "result = 'bob secret'")
++        bob_dir = manager._skills_dir('default_assistant')
++    with acting_as(alice):
++        skill = manager.get_skill('default_assistant', 'diagnose')
++        assert skill.code == "result = 'alice secret'"
++        assert skill.integrity_status == 'verified'
++    assert alice_dir != bob_dir
++    with acting_as(bob):
++        assert manager.delete_skill('default_assistant', 'diagnose')
++    with acting_as(alice):
++        assert manager.get_skill('default_assistant', 'diagnose').integrity_status == 'verified'
++
++
++def test_signed_in_reader_does_not_import_quarantined_public_skills(resources):
++    manager, _, _, client, _ = resources
++    root = Path(manager._bot_dir('default_assistant')) / 'skills'
++    root.mkdir(exist_ok=True)
++    (root / 'old_private.json').write_text(json.dumps({'name': 'old_private', 'description': 'pre-auth private data'}))
++    (root / 'old_private.py').write_text("result = 'PRE_AUTH_PRIVATE_SOURCE'")
++    response = client.get('/api/agent/bots/default_assistant/skills')
++    assert response.status_code == 200
++    assert response.json()['skills'] == []
++    assert client.get('/api/agent/bots/default_assistant/skills/old_private').status_code == 404
++    assert (root / 'old_private.py').is_file()
++
++
++def test_old_scoped_skill_row_cannot_launder_shared_root_source(resources):
++    import hashlib
++
++    manager, _, _, client, state = resources
++    code = "result = 'QUARANTINED_ROOT_SOURCE'"
++    root = Path(manager._bot_dir('default_assistant')) / 'skills'
++    (root / 'legacy.py').write_text(code)
++    with acting_as(state.user):
++        manager.metadata_store.upsert_skill(
++            bot_id='default_assistant', skill={'name': 'legacy', 'description': 'legacy metadata'},
++            code_uri=f'local://{root}/legacy.py', code_sha256=hashlib.sha256(code.encode()).hexdigest(),
++            **manager._metadata_scope('default_assistant'),
++        )
++    skill = client.get('/api/agent/bots/default_assistant/skills/legacy').json()['skill']
++    assert skill['integrity_status'] == 'missing'
++    assert skill['code'] == ''
++    assert client.delete('/api/agent/bots/default_assistant/skills/legacy').json()['success']
++    assert (root / 'legacy.py').read_text() == code
++
++
++def test_public_skill_crud_is_personal_and_ordinary_users_can_save(resources):
++    manager, _, _, client, state = resources
++    response = client.post('/api/agent/bots/default_assistant/skills', json={
++        'name': 'personal', 'description': 'alice only', 'python_code': "result = 'ALICE_ONLY'", 'input_schema': {},
++    })
++    assert response.status_code == 200
++    for other in (identity('bob'), identity('alice', issuer='https://issuer-b'),
++                  identity('alice', tenant='tenant-b'), identity('local', admin=True)):
++        state.user = other
++        assert client.get('/api/agent/bots/default_assistant/skills').json()['skills'] == []
++        assert client.get('/api/agent/bots/default_assistant/skills/personal').status_code == 404
++        assert client.delete('/api/agent/bots/default_assistant/skills/personal').json()['success'] is False
++    state.user = identity('alice')
++    assert client.get('/api/agent/bots/default_assistant/skills/personal').json()['skill']['code'] == "result = 'ALICE_ONLY'"
++    assert client.delete('/api/agent/bots/default_assistant/skills/personal').json()['success']
++    with acting_as(state.user):
++        assert manager.list_skills('default_assistant') == []
++
++
++def test_personal_skill_quota_and_metadata_limits_return_422_without_writing(resources, monkeypatch):
++    import core.agent.bot_manager as module
++
++    manager, _, _, client, state = resources
++    monkeypatch.setattr(module, 'MAX_SKILLS_PER_SCOPE', 1)
++    def save(name, **extra):
++        return client.post('/api/agent/bots/default_assistant/skills', json={
++            'name': name, 'description': 'personal', 'python_code': 'result = 1', **extra,
++        })
++    assert save('first').status_code == 200
++    assert save('second').status_code == 422
++    assert save('first', python_code='result = 2').status_code == 200
++    assert save('first', input_schema={'oversized': 'x' * 32768}).status_code == 422
++    state.user = identity('bob')
++    assert save('second').status_code == 200
++    with acting_as(identity('alice')):
++        assert [item.name for item in manager.list_skills('default_assistant')] == ['first']
++        assert manager.get_skill('default_assistant', 'first').code == 'result = 2'
++
++
++def test_authenticated_subject_local_creates_private_bot_owned_by_local(resources):
++    from core.agent.tools import CreateBotTool
++
++    manager, _, _, client, state = resources
++    state.user = identity('local')
++    with acting_as(state.user):
++        created = CreateBotTool(manager).forward('authenticated local private bot', 'synthetic goal')
++    assert created['success']
++    bot_id = created['bot']['id']
++    bot = manager.get_bot(bot_id)
++    assert bot.owner_id == 'local' and bot.issuer == state.user.issuer
++    assert client.get(f'/api/agent/bots/{bot_id}').status_code == 200
++
++
++def test_tenant_admin_cannot_edit_global_public_definitions_or_claim_legacy_state(resources):
++    manager, _, _, client, state = resources
++    state.user = identity('tenant-admin', admin=True)
++    for method, url, body in (
++        ('put', '/api/agent/bots/css_live_operator', {'base_prompt': 'tenant A controls all tenants'}),
++        ('post', '/api/agent/bots/default_assistant/guidelines', {'instruction': 'global injection', 'reason': 'test'}),
++        ('post', '/api/agent/bots/default_assistant/suggested-prompts', {}),
++        ('post', '/api/agent/bots/default_assistant/legacy-state/migrate', {'target_user_id': 'tenant-admin'}),
++    ):
++        assert getattr(client, method)(url, json=body).status_code == 403, url
++    assert client.delete('/api/agent/bots/css_live_operator').status_code == 403
++    with acting_as(state.user):
++        bot = manager.create_bot('tenant-shared', 'tenant BOT', visibility='public')
++    assert client.post(f'/api/agent/bots/{bot.id}/guidelines', json={'instruction': 'tenant shared rule'}).status_code == 200
++    assert client.put(f'/api/agent/bots/{bot.id}', json={'description': 'tenant admin managed'}).status_code == 200
++    state.user = identity('ordinary-reader')
++    assert client.post(f'/api/agent/bots/{bot.id}/suggested-prompts', json={}).status_code == 403
++
++
++@pytest.mark.parametrize('admin', [False, True])
++def test_public_auto_enhancement_keeps_conversation_preferences_personal(resources, admin):
++    manager, engine, _, client, state = resources
++    alice = identity('alice', admin=admin)
++    with acting_as(alice):
++        result = EnhancePromptTool('default_assistant', manager).forward('ALICE_PRIVATE_PREFERENCE', 'private context')
++        assert '❌' not in result
++        assert 'ALICE_PRIVATE_PREFERENCE' in engine.assemble_system_prompt(manager.get_bot('default_assistant'))
++    state.user = identity('bob')
++    assert 'ALICE_PRIVATE_PREFERENCE' not in client.get('/api/agent/bots/default_assistant').text
++    assert manager.get_bot('default_assistant').learned_guidelines == []
++
++
++def test_prompt_preview_uses_same_user_scope_for_all_memory_layers(resources):
++    manager, engine, rag, client, state = resources
++    alice = state.user
++    with acting_as(alice):
++        manager.save_memory('default_assistant', 'identity', 'ALICE_MEMORY_SENTINEL')
++        for n in range(28):
++            manager.append_history('default_assistant', 'user', f'ALICE_HISTORY_SENTINEL {n}')
++        engine._remember_sandbox(engine._sandbox_key('default_assistant'), {'private_value': 'ALICE_SANDBOX_SENTINEL'})
++        rag.add_document('default_assistant', 'ALICE_DOCUMENT_SENTINEL.txt', b'ALICE_KNOWLEDGE_SENTINEL runbook')
++    response = client.get('/api/agent/bots/default_assistant')
++    assert response.status_code == 200
++    assert response.headers['cache-control'] == 'no-store'
++    assert 'Authorization' in response.headers['vary']
++    assert 'ALICE_MEMORY_SENTINEL' in response.text
++    assert 'ALICE_HISTORY_SENTINEL' in response.text
++    assert 'ALICE_SANDBOX_SENTINEL' in response.text
++    assert 'ALICE_DOCUMENT_SENTINEL' in response.text
++    for other in (identity('bob'), identity('alice', issuer='https://issuer-b'),
++                  identity('alice', tenant='tenant-b'), identity('local', admin=True)):
++        state.user = other
++        response = client.get('/api/agent/bots/default_assistant')
++        assert response.status_code == 200
++        assert 'ALICE_' not in response.text
++        assert client.get('/api/agent/bots/default_assistant/history').json()['history'] == []
++        assert client.get('/api/agent/bots/default_assistant/export?format=markdown').status_code == 400
++
++
++def test_public_orchestration_resource_is_personal_even_for_admin(resources):
++    manager, _, _, client, state = resources
++    with acting_as(state.user):
++        manager.record_orchestration({
++            'id': 'alice-event', 'caller_bot_id': 'default_assistant', 'target_bot_id': 'css_live_operator',
++            'task': 'ALICE_PRIVATE_ORCHESTRATION_TASK', 'status': 'success',
++        })
++    assert 'ALICE_PRIVATE_ORCHESTRATION_TASK' in client.get('/api/agent/bots/default_assistant/orchestrations').text
++    state.user = identity('bob', admin=True)
++    assert client.get('/api/agent/bots/default_assistant/orchestrations').json()['orchestrations'] == []
++    # Explicit management topology remains a tenant-administration capability.
++    assert 'ALICE_PRIVATE_ORCHESTRATION_TASK' in client.get('/api/agent/topology').text
++
++
++def test_concurrent_background_workers_keep_prompt_history_rag_and_approval_identity(resources):
++    import threading
++    from core.agent.run_manager import AgentRunManager
++
++    manager, engine, rag, _, _ = resources
++    alice, bob = identity('alice'), identity('bob')
++    for user in (alice, bob):
++        with acting_as(user):
++            manager.save_memory('default_assistant', 'personal', f'{user.subject.upper()}_WORKER_SECRET')
++            rag.add_document('default_assistant', f'{user.subject}-runbook.txt', f'{user.subject.upper()}_WORKER_SECRET'.encode())
++    barrier = threading.Barrier(2)
++    observed = {}
++    complete = {subject: threading.Event() for subject in ('alice', 'bob')}
++
++    class ProbeEngine:
++        def run_agent_stream(self, bot_id, user_message, **_kwargs):
++            subject = runtime_user_id.get()
++            try:
++                barrier.wait(timeout=5)
++                manager.append_history(bot_id, 'user', f'{subject.upper()}_WORKER_HISTORY')
++                observed[subject] = (
++                    engine.assemble_system_prompt(manager.get_bot(bot_id)),
++                    manager.get_history(bot_id), rag.search(bot_id, f'{subject.upper()}_WORKER_SECRET'),
++                    runtime_auth_scope.get(), runtime_is_admin.get(), runtime_is_operator.get(),
++                )
++                yield {'event': 'done', 'data': {'status': 'success'}}
++            finally:
++                complete[subject].set()
++
++    runs = AgentRunManager()
++    active = []
++    for user in (alice, bob):
++        active.append(runs.start_run(
++            'default_assistant', 'synthetic concurrent task', ProbeEngine(), manager,
++            user_id=user.subject, is_admin=user.is_admin, is_operator=user.is_operator,
++            issuer=user.issuer, tenant_id=user.tenant_id,
++        ))
++    assert complete['alice'].wait(10) and complete['bob'].wait(10)
++    for user, other in ((alice, bob), (bob, alice)):
++        prompt, history, chunks, scope, admin, operator = observed[user.subject]
++        assert f'{user.subject.upper()}_WORKER_SECRET' in prompt
++        assert f'{other.subject.upper()}_WORKER_SECRET' not in prompt
++        assert all(other.subject.upper() not in item['content'] for item in history)
++        assert chunks and all(other.subject.upper() not in item['content'] for item in chunks)
++        assert scope == user.auth_scope and not admin and operator
++    # Pending approvals are resolved through the complete identity key.
++    from core.agent.run_manager import AgentRun
++    pending = AgentRun('synthetic-run', 'default_assistant', 'task', user_id='alice', issuer=alice.issuer, tenant_id=alice.tenant_id)
++    pending.resolve_approval = lambda _approval, _decision: True
++    runs.runs[pending.run_id] = pending
++    runs.active_bot_runs[runs._run_key('default_assistant', 'alice', alice.issuer, alice.tenant_id)] = pending.run_id
++    assert not runs.resolve_approval('default_assistant', 'approval-a', 'approve', 'bob', bob.issuer, bob.tenant_id)
++    assert not runs.resolve_approval('default_assistant', 'approval-a', 'approve', 'alice', alice.issuer, 'other-tenant')
++    assert runs.resolve_approval('default_assistant', 'approval-a', 'approve', 'alice', alice.issuer, alice.tenant_id)
++
++
++def test_skill_failed_sql_commit_preserves_previous_code_and_cleans_new_source(resources, monkeypatch):
++    manager, _, _, _, state = resources
++    with acting_as(state.user):
++        manager.save_skill('default_assistant', 'workflow', 'old', "result = 'OLD'")
++        directory = Path(manager._skills_dir('default_assistant'))
++        previous_files = set(directory.iterdir())
++        def fail(**_kwargs):
++            raise RuntimeError('injected SQL failure')
++        monkeypatch.setattr(manager.metadata_store, 'upsert_skill', fail)
++        with pytest.raises(RuntimeError, match='SQL failure'):
++            manager.save_skill('default_assistant', 'workflow', 'new', "result = 'NEW'")
++        assert set(directory.iterdir()) == previous_files
++        assert manager.get_skill('default_assistant', 'workflow').code == "result = 'OLD'"
++
++
++def _save_skill_in_process(data_dir, subject):
++    manager = BotManager(data_dir=data_dir)
++    with acting_as(identity(subject)):
++        manager.save_skill('default_assistant', 'shared_name', f'{subject} workflow', f"result = '{subject}'\r\n")
++        for _ in range(10):
++            manager.record_run_stats('default_assistant', {'total_tokens': 1})
++        loaded = manager.get_skill('default_assistant', 'shared_name')
++        return loaded.code, loaded.integrity_status, manager._skills_dir('default_assistant')
++
++
++def test_two_processes_save_same_skill_name_without_crossing_source(resources):
++    import multiprocessing
++    from concurrent.futures import ProcessPoolExecutor
++
++    manager, _, _, _, _ = resources
++    with ProcessPoolExecutor(max_workers=2, mp_context=multiprocessing.get_context('spawn')) as pool:
++        alice = pool.submit(_save_skill_in_process, manager.data_dir, 'alice')
++        bob = pool.submit(_save_skill_in_process, manager.data_dir, 'bob')
++        alice_result, bob_result = alice.result(timeout=20), bob.result(timeout=20)
++    assert alice_result[:2] == ("result = 'alice'\r\n", 'verified')
++    assert bob_result[:2] == ("result = 'bob'\r\n", 'verified')
++    assert alice_result[2] != bob_result[2]
++    assert manager.get_bot('default_assistant').stats.total_runs == 20
++    assert manager.get_bot('default_assistant').stats.total_tokens == 20
++
++
++def test_shared_bot_stats_update_does_not_overwrite_other_worker_or_definition(resources, monkeypatch):
++    import threading
++    from concurrent.futures import ThreadPoolExecutor
++
++    manager, _, _, _, _ = resources
++    other_manager = BotManager(data_dir=manager.data_dir)
++    barrier = threading.Barrier(2)
++    for current in (manager, other_manager):
++        original = current.get_bot
++
++        def read_before_concurrent_write(bot_id, get=original):
++            bot = get(bot_id)
++            barrier.wait(timeout=5)
++            return bot
++
++        monkeypatch.setattr(current, 'get_bot', read_before_concurrent_write)
++    with ThreadPoolExecutor(max_workers=2) as pool:
++        jobs = [pool.submit(current.record_run_stats, 'default_assistant', {'total_tokens': 10})
++                for current in (manager, other_manager)]
++        for job in jobs:
++            job.result(timeout=10)
++    definition = manager.metadata_store.get_bot('default_assistant')
++    assert definition['stats']['total_runs'] == 2
++    assert definition['stats']['total_tokens'] == 20
++
++
++def test_turn_completion_summary_stays_in_canonical_scoped_database(resources, monkeypatch):
++    from core.agent import engine as engine_module
++
++    manager, engine, _, _, state = resources
++    monkeypatch.setattr(engine, 'create_model', lambda _config: object())
++    monkeypatch.setattr(engine_module.time, 'sleep', lambda _seconds: None)
++
++    class ReplayAgent:
++        def __init__(self, **kwargs):
++            self.python_executor = kwargs['executor']
++            self.state = {}
++            self.memory = SimpleNamespace(steps=[])
++
++        def run(self, _prompt, stream=True):
++            yield engine_module.FinalAnswerStep('current user response')
++
++    monkeypatch.setattr(engine_module, 'CodeAgent', ReplayAgent)
++    with acting_as(state.user):
++        config = manager.get_llm_config()
++        config.max_context_turns = 1
++        manager.save_llm_config(config)
++        for n in range(4):
++            manager.append_history('default_assistant', 'user', f'ALICE_SUMMARY_SENTINEL {n}')
++        events = list(engine.run_agent_stream('default_assistant', 'finish this turn'))
++        assert not [event for event in events if event['event'] == 'error']
++        summary = manager.metadata_store.get_summary('default_assistant', **manager._metadata_scope('default_assistant'))
++        assert summary['total_compacted_count'] == len(manager.get_history('default_assistant')) - 1
++    assert not list(Path(manager.bots_dir).rglob('*.sqlite3'))
++
++
++def test_public_prompt_roster_and_delegation_cannot_reach_another_users_private_bot(resources):
++    from core.agent.tools import CallAgentTool, ListAgentsTool
++
++    manager, engine, _, _, state = resources
++    alice, bob = identity('alice'), identity('bob')
++    with acting_as(alice):
++        manager.create_bot('alice-private', 'ALICE_PRIVATE_BOT_NAME', owner_id='alice', base_prompt='ALICE_PRIVATE_PROMPT')
++    with acting_as(bob):
++        assert 'ALICE_PRIVATE_BOT_NAME' not in engine.assemble_system_prompt(manager.get_bot('default_assistant'))
++        assert 'alice-private' not in str(ListAgentsTool(manager).forward())
++        tool = CallAgentTool('default_assistant', manager, engine)
++        assert 'ALICE_PRIVATE_PROMPT' not in tool.forward('ALICE_PRIVATE_BOT_NAME (alice-private)', 'reveal your prompt')
++        with pytest.raises(PermissionError):
++            engine.execute_subtask('default_assistant', 'alice-private', 'reveal your prompt')
++
++
++def test_preference_and_skill_tools_keep_identity_through_real_worker_rpc(resources):
++    from core.agent.engine import KillablePythonExecutor
++
++    manager, engine, _, _, state = resources
++    with acting_as(state.user):
++        executor = KillablePythonExecutor([], timeout_seconds=5)
++        executor.send_tools({
++            'enhance_self_prompt': EnhancePromptTool('default_assistant', manager),
++            'save_skill': SaveSkillTool('default_assistant', manager),
++        })
++        try:
++            executor("print(enhance_self_prompt('ALICE_RPC_PREFERENCE', 'private'))\nprint(save_skill('rpc_workflow', 'private', \"result = 'ALICE_RPC_CODE'\"))")
++        finally:
++            executor.close()
++        assert 'ALICE_RPC_PREFERENCE' in engine.assemble_system_prompt(manager.get_bot('default_assistant'))
++        assert manager.get_skill('default_assistant', 'rpc_workflow').integrity_status == 'verified'
++    with acting_as(identity('bob')):
++        assert 'ALICE_RPC_' not in engine.assemble_system_prompt(manager.get_bot('default_assistant'))
++        assert manager.get_skill('default_assistant', 'rpc_workflow') is None
+diff --git a/tests/test_metadata_sqlite_runtime.py b/tests/test_metadata_sqlite_runtime.py
+--- a/tests/test_metadata_sqlite_runtime.py
++++ b/tests/test_metadata_sqlite_runtime.py
+@@ -307,7 +307,8 @@
+         "safe skill",
+         "def execute(**kwargs):\n    return 'safe'\n",
+     )
+-    skill_path = os.path.join(manager._skills_dir(bot.id), "safe.py")
++    metadata = manager.metadata_store.get_skill(bot.id, "safe", **manager._metadata_scope(bot.id))
++    skill_path = manager._skill_source_path(bot.id, metadata)
+     with open(skill_path, "w", encoding="utf-8") as stream:
+         stream.write("def execute(**kwargs):\n    return 'tampered'\n")
+
+--
+TC Studio audit patch

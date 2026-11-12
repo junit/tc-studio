@@ -13,14 +13,14 @@ from collections import deque
 from contextlib import contextmanager, suppress
 from datetime import UTC, datetime
 from typing import Any
-from urllib.parse import unquote
+from urllib.parse import quote, unquote
 
 try:
     import fcntl
 except ImportError:  # pragma: no cover - Windows keeps the thread lock fallback
     fcntl = None
 
-from core.runtime_context import runtime_auth_scope, runtime_user_id
+from core.runtime_context import runtime_auth_scope, runtime_is_admin, runtime_user_id, runtime_user_partition
 from core.namespace import (
     CANONICAL_DATABASE_FILENAME,
     LEGACY_DATABASE_FILENAME,
@@ -41,7 +41,6 @@ from .constants import HIGH_RISK_API_KEYWORDS
 from .file_parser import format_file_size, get_file_category_and_type
 from .models import (
     BotConfig,
-    BotStats,
     LearnedGuideline,
     LLMConfig,
     MemoryItem,
@@ -58,6 +57,8 @@ MAX_MEMORY_KEY_CHARS = 256
 MAX_MEMORY_CONTENT_CHARS = 16_384
 MAX_GUIDELINE_INSTRUCTION_CHARS = 16_384
 MAX_GUIDELINE_REASON_CHARS = 4_096
+MAX_SKILLS_PER_SCOPE = 100
+MAX_SKILL_METADATA_BYTES = 32 * 1024
 
 
 class BotIdConflict(ValueError):
@@ -319,8 +320,9 @@ class BotManager:
         bot = bot or self.get_bot(bot_id)
         effective_user_id = runtime_user_id.get() if user_id is None else str(user_id)
         if bot and bot.visibility == "public":
-            owner_subject = "" if effective_user_id == "local" else effective_user_id
             active_scope = runtime_auth_scope.get()
+            is_local = effective_user_id == "local" and not active_scope.issuer and not active_scope.tenant_id
+            owner_subject = "" if is_local else effective_user_id
             return {
                 "issuer": active_scope.issuer,
                 "tenant_id": active_scope.tenant_id,
@@ -350,7 +352,9 @@ class BotManager:
         return {
             "issuer": bot_issuer,
             "tenant_id": bot_tenant,
-            "owner_subject": str(bot.owner_id or ""),
+            # Local development historically stored ownerless private BOT data
+            # under the empty scope. Claiming it as 'local' must retain it.
+            "owner_subject": "" if bot.owner_id == "local" and not bot_issuer and not bot_tenant else str(bot.owner_id or ""),
         }
 
     @staticmethod
@@ -364,7 +368,7 @@ class BotManager:
         return {
             "issuer": str(bot.issuer or ""),
             "tenant_id": str(bot.tenant_id or ""),
-            "owner_subject": str(bot.owner_id or ""),
+            "owner_subject": "" if bot.visibility != "public" and bot.owner_id == "local" and not bot.issuer and not bot.tenant_id else str(bot.owner_id or ""),
         }
 
     @staticmethod
@@ -382,6 +386,45 @@ class BotManager:
         if bot.visibility == "public" and not bot_issuer and not bot_tenant:
             return True
         return bot_issuer == str(issuer or "") and bot_tenant == str(tenant_id or "")
+
+    @classmethod
+    def can_access_bot(
+        cls,
+        bot: BotConfig,
+        *,
+        user_id: str | None = None,
+        is_admin: bool | None = None,
+        issuer: str | None = None,
+        tenant_id: str | None = None,
+    ) -> bool:
+        scope = runtime_auth_scope.get()
+        subject = runtime_user_id.get() if user_id is None else user_id
+        admin = runtime_is_admin.get() if is_admin is None else is_admin
+        return cls.bot_scope_matches(
+            bot,
+            issuer=scope.issuer if issuer is None else issuer,
+            tenant_id=scope.tenant_id if tenant_id is None else tenant_id,
+        ) and (admin or bot.visibility == "public" or bot.owner_id == subject)
+
+    @classmethod
+    def can_edit_bot_definition(
+        cls,
+        bot: BotConfig,
+        *,
+        user_id: str | None = None,
+        is_admin: bool | None = None,
+        issuer: str | None = None,
+        tenant_id: str | None = None,
+    ) -> bool:
+        """Global templates can be used across tenants, but not edited by them."""
+        scope = runtime_auth_scope.get()
+        active_issuer = scope.issuer if issuer is None else issuer
+        active_tenant = scope.tenant_id if tenant_id is None else tenant_id
+        if str(bot.issuer or "") != str(active_issuer or "") or str(bot.tenant_id or "") != str(active_tenant or ""):
+            return False
+        subject = runtime_user_id.get() if user_id is None else user_id
+        admin = runtime_is_admin.get() if is_admin is None else is_admin
+        return admin or (bot.visibility != "public" and bot.owner_id == subject)
 
     def _legacy_bot_data(self, bot_id: str) -> dict[str, Any] | None:
         bot_json = os.path.join(self._bot_dir(bot_id), "bot.json")
@@ -416,12 +459,8 @@ class BotManager:
         bot_dir = self._bot_dir(bot_id)
         bot = self.get_bot(bot_id)
         effective_user_id = runtime_user_id.get() if user_id is None else str(user_id)
-        if bot and bot.visibility == "public" and effective_user_id != "local":
-            active_scope = runtime_auth_scope.get()
-            identity = "\0".join(
-                (active_scope.issuer, active_scope.tenant_id, effective_user_id)
-            )
-            partition = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
+        partition = runtime_user_partition(effective_user_id)
+        if bot and bot.visibility == "public" and partition is not None:
             return os.path.join(bot_dir, "users", partition)
         return bot_dir
 
@@ -1029,6 +1068,7 @@ class BotManager:
             # 统一通过 SQLite 保存定义，旧 bot.json 只作为迁移源。
             existing = self.get_bot(default_id)
             if existing:
+                previous_definition = existing.model_dump()
                 existing.visibility = "public"
                 if (
                     "166" in existing.description
@@ -1039,7 +1079,8 @@ class BotManager:
                     existing.description = default_desc
                     existing.base_prompt = default_prompt
                     existing.suggested_prompts = default_prompts
-                self.save_bot(existing)
+                if existing.model_dump() != previous_definition:
+                    self.save_bot(existing)
 
         # 确保云直播专属巡检官内置就绪
         live_id = "css_live_operator"
@@ -1555,6 +1596,8 @@ class BotManager:
         bot = self.get_bot(bot_id)
         if not bot:
             return None
+        if not self.can_edit_bot_definition(bot):
+            raise PermissionError("无权修改该 BOT 的共享定义")
         instruction = str(instruction or "").strip()
         reason = str(reason or "").strip()
         if not instruction:
@@ -1583,6 +1626,8 @@ class BotManager:
         bot = self.get_bot(bot_id)
         if not bot:
             return False
+        if not self.can_edit_bot_definition(bot):
+            raise PermissionError("无权修改该 BOT 的共享定义")
         return self.metadata_store.delete_guideline(
             bot_id,
             guideline_id,
@@ -1686,14 +1731,82 @@ class BotManager:
     # 技能自沉淀系统 (Self-Evolving Skills)
     # -------------------------------------------------------------
     def _skills_dir(self, bot_id: str) -> str:
-        s_dir = os.path.join(self._bot_dir(bot_id), "skills")
-        os.makedirs(s_dir, exist_ok=True)  # pi-lens-ignore: unchecked-throwing-call-python -- persistence boundary
+        s_dir = os.path.join(self._runtime_dir(bot_id), "skills")
+        os.makedirs(s_dir, mode=0o700, exist_ok=True)
+        os.chmod(s_dir, 0o700)
         return s_dir
+
+    def _skill_source_path(self, bot_id: str, metadata: dict[str, Any]) -> str:
+        """Resolve an immutable source within this identity's skill directory.
+
+        Old name.py files inside this same identity's directory may be imported
+        only with a matching recorded hash. Unowned root files are never a
+        source for authenticated public users, even with an old scoped SQL row.
+        """
+        directory = self._skills_dir(bot_id)
+        expected = str(metadata.get("code_sha256") or "").lower()
+        name = str(metadata.get("name") or "")
+        if not re.fullmatch(r"[a-zA-Z0-9_]{1,128}", name):
+            raise ValueError("技能名称不合法")
+        if not re.fullmatch(r"[0-9a-f]{64}", expected):
+            return os.path.join(directory, f"{name}.py")
+        destination = os.path.join(directory, f"s_{expected}.py")
+        if os.path.isfile(destination):
+            return destination
+        # This fallback is only reachable with an existing scoped SQL row.
+        old_path = os.path.join(directory, f"{name}.py")
+        if not os.path.islink(old_path) and os.path.isfile(old_path):
+            with open(old_path, "rb") as source:
+                code = source.read(64 * 1024 + 1)
+            if len(code) <= 64 * 1024 and hashlib.sha256(code).hexdigest() == expected:
+                self._write_skill_source(destination, code)
+        return destination
+
+    @staticmethod
+    def _write_skill_source(destination: str, code: bytes) -> None:
+        """Publish complete, content-addressed bytes before committing SQL."""
+        temporary = f"{destination}.{uuid.uuid4().hex}.tmp"
+        try:
+            fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "wb") as source:
+                source.write(code)
+                source.flush()
+                os.fsync(source.fileno())
+            try:
+                os.link(temporary, destination)
+                if os.name != "nt":
+                    directory_fd = os.open(os.path.dirname(destination), os.O_RDONLY)
+                    try:
+                        os.fsync(directory_fd)
+                    finally:
+                        os.close(directory_fd)
+            except FileExistsError:
+                if os.path.islink(destination):
+                    raise ValueError("技能源码不允许使用符号链接")
+                with open(destination, "rb") as existing:
+                    if existing.read(len(code) + 1) != code:
+                        raise ValueError("技能源码完整性校验失败")
+        finally:
+            with suppress(OSError):
+                os.remove(temporary)
+
+    def _prune_skill_source(self, bot_id: str, digest: str) -> None:
+        if not re.fullmatch(r"[0-9a-f]{64}", digest):
+            return
+        scope = self._metadata_scope(bot_id)
+        if any(item.get("code_sha256") == digest for item in self.metadata_store.list_skills(bot_id, **scope)):
+            return
+        with suppress(OSError):
+            os.remove(os.path.join(self._skills_dir(bot_id), f"s_{digest}.py"))
 
     def list_skills(self, bot_id: str) -> list[SkillItem]:
         bot = self.get_bot(bot_id)
-        if not bot:
+        if not bot or not self.can_access_bot(bot):
             return []
+        with self._history_storage_lock(bot_id):
+            return self._list_skills_unlocked(bot_id, bot)
+
+    def _list_skills_unlocked(self, bot_id: str, bot: BotConfig) -> list[SkillItem]:
         scope = self._metadata_scope(bot_id, bot=bot)
         rows = self.metadata_store.list_skills(bot_id, **scope)
         if not rows:
@@ -1707,11 +1820,15 @@ class BotManager:
                     with open(os.path.join(s_dir, file), "r", encoding="utf-8") as f:
                         meta = json.load(f)
                     name = str(meta.get("name") or "")
+                    if not re.fullmatch(r"[a-zA-Z0-9_]{1,128}", name):
+                        continue
                     py_file = os.path.join(s_dir, f"{name}.py")
                     code = ""
-                    if os.path.isfile(py_file):
-                        with open(py_file, "r", encoding="utf-8") as pf:
-                            code = pf.read()
+                    if os.path.isfile(py_file) and not os.path.islink(py_file):
+                        with open(py_file, "r", encoding="utf-8", newline="") as pf:
+                            code = pf.read(64 * 1024 + 1)
+                    if len(code.encode("utf-8")) > 64 * 1024:
+                        continue
                     self.metadata_store.upsert_skill(
                         bot_id=bot_id,
                         skill=meta,
@@ -1719,21 +1836,22 @@ class BotManager:
                         code_sha256=hashlib.sha256(code.encode("utf-8")).hexdigest() if code else None,
                         **scope,
                     )
+                    os.remove(os.path.join(s_dir, file))
                 except Exception:
                     continue
             rows = self.metadata_store.list_skills(bot_id, **scope)
         result = []
-        s_dir = self._skills_dir(bot_id)
         for meta in rows:
             try:
-                name = str(meta.get("name") or "")
-                py_file = os.path.join(s_dir, f"{name}.py")
+                py_file = self._skill_source_path(bot_id, meta)
                 code = ""
-                if os.path.isfile(py_file):
-                    with open(py_file, "r", encoding="utf-8") as pf:
-                        code = pf.read()
+                if os.path.isfile(py_file) and not os.path.islink(py_file):
+                    with open(py_file, "r", encoding="utf-8", newline="") as pf:
+                        code = pf.read(64 * 1024 + 1)
                 meta["code"] = code
                 self._populate_skill_integrity(meta, code, py_file)
+                if meta["integrity_status"] != "verified":
+                    meta["code"] = ""
                 result.append(SkillItem(**meta))
             except Exception:
                 continue
@@ -1746,7 +1864,7 @@ class BotManager:
         code_path: str,
     ) -> None:
         expected = str(metadata.get("code_sha256") or "").strip().lower()
-        if not os.path.isfile(code_path):
+        if not os.path.isfile(code_path) or os.path.islink(code_path):
             metadata["integrity_status"] = "missing"
             metadata["integrity_error"] = "技能源码文件不存在"
             return
@@ -1764,34 +1882,34 @@ class BotManager:
 
     def get_skill(self, bot_id: str, name: str) -> SkillItem | None:
         bot = self.get_bot(bot_id)
-        if not bot:
+        if not bot or not self.can_access_bot(bot):
             return None
-        s_dir = self._skills_dir(bot_id)
         clean_name = re.sub(r"[^a-zA-Z0-9_]", "_", name)
-        py_file = os.path.join(s_dir, f"{clean_name}.py")
-        scope = self._metadata_scope(bot_id, bot=bot)
-        meta = self.metadata_store.get_skill(bot_id, clean_name, **scope)
-        if meta is None:
-            self.list_skills(bot_id)
-            meta = self.metadata_store.get_skill(bot_id, clean_name, **scope)
-        if meta is None:
-            return None
-        code = ""
-        if os.path.exists(py_file):
-            with open(py_file, "r", encoding="utf-8") as pf:  # pi-lens-ignore: unchecked-throwing-call-python -- persistence boundary
-                code = pf.read()
-        meta["code"] = code
-        self._populate_skill_integrity(meta, code, py_file)
-        return SkillItem(**meta)
+        return next((skill for skill in self.list_skills(bot_id) if skill.name == clean_name), None)
 
     def save_skill(self, bot_id: str, name: str, description: str, code: str, input_schema: dict | None = None) -> SkillItem:
-        with self._lock:
+        with self._history_storage_lock(bot_id), self._lock:
             bot = self.get_bot(bot_id)
             if not bot:
                 raise ValueError("BOT 不存在")
+            if not self.can_access_bot(bot):
+                raise PermissionError("无权访问该 BOT 的技能")
             s_dir = self._skills_dir(bot_id)
             clean_name = re.sub(r"[^a-zA-Z0-9_]", "_", name)
-            py_file = os.path.join(s_dir, f"{clean_name}.py")
+            if not re.fullmatch(r"[a-zA-Z0-9_]{1,128}", clean_name):
+                raise ValueError("技能名称长度必须为 1 到 128 个字符")
+            code_bytes = code.encode("utf-8")
+            if len(code_bytes) > 64 * 1024:
+                raise ValueError("技能代码超过 64 KiB 限制")
+            digest = hashlib.sha256(code_bytes).hexdigest()
+            py_file = os.path.join(s_dir, f"s_{digest}.py")
+            scope = self._metadata_scope(bot_id, bot=bot)
+            previous = self.metadata_store.get_skill(bot_id, clean_name, **scope)
+            if previous is None and len(self.metadata_store.list_skills(bot_id, **scope)) >= MAX_SKILLS_PER_SCOPE:
+                raise ValueError(f"每个 BOT 的个人技能最多 {MAX_SKILLS_PER_SCOPE} 项，请先删除不再使用的技能")
+            metadata = {"description": description, "input_schema": input_schema or {}}
+            if len(json.dumps(metadata, ensure_ascii=False).encode("utf-8")) > MAX_SKILL_METADATA_BYTES:
+                raise ValueError("技能描述和入参定义不能超过 32 KiB")
 
             skill = SkillItem(
                 name=clean_name,
@@ -1801,15 +1919,8 @@ class BotManager:
                 created_at=now_iso(),
                 integrity_status="verified",
             )
-            temp_path = f"{py_file}.{os.getpid()}.{threading.get_ident()}.tmp"
+            self._write_skill_source(py_file, code_bytes)
             try:
-                fd = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-                with os.fdopen(fd, "w", encoding="utf-8") as f:  # pi-lens-ignore: unchecked-throwing-call-python -- persistence boundary
-                    f.write(code)
-                    f.flush()
-                    os.fsync(f.fileno())
-                os.chmod(temp_path, 0o600)
-                os.replace(temp_path, py_file)
                 self.metadata_store.upsert_skill(
                     bot_id=bot_id,
                     skill={
@@ -1818,34 +1929,39 @@ class BotManager:
                         "input_schema": skill.input_schema,
                         "created_at": skill.created_at,
                     },
-                    code_uri=f"local://data/bots/{bot_id}/skills/{clean_name}.py",
-                    code_sha256=hashlib.sha256(code.encode("utf-8")).hexdigest(),
-                    **self._metadata_scope(bot_id, bot=bot),
+                    code_uri=f"local://{os.path.relpath(py_file, self.data_dir).replace(os.sep, '/')}",
+                    code_sha256=digest,
+                    **scope,
                 )
             except Exception:
-                with suppress(OSError):
-                    os.remove(temp_path)
+                with suppress(Exception):
+                    self._prune_skill_source(bot_id, digest)
                 raise
+            if previous:
+                self._prune_skill_source(bot_id, str(previous.get("code_sha256") or ""))
             return skill
 
     def delete_skill(self, bot_id: str, name: str) -> bool:
-        with self._lock:
+        with self._history_storage_lock(bot_id), self._lock:
             bot = self.get_bot(bot_id)
-            if not bot:
+            if not bot or not self.can_access_bot(bot):
                 return False
             s_dir = self._skills_dir(bot_id)
             clean_name = re.sub(r"[^a-zA-Z0-9_]", "_", name)
-            py_file = os.path.join(s_dir, f"{clean_name}.py")
+            existing = self.get_skill(bot_id, clean_name)
+            if existing is None:
+                return False
+            scope = self._metadata_scope(bot_id, bot=bot)
+            metadata = self.metadata_store.get_skill(bot_id, clean_name, **scope)
             removed = self.metadata_store.delete_skill(
                 bot_id,
                 clean_name,
-                **self._metadata_scope(bot_id, bot=bot),
+                **scope,
             )
             with suppress(OSError):
                 os.remove(os.path.join(s_dir, f"{clean_name}.json"))
-            if os.path.exists(py_file):
-                os.remove(py_file)  # pi-lens-ignore: unchecked-throwing-call-python -- persistence boundary
-                removed = True
+            if removed and metadata:
+                self._prune_skill_source(bot_id, str(metadata.get("code_sha256") or ""))
             return removed
 
     # -------------------------------------------------------------
@@ -2051,17 +2167,7 @@ class BotManager:
     # -------------------------------------------------------------
     def record_run_stats(self, bot_id: str, metrics: dict[str, Any]):
         """记录单次对话运行产生的消耗与耗时，持久化累计指标"""
-        with self._lock:
-            bot = self.get_bot(bot_id)
-            if not bot:
-                return
-            if not hasattr(bot, "stats") or bot.stats is None:
-                bot.stats = BotStats()
-            bot.stats.total_runs += 1
-            bot.stats.total_tokens += int(metrics.get("total_tokens", 0))
-            bot.stats.total_code_executions += int(metrics.get("code_executions", 0))
-            bot.stats.total_duration_seconds += round(float(metrics.get("elapsed_seconds", 0.0)), 2)
-            self.save_bot(bot)
+        self.metadata_store.increment_bot_stats(bot_id, metrics)
 
     # -------------------------------------------------------------
     # 消息回溯、重新生成与历史截断
@@ -2126,7 +2232,9 @@ class BotManager:
             {
                 "file_id": file_id,
                 "bot_id": bot_id,
-                "blob_uri": f"local://data/bots/{bot_id}/uploads/{stored_name}",
+                "blob_uri": "local://" + os.path.relpath(
+                    os.path.join(self._uploads_dir(bot_id, user_id), stored_name), self.data_dir
+                ).replace(os.sep, "/"),
                 "original_name": original_name,
                 "stored_name": stored_name,
                 "content_type": content_type,
@@ -2138,7 +2246,7 @@ class BotManager:
 
     def list_bot_files(self, bot_id: str, user_id: str | None = None) -> list[dict[str, Any]]:
         """查询指定智能体所有的上传与产出文件，带有大小、时间与引用状态"""
-        with self._lock:
+        with self._history_storage_lock(bot_id, user_id), self._lock:
             self.ensure_legacy_state(bot_id, user_id)
             bot_dir = self._runtime_dir(bot_id, user_id)
             uploads_dir = os.path.join(bot_dir, "uploads")
@@ -2156,8 +2264,36 @@ class BotManager:
             bot = self.get_bot(bot_id)
             scope = self._metadata_scope(bot_id, user_id=user_id, bot=bot)
             metadata_rows = self.metadata_store.list_files(bot_id, **scope)
-            if metadata_rows:
-                candidates = [
+            # Earlier generated files bypassed register_bot_file. Reconcile
+            # valid legacy files within this exact runtime partition even when
+            # uploaded-file rows already exist. New g_* orphans and scratch
+            # files are never promoted by a directory scan.
+            from .generated_files import validate_generated_file
+            known = {str(row["stored_name"]) for row in metadata_rows}
+            for entry in os.scandir(uploads_dir):
+                if (entry.name in known or entry.name.startswith((".", "_", "g_"))
+                    or not entry.is_file(follow_symlinks=False)
+                    or re.search(r"\.\d+\.\d+\.tmp(?:\.|$)", entry.name)
+                    or entry.name.lower().endswith(".bin")):
+                    continue
+                try:
+                    stat = entry.stat(follow_symlinks=False)
+                    if not stat.st_size or stat.st_size > MAX_RUNTIME_TOTAL_FILE_BYTES:
+                        continue
+                    validate_generated_file(entry.path)
+                    digest = hashlib.sha256()
+                    with open(entry.path, "rb") as stream:
+                        for block in iter(lambda: stream.read(1024 * 1024), b""):
+                            digest.update(block)
+                    self.register_bot_file(bot_id, file_id=hashlib.sha256(
+                        f"{bot_id}\0{scope}\0{entry.name}".encode("utf-8")
+                    ).hexdigest(), original_name=re.sub(r"^f_\d+_(?:[a-f0-9]{12}_)?", "", entry.name),
+                        stored_name=entry.name, content_type=None, size_bytes=stat.st_size,
+                        sha256=digest.hexdigest(), user_id=user_id)
+                except (OSError, ValueError, TypeError):
+                    continue
+            metadata_rows = self.metadata_store.list_files(bot_id, **scope)
+            candidates = [
                     (
                         str(row["stored_name"]),
                         str(row["original_name"] or row["stored_name"]),
@@ -2166,29 +2302,10 @@ class BotManager:
                     )
                     for row in metadata_rows
                 ]
-            else:
-                # Legacy fallback is used only before a file row exists.  New
-                # uploads always register a row before returning to the user.
-                candidates = []
-                for fn in os.listdir(uploads_dir):  # pi-lens-ignore: unchecked-throwing-call-python -- persistence boundary
-                    fp = os.path.join(uploads_dir, fn)
-                    if os.path.isfile(fp):
-                        try:
-                            stat = os.stat(fp)
-                            candidates.append(
-                                (
-                                    fn,
-                                    re.sub(r"^f_\d+_", "", fn),
-                                    stat.st_size,
-                                    datetime.fromtimestamp(stat.st_mtime, tz=UTC).isoformat(),
-                                )
-                            )
-                        except OSError:
-                            continue
 
             for fn, original_name, recorded_size, recorded_created in candidates:
                 fp = os.path.join(uploads_dir, fn)
-                if not os.path.isfile(fp):
+                if os.path.islink(fp) or not os.path.isfile(fp):
                     continue
                 try:
                     stat = os.stat(fp)
@@ -2204,7 +2321,7 @@ class BotManager:
                         "size_formatted": format_file_size(size),
                         "category": cat,
                         "type": ftype,
-                        "url": f"/api/agent/bots/{bot_id}/files/{fn}",
+                        "url": f"/api/agent/bots/{bot_id}/files/{quote(fn, safe='')}",
                         "created_at": created_iso,
                         "is_referenced": is_ref
                     })

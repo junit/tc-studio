@@ -12,6 +12,7 @@ import sqlite3
 import threading
 import time
 import zipfile
+from contextlib import asynccontextmanager
 from typing import Any
 
 import openpyxl
@@ -67,6 +68,8 @@ from core.namespace import get_env, set_default_env
 from core.runtime_paths import official_tree_read_paths
 from core.sync_task_manager import sync_task_manager
 from core.tree_syncer import sync_catalog_from_live_tree
+from core.agent.pdf_reports import check_pdf_runtime
+from core.agent.model_runtime import check_model_runtime
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(BASE_DIR, "static")
@@ -83,7 +86,16 @@ ALLOWED_ORIGINS = [
     if origin.strip()
 ]
 
-app = FastAPI(title="TC Studio (Nova) - Tencent Cloud Multi-Service Architecture Studio", version="2.0.0")
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    # Validate actual runtime capabilities with this server's interpreter.
+    # Neither check contacts a provider or reads user credentials.
+    await run_in_threadpool(check_model_runtime)
+    await run_in_threadpool(check_pdf_runtime)
+    yield
+
+
+app = FastAPI(title="TC Studio (Nova) - Tencent Cloud Multi-Service Architecture Studio", version="2.0.0", lifespan=lifespan)
 app.add_middleware(AuthenticationMiddleware)
 
 app.add_middleware(
@@ -169,7 +181,8 @@ def require_batch_task(task_id: str, user: CurrentUser = Depends(current_user)):
 
 @app.get("/api/auth/me")
 def get_auth_me(user: CurrentUser = Depends(current_user)):
-    return {"subject": user.subject, "roles": sorted(user.roles), "is_admin": user.is_admin, "is_operator": user.is_operator}
+    return {"subject": user.subject, "roles": sorted(user.roles), "is_admin": user.is_admin, "is_operator": user.is_operator,
+            "auth_mode": "local" if user.claims.get("mode") == "disabled" else "oidc"}
 
 
 @app.get("/healthz")

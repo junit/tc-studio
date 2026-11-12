@@ -307,7 +307,8 @@ def test_skill_source_hash_mismatch_is_diagnostic_and_blocks_execution(tmp_path)
         "safe skill",
         "def execute(**kwargs):\n    return 'safe'\n",
     )
-    skill_path = os.path.join(manager._skills_dir(bot.id), "safe.py")
+    metadata = manager.metadata_store.get_skill(bot.id, "safe", **manager._metadata_scope(bot.id))
+    skill_path = manager._skill_source_path(bot.id, metadata)
     with open(skill_path, "w", encoding="utf-8") as stream:
         stream.write("def execute(**kwargs):\n    return 'tampered'\n")
 

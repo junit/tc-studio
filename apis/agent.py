@@ -24,11 +24,16 @@ from urllib.parse import quote, urlparse, urlunparse
 import requests
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse, Response, StreamingResponse
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from starlette.concurrency import run_in_threadpool
 
 from core.agent.bot_manager import BotIdConflict, bot_manager
 from core.agent.tools import MAX_SKILL_CODE_BYTES, _validate_skill_ast
+from core.agent.capabilities import (
+    CapabilityConflict, CapabilityPolicyError, describe_capabilities,
+    load_capability_snapshot, update_capability_policy,
+)
+from core.agent.web_policy import WebReadPolicy
 from core.auth import CurrentUser, current_user, require_admin, require_operator
 from core.agent.constants import SUPPORTED_PROVIDERS, BOT_PRESET_TEMPLATES, HIGH_RISK_API_KEYWORDS
 from core.agent.risk import matching_confirmation_paths, resolve_api
@@ -73,13 +78,12 @@ def require_bot_definition_editor(bot_id: str, user: CurrentUser = Depends(curre
         tenant_id=user.tenant_id,
     ):
         raise HTTPException(status_code=404, detail="BOT 不存在")
-    if user.is_admin:
+    if bot_manager.can_edit_bot_definition(
+        bot, user_id=user.subject, is_admin=user.is_admin,
+        issuer=user.issuer, tenant_id=user.tenant_id,
+    ):
         return user
-    if bot.visibility == "public":
-        raise HTTPException(status_code=403, detail="公共 BOT 定义仅管理员可修改")
-    if bot.owner_id == user.subject:
-        return user
-    raise HTTPException(status_code=403, detail="无权修改该 BOT")
+    raise HTTPException(status_code=403, detail="无权修改该 BOT 定义；全局公共模板不属于租户管理员")
 
 
 def require_scoped_admin(bot_id: str, user: CurrentUser = Depends(current_user)) -> CurrentUser:
@@ -95,6 +99,11 @@ def require_scoped_admin(bot_id: str, user: CurrentUser = Depends(current_user))
         raise HTTPException(status_code=404, detail="BOT 不存在")
     if not user.is_admin:
         raise HTTPException(status_code=403, detail="需要管理员权限")
+    if not bot_manager.can_edit_bot_definition(
+        bot, user_id=user.subject, is_admin=True,
+        issuer=user.issuer, tenant_id=user.tenant_id,
+    ):
+        raise HTTPException(status_code=403, detail="无权管理其他认证范围的 BOT 定义与旧版状态")
     return user
 
 
@@ -714,7 +723,15 @@ class CreateBotPayload(BaseModel):
 
 
 class TransferBotOwnershipPayload(BaseModel):
-    owner_id: str = Field(..., min_length=1, description="目标 OIDC subject")
+    owner_id: str = Field(..., min_length=1, max_length=256, description="目标用户 subject；关闭认证的本地开发使用 local")
+
+    @field_validator("owner_id")
+    @classmethod
+    def validate_owner(cls, value: str) -> str:
+        value = value.strip()
+        if not value or any(ord(char) < 32 for char in value):
+            raise ValueError("目标用户 subject 不能为空或包含控制字符")
+        return value
 
 
 class LegacyStateMigrationPayload(BaseModel):
@@ -794,8 +811,8 @@ class GuidelinePayload(BaseModel):
 
 
 class SaveSkillPayload(BaseModel):
-    name: str = Field(..., description="技能名称")
-    description: str = Field(..., description="功能描述")
+    name: str = Field(..., min_length=1, max_length=128, description="技能名称")
+    description: str = Field(..., max_length=MAX_BOT_DESCRIPTION_CHARS, description="功能描述")
     python_code: str = Field(..., max_length=MAX_SKILL_CODE_BYTES, description="Python 代码")
     input_schema: Optional[Dict[str, Any]] = Field(default_factory=dict, description="入参模式说明")
 
@@ -834,6 +851,43 @@ class ApprovalDecisionPayload(BaseModel):
 # -------------------------------------------------------------
 # LLM 全局模型配置与预设
 # -------------------------------------------------------------
+class CapabilityPolicyPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    expected_version: int = Field(..., ge=0)
+    catalog_version: str = Field(..., min_length=1, max_length=64)
+    disabled_ids: list[str] = Field(..., max_length=128)
+    enabled_ids: list[str] | None = Field(default=None, max_length=128)
+    web_read: WebReadPolicy | None = None
+
+
+@router.get("/capabilities")
+def get_capability_catalog(_user: CurrentUser = Depends(require_admin)):
+    try:
+        return describe_capabilities(load_capability_snapshot(bot_manager))
+    except CapabilityPolicyError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+@router.put("/capabilities")
+def set_capability_policy(payload: CapabilityPolicyPayload, user: CurrentUser = Depends(require_admin)):
+    try:
+        snapshot = update_capability_policy(
+            bot_manager, payload.disabled_ids, expected_version=payload.expected_version,
+            catalog_version=payload.catalog_version,
+            enabled_ids=payload.enabled_ids, web_read=payload.web_read,
+        )
+    except CapabilityConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except CapabilityPolicyError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    _write_agent_audit(user, action="agent.capabilities.update", bot_id="capability_policy",
+                       metadata={"version": snapshot.version, "disabled_ids": sorted(snapshot.disabled_ids),
+                                 "enabled_ids": sorted(snapshot.enabled_ids),
+                                 "web_read": snapshot.web_read.model_dump(mode="json"),
+                                 "catalog_version": snapshot.catalog_version})
+    return describe_capabilities(snapshot)
+
+
 @router.get("/config")
 def get_llm_config(_user=Depends(require_admin)):
     """获取大模型配置（API Key 脱敏）与支持的供应商列表 (SSoT)"""
@@ -1168,6 +1222,7 @@ def create_bot(payload: CreateBotPayload, user: CurrentUser = Depends(current_us
 def _format_bot_response(bot):
     """格式化智能体返回体，包含记忆、技能与实时合成的系统提示词以及四层分级记忆运行期透视"""
     data = bot.model_dump()
+    data["permissions"] = {"can_edit_definition": bot_manager.can_edit_bot_definition(bot)}
     data["skills"] = [s.model_dump() for s in bot_manager.list_skills(bot.id)]
     data["memories"] = [m.model_dump() for m in bot_manager.list_memories(bot.id)]
     data["history_count"] = len(bot_manager.get_history(bot.id))
@@ -1233,7 +1288,7 @@ def get_bot(bot_id: str):
     return {"bot": _format_bot_response(bot)}
 
 
-@router.post("/bots/{bot_id}/suggested-prompts", dependencies=[Depends(require_bot_access)])
+@router.post("/bots/{bot_id}/suggested-prompts", dependencies=[Depends(require_bot_definition_editor)])
 def refresh_bot_suggested_prompts(bot_id: str):
     """根据智能体人设，通过大模型动态重新生成推荐指令（换一换）"""
     bot = bot_manager.get_bot(bot_id)
@@ -1671,6 +1726,8 @@ def get_bot_file(bot_id: str, filename: str, download: bool = Query(default=Fals
         except OSError as exc:
             raise HTTPException(status_code=404, detail="文件不存在或完整性校验失败") from exc
     else:
+        if safe_filename.startswith("g_"):
+            raise HTTPException(status_code=404, detail="文件不存在或尚未发布")
         file_path = confined_file_path(safe_filename)
 
     # 1. 尝试直接路径匹配
@@ -1765,9 +1822,10 @@ def get_bot_file(bot_id: str, filename: str, download: bool = Query(default=Fals
         file_path,
         media_type=media_type,
         content_disposition_type=disposition,
-        filename=safe_filename
+        filename=str(metadata_record["original_name"]) if metadata_record else safe_filename,
     )
     response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Cache-Control"] = "no-store"
     return response
 
 
@@ -2559,7 +2617,7 @@ def list_bot_skills(bot_id: str):
     return {"skills": [s.model_dump() for s in skills]}
 
 
-@router.post("/bots/{bot_id}/skills", dependencies=[Depends(require_bot_definition_editor)])
+@router.post("/bots/{bot_id}/skills", dependencies=[Depends(require_bot_access)])
 def create_or_save_skill(bot_id: str, payload: SaveSkillPayload):
     """用户或前端一键将验证通过的脚本沉淀为专属技能"""
     bot = bot_manager.get_bot(bot_id)
@@ -2569,13 +2627,16 @@ def create_or_save_skill(bot_id: str, payload: SaveSkillPayload):
         _validate_skill_ast(payload.python_code)
     except (SyntaxError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=f"技能代码预检失败: {exc}") from exc
-    skill = bot_manager.save_skill(
-        bot_id=bot_id,
-        name=payload.name,
-        description=payload.description,
-        code=payload.python_code,
-        input_schema=payload.input_schema
-    )
+    try:
+        skill = bot_manager.save_skill(
+            bot_id=bot_id,
+            name=payload.name,
+            description=payload.description,
+            code=payload.python_code,
+            input_schema=payload.input_schema
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     return {"success": True, "skill": skill.model_dump()}
 
 
@@ -2629,7 +2690,7 @@ def run_bot_skill(bot_id: str, name: str, payload: RunSkillPayload, _user=Depend
     return res
 
 
-@router.delete("/bots/{bot_id}/skills/{name}", dependencies=[Depends(require_bot_definition_editor)])
+@router.delete("/bots/{bot_id}/skills/{name}", dependencies=[Depends(require_bot_access)])
 def delete_bot_skill(bot_id: str, name: str):
     """删除技能"""
     ok = bot_manager.delete_skill(bot_id, name)
@@ -2639,7 +2700,7 @@ def delete_bot_skill(bot_id: str, name: str):
 # -------------------------------------------------------------
 # 企业知识库与运维手册挂载 (Lightweight RAG)
 # -------------------------------------------------------------
-@router.get("/bots/{bot_id}/knowledge/docs", dependencies=[Depends(require_bot_definition_editor)])
+@router.get("/bots/{bot_id}/knowledge/docs", dependencies=[Depends(require_bot_access)])
 def list_bot_knowledge_docs(bot_id: str):
     """获取指定智能体挂载的所有企业知识库与手册文档"""
     bot = bot_manager.get_bot(bot_id)
@@ -2649,7 +2710,7 @@ def list_bot_knowledge_docs(bot_id: str):
     return {"docs": docs}
 
 
-@router.post("/bots/{bot_id}/knowledge/upload", dependencies=[Depends(require_bot_definition_editor)])
+@router.post("/bots/{bot_id}/knowledge/upload", dependencies=[Depends(require_bot_access)])
 async def upload_bot_knowledge_doc(
     bot_id: str,
     file: UploadFile = File(...)
@@ -2658,12 +2719,6 @@ async def upload_bot_knowledge_doc(
     bot = bot_manager.get_bot(bot_id)
     if not bot:
         raise HTTPException(status_code=404, detail="BOT 不存在")
-    if bot.visibility == "public":
-        raise HTTPException(
-            status_code=403,
-            detail="公共 BOT 不允许挂载企业私有知识库，请改用私有 BOT",
-        )
-
     filename = file.filename or "unknown_doc.txt"
     extension = os.path.splitext(filename)[1].lower()
     if extension == ".xls":
@@ -2688,7 +2743,7 @@ async def upload_bot_knowledge_doc(
     }
 
 
-@router.put("/bots/{bot_id}/knowledge/docs/{doc_id}", dependencies=[Depends(require_bot_definition_editor)])
+@router.put("/bots/{bot_id}/knowledge/docs/{doc_id}", dependencies=[Depends(require_bot_access)])
 def update_bot_knowledge_doc(bot_id: str, doc_id: str, payload: ToggleKnowledgePayload):
     """启用或禁用某篇文档参与 RAG 语义检索"""
     ok = rag_manager.toggle_document(bot_id, doc_id, payload.enabled)
@@ -2697,7 +2752,7 @@ def update_bot_knowledge_doc(bot_id: str, doc_id: str, payload: ToggleKnowledgeP
     return {"success": True}
 
 
-@router.delete("/bots/{bot_id}/knowledge/docs/{doc_id}", dependencies=[Depends(require_bot_definition_editor)])
+@router.delete("/bots/{bot_id}/knowledge/docs/{doc_id}", dependencies=[Depends(require_bot_access)])
 def delete_bot_knowledge_doc(bot_id: str, doc_id: str):
     """删除挂载的知识文档及其索引切片"""
     ok = rag_manager.delete_document(bot_id, doc_id)
@@ -2706,7 +2761,7 @@ def delete_bot_knowledge_doc(bot_id: str, doc_id: str):
     return {"success": True}
 
 
-@router.post("/bots/{bot_id}/knowledge/search", dependencies=[Depends(require_bot_definition_editor)])
+@router.post("/bots/{bot_id}/knowledge/search", dependencies=[Depends(require_bot_access)])
 def test_search_bot_knowledge(bot_id: str, payload: SearchKnowledgePayload):
     """在线检索与召回调试：测试特定问题在知识库中的命中结果与匹配分数"""
     results = rag_manager.search(
@@ -2722,7 +2777,7 @@ def test_search_bot_knowledge(bot_id: str, payload: SearchKnowledgePayload):
     }
 
 
-@router.get("/bots/{bot_id}/knowledge/docs/{doc_id}/download", dependencies=[Depends(require_bot_definition_editor)])
+@router.get("/bots/{bot_id}/knowledge/docs/{doc_id}/download", dependencies=[Depends(require_bot_access)])
 def download_knowledge_doc(bot_id: str, doc_id: str):
     """下载知识库原始文件"""
     path = rag_manager.get_document_file_path(bot_id, doc_id)
@@ -2749,8 +2804,8 @@ def get_orchestration_topology():
 
 @router.get("/bots/{bot_id}/orchestrations", dependencies=[Depends(require_bot_access)])
 def get_bot_orchestrations(bot_id: str, limit: int = Query(default=20, ge=1, le=100), user: CurrentUser = Depends(current_user)):
-    """获取当前用户可见的协同调用流水；管理员可查看全局记录。"""
-    all_events = bot_manager.get_orchestrations(limit=200, user_id=user.subject, is_admin=user.is_admin)
+    """获取当前用户的协同流水；管理员全范围观测使用单独的 topology 入口。"""
+    all_events = bot_manager.get_orchestrations(limit=200, user_id=user.subject, is_admin=False)
     related = [e for e in all_events if e.get("caller_bot_id") == bot_id or e.get("target_bot_id") == bot_id]
     return {"orchestrations": related[:limit]}
 

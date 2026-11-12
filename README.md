@@ -97,7 +97,10 @@ TC Studio 的智能体并非传统打字聊天的对话机器人，而是**以�
 - **动态单点真实源提示词（Zero-Hardcoding SSoT Prompt）**：
   系统提示词不再硬编码任何静态接口数，由 `DynamicTimRegistry` 运行时动态检测并注入所有已挂载云产品与最新接口统计，确保新业务接入时提示词 100% 自动对齐。
 - **📖 轻量企业私有知识库挂载（RAG 检索增强）**：
-  支持为各个独立智能体上传并挂载专属企业私有知识库（支持 Markdown、TXT、JSON、Word、Excel/CSV），提供轻量分块语义索引与上下文召回。
+  支持为私有智能体挂载专属知识库，公共 BOT 支持按当前用户隔离的个人知识库（支持 Markdown、TXT、JSON、DOCX、PDF、CSV；Excel 请转 CSV），提供文档切片与检索召回。
+  文件产出使用独立版本名并登记到 SQLite；临时探测文件不自动交付。详见[文件产出与公共 BOT 资源边界](docs/ARTIFACTS_AND_PUBLIC_BOT_RESOURCES.md)。
+  公共 BOT 共享助手定义，个人偏好、技能和资料按用户隔离；完整权限矩阵、审查证据及跨 worker 运行态边界见[公共 BOT 隔离审查](docs/PUBLIC_BOT_ISOLATION_AUDIT.md)。
+  最近两轮 PDF 的字距与乱码根因、实际服务环境修复、列表状态调整和公共 BOT 并发规则见[后续复查](docs/PDF_RUNTIME_AND_BOT_STATUS_FOLLOWUP.md)。
 - **🕸️ 多智能体协同网络与拓扑流转视图（Multi-Agent Swarm & Visual Topology）**：
   支持通过 `@` 呼叫或直接在自然语言对话中调度跨领域智能体（如让架构管家调度直播巡检官），任务自动转派协同；提供交互式多智能体协同网络拓扑流转全景图。
 
@@ -113,6 +116,9 @@ TC Studio 的智能体并非传统打字聊天的对话机器人，而是**以�
   支持一键动态探测后端 Base URL 下的 `/models`、`/v1/models` 以及 Ollama `/api/tags` 模型列表；全面兼容 **DeepSeek (V3/R1)**、**通义千问 (Qwen-2.5)**、**本地 Ollama** 及任何符合 OpenAI 规范的模型。
 
 ---
+
+智能体生成 PDF 报告使用服务端 `create_pdf_report(filename, title, content)`，内嵌中文字体并自动换行、分页。
+故障证据、输入边界与回归方法见 [PDF 报告生成与验收说明](docs/PDF_REPORT_GENERATION.md)。
 
 ### 5. 📚 原生级官方文档与规范中心 (Docs Center & Common Specs)
 
@@ -156,6 +162,8 @@ TC Studio 的智能体并非传统打字聊天的对话机器人，而是**以�
 ├── core/                             # 核心支撑引擎 (SSoT 架构)
 │   ├── agent/                        # 智能体架构实现
 │   │   ├── engine.py                 # CodeAgent 沙箱执行引擎与动态提示词装配
+│   │   ├── capabilities.py           # 统一能力目录、SQLite 动态策略与任务快照
+│   │   ├── sandbox_policy.py         # 项目固定的模块/属性白名单
 │   │   ├── bot_manager.py            # 多 BOT 实例、通用人设准则、技能树与记忆持久化
 │   │   ├── run_manager.py            # 异步运行实例与高危门禁拦截控制器
 │   │   ├── rag_manager.py            # 轻量私有知识库挂载与语义检索召回管理器
@@ -306,11 +314,17 @@ cp config.example.json config.json
 
 ```bash
 # 本地开发（直接运行 app.py 时也会使用这两个安全的本地默认值）
-TC_STUDIO_APP_ENV=development TC_STUDIO_AUTH_ENABLED=false python3 app.py
+TC_STUDIO_APP_ENV=development TC_STUDIO_AUTH_ENABLED=false uv run --locked python app.py
 ```
 
 服务启动后，在浏览器中打开：
 👉 **http://127.0.0.1:8000**
+
+使用锁文件环境启动，避免全局 `python3` 和项目 `.venv` 的依赖不一致。服务启动会构造并关闭真实模型客户端，
+再实际生成一页中文 PDF 自检；缺少 `smolagents[openai]`、ReportLab 或随包字体时拒绝启动，并提示修复命令。
+模型自检不访问外部服务、不使用真实 API Key。DeepSeek、Qwen、Ollama 等也通过 OpenAI 兼容协议适配器调用，
+因此该扩展属于必需依赖。使用 pip 安装时，请用安装依赖的同一解释器启动。
+依赖漏项及 SSE 错误处理的修复和验证见[模型运行依赖与错误流修复](docs/MODEL_RUNTIME_AND_SSE_ERROR_FIX.md)。
 
 ---
 
@@ -396,12 +410,20 @@ export OIDC_JWKS_URL=https://sso.example.com/realms/ops/protocol/openid-connect/
 # 旧 AUTH_PROVIDER / TIM_AUTH_PROVIDER 仍兼容读取；OIDC_* 名称保持外部身份系统契约
 
 # 启动服务
-python3 app.py
+uv run --locked --no-dev uvicorn app:app --host 0.0.0.0 --port 8000 --workers 1
 ```
 
 ### 2. CodeAgent 执行边界（Linux 生产必须使用 nsjail）
 
-主 CodeAgent 的代码执行通过独立的非 daemon worker、父子 JSON RPC、父端硬超时和进程组回收实现。单线程 POSIX 开发进程可使用 `fork`；FastAPI/AgentRun 多线程场景会自动切换为 spawn + RPC，Windows 始终使用 spawn + RPC。
+主 CodeAgent 的代码执行通过独立的非 daemon worker、父子 JSON RPC、父端硬超时和进程组回收实现。带工具或文件能力的正常 Agent 路径使用 spawn + RPC，macOS/Windows 也使用该路径；仅无外部能力、单线程且支持 fork 的非 macOS POSIX 计算路径可使用 `fork`。
+
+模块导入集合由 `sandbox_policy.py` 显式固定；`run_skill` 保留独立且更窄的模块/属性策略。
+文件、PDF、云 API、受控网页读取等统一由能力目录注册，按声明的上下文绑定到主会话、协同和技能 worker。
+网页读取默认关闭；需管理员批准精确域名后启用，仅 HTTPS/443，通过固定连接地址的 TLS 和可终止网络进程执行，
+不跟随跳转、不下载文件、不携带凭据；并发和分钟配额通过 SQLite 跨服务进程共享。
+管理员可在“配置 → 能力权限 / 网页访问”在线启停已部署能力，与模型连接共用底部“保存更改”；[配置交互与保存边界](docs/AGENT_SETTINGS_UX.md)说明冲突及部分失败处理。策略存在 SQLite，新任务读取最新设置，
+任务及其子调用固定使用启动快照。新增执行代码/依赖仍需审查、锁定和部署。
+管理接口、单机多进程语义、实测证伪与扩展步骤见[沙箱能力与扩展约定](docs/SANDBOX_CAPABILITIES_AND_EXTENSION.md)。
 
 Linux 生产、预发布环境必须使用 `nsjail`，并由部署提供最小 rootfs 与 seccomp-bpf（Kafel）策略文件：
 
@@ -412,7 +434,7 @@ export TC_STUDIO_NSJAIL_BIN=/usr/local/bin/nsjail
 export TC_STUDIO_NSJAIL_ROOT=/opt/tc-studio/nsjail-rootfs
 export TC_STUDIO_NSJAIL_PYTHON=/usr/bin/python3
 export TC_STUDIO_NSJAIL_SECCOMP_POLICY=/opt/tc-studio/nsjail-python.policy
-python3 app.py
+uv run --locked --no-dev uvicorn app:app --host 0.0.0.0 --port 8000 --workers 1
 ```
 
 nsjail worker 只接收工具名和 RPC 代理；云客户端、BotManager、AgentEngine 以及审批回调留在父进程。nsjail profile 应将应用代码与 Python 运行时以只读方式挂载，将 `/tmp` 设为临时文件系统，启用网络、PID/IPC/UTS 命名空间隔离，并设置 CPU、地址空间、文件描述符和墙钟时间上限。`TC_STUDIO_NSJAIL_SECCOMP_POLICY` 是宿主机上的 Kafel 策略文件路径。未安装 nsjail、未配置 rootfs 或缺少 seccomp 策略时，生产请求会 fail-closed；旧的 `TIM_NSJAIL_*` 变量仍可兼容读取。

@@ -77,6 +77,7 @@ export const AgentPromptTab: React.FC<AgentPromptTabProps> = ({
   const [editedBasePrompt, setEditedBasePrompt] = useState<string>('')
   const [copiedPromptId, setCopiedPromptId] = useState<string | null>(null)
   const [hasCopiedBotId, setHasCopiedBotId] = useState<boolean>(false)
+  const canEditDefinition = Boolean(activeBot?.permissions?.can_edit_definition)
 
   const isAllBlueprintExpanded = Object.values(expandedBlueprintCards).every(Boolean)
 
@@ -144,7 +145,7 @@ export const AgentPromptTab: React.FC<AgentPromptTabProps> = ({
           </div>
 
           <div className="flex items-center gap-1.5">
-            {activeBot?.id !== 'default_assistant' && (
+            {activeBot?.id !== 'default_assistant' && canEditDefinition && (
               <button
                 type="button"
                 onClick={onOpenEditProfileModal}
@@ -157,6 +158,7 @@ export const AgentPromptTab: React.FC<AgentPromptTabProps> = ({
             )}
             <button
               type="button"
+              disabled={!canEditDefinition}
               onClick={onOpenModelModal}
               className="px-2 py-1 rounded-lg border border-slate-200 dark:border-slate-800 hover:bg-slate-50 dark:hover:bg-slate-800 text-[11px] text-slate-700 dark:text-slate-300 flex items-center gap-1 cursor-pointer transition-colors"
               title="配置专属推理模型"
@@ -172,7 +174,7 @@ export const AgentPromptTab: React.FC<AgentPromptTabProps> = ({
             {activeBot.description}
           </p>
         ) : (
-          activeBot?.id !== 'default_assistant' && (
+          activeBot?.id !== 'default_assistant' && canEditDefinition && (
             <div
               onClick={onOpenEditProfileModal}
               className="text-[11px] text-slate-400 dark:text-slate-500 border border-dashed border-slate-200 dark:border-slate-800 p-2 rounded-xl text-center cursor-pointer hover:border-blue-400 hover:text-blue-500 transition-colors"
@@ -552,6 +554,7 @@ export const AgentPromptTab: React.FC<AgentPromptTabProps> = ({
                                 </div>
                                 <button
                                   type="button"
+                                  disabled={!canEditDefinition}
                                   onClick={(e) => {
                                     e.stopPropagation()
                                     onDeleteGuideline(g.id)
@@ -572,7 +575,7 @@ export const AgentPromptTab: React.FC<AgentPromptTabProps> = ({
                         </div>
                       ) : (
                         <div className="p-3 rounded-xl bg-slate-50/60 dark:bg-slate-950/60 border border-dashed border-slate-200 dark:border-slate-800 text-xs text-slate-400 text-center italic mt-2">
-                          尚无沉淀准则。日常交流中，智能体会自主捕捉您的操作偏好并在后台自动强化准则库。
+                          {activeBot?.visibility === 'public' ? '尚无共享准则。个人行为偏好自动保存在当前用户的记忆中。' : '尚无沉淀准则，可在日常交流中表达长期要求。'}
                         </div>
                       )}
                     </div>
@@ -1087,7 +1090,7 @@ export const AgentPromptTab: React.FC<AgentPromptTabProps> = ({
         {/* 视图 2: 基础设定 (Base Persona) */}
         {promptViewMode === 'base' && (
           <div className="space-y-2.5">
-            {activeBot?.id === 'default_assistant' ? (
+            {activeBot?.id === 'default_assistant' || !canEditDefinition ? (
               /* 内置智能体：受保护，严禁修改 */
               <div className="space-y-2.5">
                 <div className="p-3 rounded-xl bg-amber-500/10 border border-amber-500/20 text-[11px] text-amber-900 dark:text-amber-200 leading-relaxed flex items-start gap-2.5">
@@ -1097,7 +1100,7 @@ export const AgentPromptTab: React.FC<AgentPromptTabProps> = ({
                       <span>官方核心内置设定（系统保护 · 只读）</span>
                     </div>
                     <p className="text-[10px] text-slate-600 dark:text-slate-400 leading-normal">
-                      该智能体预装了腾讯云多业务全量接口（涵盖云直播 API 3.0 与即时通信 IM REST 等）最高调度权限与标准流转机制。其人设基底由平台统一维护，防止破坏底座契约。您可以在交流中使其进化准则、记忆与技能，或点击「+」新建专属智能体自定义任意人设。
+                      助手共享人设由平台或对应范围的管理员维护。公共 BOT 对话中的偏好、记忆和技能仅属于当前用户；也可以新建私有 BOT 定制人设。云接口调用仍受当前用户角色及高危操作确认约束。
                     </p>
                   </div>
                 </div>
@@ -1266,7 +1269,7 @@ export const AgentPromptTab: React.FC<AgentPromptTabProps> = ({
                 : `永久移除「${activeBot?.name}」，清理其所有记忆、技能与历史会话。`}
             </div>
           </div>
-          {activeBot?.id !== 'default_assistant' ? (
+          {activeBot?.id !== 'default_assistant' && canEditDefinition ? (
             <Button
               variant="destructive"
               size="sm"

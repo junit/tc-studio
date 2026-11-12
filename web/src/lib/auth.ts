@@ -94,14 +94,30 @@ export async function openWithAuth(url: string): Promise<void> {
 
 export function installApiAuthInterceptor(): void {
   const nativeFetch = window.fetch.bind(window)
+  const initialToken = getAccessToken()
+  let identityChanged = false
+  const checkIdentity = () => {
+    if (getAccessToken() === initialToken && !identityChanged) return
+    if (!identityChanged) {
+      identityChanged = true
+      window.location.reload()
+    }
+    throw new Error('登录身份已变化，正在重新加载个人工作区')
+  }
   window.fetch = (input: RequestInfo | URL, init?: RequestInit) => {
     const requestUrl = new URL(input instanceof Request ? input.url : input.toString(), window.location.origin)
     const isSameOriginApi = requestUrl.origin === window.location.origin && requestUrl.pathname.startsWith('/api/')
+    if (isSameOriginApi) {
+      try { checkIdentity() } catch (error) { return Promise.reject(error) }
+    }
     const existingHeaders = init?.headers || (input instanceof Request ? input.headers : undefined)
     const requestInit: RequestInit = isSameOriginApi
-      ? { ...init, headers: authHeaders(existingHeaders) }
+      ? { ...init, headers: authHeaders(existingHeaders), cache: 'no-store' }
       : init
-    return nativeFetch(input, requestInit)
+    return nativeFetch(input, requestInit).then((response) => {
+      if (isSameOriginApi) checkIdentity()
+      return response
+    })
   }
 
   document.addEventListener('click', (event) => {

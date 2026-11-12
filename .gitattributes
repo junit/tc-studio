@@ -1,0 +1,3 @@
+# Bundled third-party template literals contain significant trailing whitespace.
+# Check the source files normally; do not strip characters from generated JS.
+static/assets/*.js linguist-generated=true whitespace=-blank-at-eol

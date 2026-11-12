@@ -13,6 +13,7 @@ import { KnowledgeDoc } from './types'
 
 interface AgentKnowledgeTabProps {
   activeBotId: string
+  isPublicBot?: boolean
   knowledgeDocs: KnowledgeDoc[]
   isLoadingKnowledge: boolean
   isUploadingKnowledge: boolean
@@ -30,6 +31,7 @@ interface AgentKnowledgeTabProps {
 
 export const AgentKnowledgeTab: React.FC<AgentKnowledgeTabProps> = ({
   activeBotId,
+  isPublicBot = false,
   knowledgeDocs,
   isLoadingKnowledge,
   isUploadingKnowledge,
@@ -50,13 +52,14 @@ export const AgentKnowledgeTab: React.FC<AgentKnowledgeTabProps> = ({
       <div className="p-3 rounded-xl bg-gradient-to-r from-sky-50 to-indigo-50/70 dark:from-sky-950/40 dark:to-indigo-950/30 border border-sky-200/80 dark:border-sky-800/80 text-[11px] text-sky-900 dark:text-sky-200 leading-relaxed shadow-2xs">
         <div className="flex items-center gap-1.5 font-semibold text-xs text-sky-800 dark:text-sky-200 mb-1">
           <BookOpen className="h-3.5 w-3.5 text-sky-500" />
-          <span>企业知识库与私有运维手册 (Lightweight RAG)</span>
+          <span>{isPublicBot ? '我的知识库' : '企业知识库与私有运维手册'} (Lightweight RAG)</span>
         </div>
         为当前智能体挂载团队特有的故障排障手册、业务规范、敏感词规则或私有文档（支持 Markdown、Word、PDF、TXT、JSON、CSV）。智能体在执行需求时会自动结合语义检索召回规范依据，并在需要时调用{' '}
         <code className="px-1 py-0.2 rounded bg-sky-100 dark:bg-sky-900 font-mono text-[10px]">
           search_knowledge
         </code>{' '}
         工具。
+        {isPublicBot && ' 公共 BOT 共享助手能力；这里的文档只用于当前用户的会话，其他用户无法查看、下载或检索。'}
       </div>
 
       {/* 隐藏文件输入控件 */}

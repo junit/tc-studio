@@ -4,6 +4,7 @@ import { SkillItem } from './types'
 
 interface AgentSkillsTabProps {
   skills: SkillItem[]
+  isPublicBot?: boolean
   onInspectSkill: (skill: SkillItem) => void
   onDeleteSkill: (skillName: string) => void
   onRunSkill: (skillName: string) => void
@@ -11,6 +12,7 @@ interface AgentSkillsTabProps {
 
 export const AgentSkillsTab: React.FC<AgentSkillsTabProps> = ({
   skills,
+  isPublicBot = false,
   onInspectSkill,
   onDeleteSkill,
   onRunSkill,
@@ -18,7 +20,7 @@ export const AgentSkillsTab: React.FC<AgentSkillsTabProps> = ({
   return (
     <div className="space-y-3">
       <div className="p-2.5 rounded-xl bg-amber-50 dark:bg-amber-950/40 border border-amber-200 dark:border-amber-800 text-[11px] text-amber-800 dark:text-amber-300 leading-relaxed">
-        ⚡ <strong>自主沉淀专属技能</strong>：当智能体编写并验证成功复杂批量脚本后，会自主在后台调用 <code>save_skill</code> 沉淀为专属技能。后续随叫随跑，执行提速 90% 以上。
+        {isPublicBot ? '我的技能：仅当前用户可见、修改和调用；同名技能不会影响其他用户。' : '专属技能：智能体可通过 save_skill 保存已验证的流程，供后续任务复用。'}
       </div>
 
       {(!skills || skills.length === 0) ? (

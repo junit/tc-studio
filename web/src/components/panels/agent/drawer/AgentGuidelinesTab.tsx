@@ -4,23 +4,29 @@ import { LearnedGuideline } from './types'
 
 interface AgentGuidelinesTabProps {
   guidelines: LearnedGuideline[]
+  isPublicBot?: boolean
+  canEdit: boolean
   onDeleteGuideline: (id: string) => void
 }
 
 export const AgentGuidelinesTab: React.FC<AgentGuidelinesTabProps> = ({
   guidelines,
+  isPublicBot = false,
+  canEdit,
   onDeleteGuideline,
 }) => {
   return (
     <div className="space-y-3">
       <div className="p-2.5 rounded-xl bg-blue-50 dark:bg-blue-950/40 border border-blue-200 dark:border-blue-800 text-[11px] text-blue-800 dark:text-blue-300 leading-relaxed">
-        💡 <strong>自主沉淀无感准则</strong>：在日常交流中，智能体会自主理解您的管理习惯与业务要求，并在后台自动调用 <code>enhance_self_prompt</code> 增强准则库。无需打扰用户，即可持久生效。
+        {isPublicBot
+          ? '这里是所有用户共用的助手准则，由对应范围的管理员显式管理。对话中自动学习的个人偏好保存在“记忆”中，仅自己可见。'
+          : '智能体可通过 enhance_self_prompt 沉淀专属行为准则，供该私有 BOT 后续任务使用。'}
       </div>
 
       {(!guidelines || guidelines.length === 0) ? (
         <div className="text-center py-8 text-slate-400 text-xs">
           暂无沉淀的强化准则。<br />
-          可在日常对话中直接吩咐要求，它将自动提炼并固化为专属准则。
+          {isPublicBot ? '个人偏好请在“记忆”中查看。' : '可在日常对话中表达您的长期要求。'}
         </div>
       ) : (
         guidelines.map((g: LearnedGuideline, idx: number) => (
@@ -33,6 +39,7 @@ export const AgentGuidelinesTab: React.FC<AgentGuidelinesTabProps> = ({
                 准则 #{idx + 1}
               </span>
               <button
+                disabled={!canEdit}
                 onClick={() => onDeleteGuideline(g.id)}
                 className="text-slate-400 hover:text-rose-500 p-0.5 rounded cursor-pointer opacity-0 group-hover:opacity-100 transition-opacity"
                 title="删除该准则"

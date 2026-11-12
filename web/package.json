@@ -11,6 +11,8 @@
   "scripts": {
     "dev": "vite",
     "typecheck": "tsc --noEmit",
+    "test:sse": "node --experimental-strip-types --test tests/sse.test.ts",
+    "test:settings": "node --experimental-strip-types --test tests/agent-settings.test.ts",
     "build": "tsc && vite build",
     "preview": "vite preview"
   },

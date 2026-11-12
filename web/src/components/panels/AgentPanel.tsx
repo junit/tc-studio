@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react'
+import React, { useState, useEffect, useLayoutEffect, useRef, useMemo, useCallback } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 import {
   Bot,
@@ -47,6 +47,7 @@ import { useApiStore } from '@/stores/apiStore'
 import { MarkdownView } from '@/components/common/MarkdownView'
 import { AuthenticatedImage } from '@/components/common/AuthenticatedImage'
 import { downloadWithAuth, openWithAuth } from '@/lib/auth'
+import { readSSEEvents } from '@/lib/sse'
 import {
   AgentExecutionRun,
   buildAgentRunFromMessage,
@@ -55,6 +56,7 @@ import { AgentTopologyViewer } from '@/components/agent/AgentTopologyViewer'
 import type { OrchestrationEvent } from '@/components/agent/AgentTopologyViewer'
 import { ConsentGateCard, ApprovalData } from './agent/ConsentGateCard'
 import { AgentPromptTab } from './agent/drawer/AgentPromptTab'
+import { AgentSettingsDialog } from './agent/AgentSettingsDialog'
 import { AgentGuidelinesTab } from './agent/drawer/AgentGuidelinesTab'
 import { AgentSkillsTab } from './agent/drawer/AgentSkillsTab'
 import { AgentMemoryTab } from './agent/drawer/AgentMemoryTab'
@@ -320,9 +322,12 @@ export const AgentPanel: React.FC = () => {
   // 批量上传文件核心方法
   const uploadFiles = async (files: FileList | File[]) => {
     if (!files || files.length === 0) return
+    const botId = activeBotId
+    const requestEpoch = botRequestEpochRef.current
     setIsUploadingFile(true)
     try {
       for (const file of Array.from(files)) {
+        if (!isCurrentBotRequest(botId, requestEpoch)) return
         // 对图片即刻生成本地零开销 Blob URL 用于即时预览
         let localPreviewUrl: string | undefined = undefined
         if (file.type.startsWith('image/')) {
@@ -336,12 +341,16 @@ export const AgentPanel: React.FC = () => {
 
         const formData = new FormData()
         formData.append('file', file)
-        const res = await fetch(`/api/agent/bots/${activeBotId}/upload`, {
+        const res = await fetch(`/api/agent/bots/${botId}/upload`, {
           method: 'POST',
           body: formData,
         })
         if (res.ok) {
           const data = await res.json()
+          if (!isCurrentBotRequest(botId, requestEpoch)) {
+            revokeLocalPreviewUrl(localPreviewUrl)
+            return
+          }
           if (data.file) {
             setAttachedFiles((prev) => [
               ...prev,
@@ -362,8 +371,10 @@ export const AgentPanel: React.FC = () => {
     } catch (err: any) {
       showToast({ type: 'error', message: '附件上传异常: ' + (err.message || '网络连接失败') })
     } finally {
-      setIsUploadingFile(false)
-      if (fileInputRef.current) fileInputRef.current.value = ''
+      if (isCurrentBotRequest(botId, requestEpoch)) {
+        setIsUploadingFile(false)
+        if (fileInputRef.current) fileInputRef.current.value = ''
+      }
     }
   }
 
@@ -469,6 +480,8 @@ export const AgentPanel: React.FC = () => {
     if (isLoadingMoreHistory || !hasMoreHistory || messages.length === 0 || !activeBotId) return
     const firstMsg = messages[0]
     if (!firstMsg || !firstMsg.id) return
+    const botId = activeBotId
+    const requestEpoch = botRequestEpochRef.current
 
     setIsLoadingMoreHistory(true)
     const el = messagesContainerRef.current
@@ -476,9 +489,10 @@ export const AgentPanel: React.FC = () => {
     const prevScrollTop = el ? el.scrollTop : 0
 
     try {
-      const res = await fetch(`/api/agent/bots/${activeBotId}/history?limit=20&before_id=${encodeURIComponent(firstMsg.id)}`)
+      const res = await fetch(`/api/agent/bots/${botId}/history?limit=20&before_id=${encodeURIComponent(firstMsg.id)}`)
       if (!res.ok) throw new Error('拉取更早历史失败')
       const data = await res.json()
+      if (!isCurrentBotRequest(botId, requestEpoch)) return
       if (data.history && data.history.length > 0) {
         const olderMessages: ChatMessage[] = data.history.map((h: any) => ({
           id: h.id || `msg-${Math.random()}`,
@@ -508,6 +522,7 @@ export const AgentPanel: React.FC = () => {
 
         // 保持视口当前位置无感知跳动 (Scroll Anchor Correction)
         requestAnimationFrame(() => {
+          if (!isCurrentBotRequest(botId, requestEpoch)) return
           if (messagesContainerRef.current) {
             const newScrollHeight = messagesContainerRef.current.scrollHeight
             const diff = newScrollHeight - prevScrollHeight
@@ -525,7 +540,7 @@ export const AgentPanel: React.FC = () => {
     } catch (err) {
       console.error('Failed to load earlier history:', err)
     } finally {
-      setIsLoadingMoreHistory(false)
+      if (isCurrentBotRequest(botId, requestEpoch)) setIsLoadingMoreHistory(false)
     }
   }
 
@@ -737,16 +752,18 @@ export const AgentPanel: React.FC = () => {
   const handleUploadKnowledge = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0]
     if (!file || !activeBotId) return
+    const botId = activeBotId
+    const requestEpoch = botRequestEpochRef.current
     try {
       setIsUploadingKnowledge(true)
       const formData = new FormData()
       formData.append('file', file)
-      const res = await fetch(`/api/agent/bots/${activeBotId}/knowledge/upload`, {
+      const res = await fetch(`/api/agent/bots/${botId}/knowledge/upload`, {
         method: 'POST',
         body: formData,
       })
       if (res.ok) {
-        await fetchKnowledgeDocs()
+        if (isCurrentBotRequest(botId, requestEpoch)) await fetchKnowledgeDocs(botId, requestEpoch)
       } else {
         const err = await res.json()
         alert(err.detail || '上传知识库文档失败')
@@ -755,20 +772,22 @@ export const AgentPanel: React.FC = () => {
       console.error('Upload knowledge error:', e)
       alert('上传知识库文档异常')
     } finally {
-      setIsUploadingKnowledge(false)
+      if (isCurrentBotRequest(botId, requestEpoch)) setIsUploadingKnowledge(false)
       if (e.target) e.target.value = ''
     }
   }
 
   // 切换文档启用/禁用
   const handleToggleKnowledgeDoc = async (docId: string, currentEnabled: boolean) => {
+    const botId = activeBotId
+    const requestEpoch = botRequestEpochRef.current
     try {
       const res = await fetch(`/api/agent/bots/${activeBotId}/knowledge/docs/${docId}`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ enabled: !currentEnabled }),
       })
-      if (res.ok) {
+      if (res.ok && isCurrentBotRequest(botId, requestEpoch)) {
         setKnowledgeDocs((prev) =>
           prev.map((d) => (d.id === docId ? { ...d, enabled: !currentEnabled } : d))
         )
@@ -781,11 +800,13 @@ export const AgentPanel: React.FC = () => {
   // 删除知识库文档
   const handleDeleteKnowledgeDoc = async (docId: string) => {
     if (!confirm('确定要删除此知识库文档及其所有索引切片吗？')) return
+    const botId = activeBotId
+    const requestEpoch = botRequestEpochRef.current
     try {
       const res = await fetch(`/api/agent/bots/${activeBotId}/knowledge/docs/${docId}`, {
         method: 'DELETE',
       })
-      if (res.ok) {
+      if (res.ok && isCurrentBotRequest(botId, requestEpoch)) {
         setKnowledgeDocs((prev) => prev.filter((d) => d.id !== docId))
       }
     } catch (e) {
@@ -797,6 +818,8 @@ export const AgentPanel: React.FC = () => {
   const handleTestSearchKnowledge = async () => {
     const q = knowledgeSearchQuery.trim()
     if (!q || !activeBotId) return
+    const botId = activeBotId
+    const requestEpoch = botRequestEpochRef.current
     try {
       setIsSearchingKnowledge(true)
       setHasSearchedKnowledge(true)
@@ -807,12 +830,13 @@ export const AgentPanel: React.FC = () => {
       })
       if (res.ok) {
         const data = await res.json()
+        if (!isCurrentBotRequest(botId, requestEpoch)) return
         setKnowledgeSearchResults(data.results || [])
       }
     } catch (e) {
       console.error('Search knowledge error:', e)
     } finally {
-      setIsSearchingKnowledge(false)
+      if (isCurrentBotRequest(botId, requestEpoch)) setIsSearchingKnowledge(false)
     }
   }
 
@@ -989,6 +1013,7 @@ export const AgentPanel: React.FC = () => {
 
   // 模型配置
   const [isModelModalOpen, setIsModelModalOpen] = useState<boolean>(false)
+  const modelSettingsTriggerRef = useRef<HTMLButtonElement>(null)
 
   const [ownershipSubject, setOwnershipSubject] = useState('')
 
@@ -1033,67 +1058,19 @@ export const AgentPanel: React.FC = () => {
     context_budget: 32000,
     max_context_turns: 25,
   })
-  const [inputApiKey, setInputApiKey] = useState<string>('')
-  const [isTestingModel, setIsTestingModel] = useState<boolean>(false)
-  const [availableModels, setAvailableModels] = useState<string[]>([])
-  const [isFetchingModels, setIsFetchingModels] = useState<boolean>(false)
-  const [modelFetchMsg, setModelFetchMsg] = useState<{ type: 'success' | 'warn'; text: string } | null>(null)
   const [isAdminUser, setIsAdminUser] = useState(false)
+  const [currentIdentity, setCurrentIdentity] = useState({ subject: '', authMode: '' })
 
   useEffect(() => {
     fetch('/api/auth/me')
       .then((response) => response.ok ? response.json() : null)
-      .then((data) => setIsAdminUser(Boolean(data?.is_admin)))
+      .then((data) => {
+        setIsAdminUser(Boolean(data?.is_admin))
+        setCurrentIdentity({ subject: data?.subject || '', authMode: data?.auth_mode || '' })
+      })
       .catch(() => setIsAdminUser(false))
   }, [])
 
-
-  const fetchAvailableModels = async (showNotification = false, overrideConfig?: Partial<LLMConfigData>) => {
-    setIsFetchingModels(true)
-    try {
-      const targetProvider = overrideConfig?.provider || llmConfig.provider
-      const targetBaseUrl = overrideConfig?.base_url !== undefined ? overrideConfig.base_url : llmConfig.base_url
-      const targetKey = inputApiKey || (llmConfig.has_api_key ? undefined : '')
-
-      const res = await fetch('/api/agent/models', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          provider: targetProvider,
-          base_url: targetBaseUrl,
-          api_key: targetKey,
-        }),
-      })
-      const data = await res.json()
-      if (data && data.models && data.models.length > 0) {
-        setAvailableModels(data.models)
-        if (data.source === 'remote') {
-          setModelFetchMsg({ type: 'success', text: `已探测到 ${data.models.length} 个模型` })
-          if (showNotification) {
-            showToast({ type: 'success', message: `成功从 /models 探测到 ${data.models.length} 个可用模型！` }, 3500)
-          }
-        } else {
-          setModelFetchMsg({ type: 'warn', text: '已载入常用预设' })
-          if (showNotification) {
-            showToast({ type: 'warning', message: data.message || '已提供常见常用模型候选' }, 4000)
-          }
-        }
-      }
-    } catch (e: any) {
-      if (showNotification) {
-        showToast({ type: 'error', message: '拉取可用模型失败: ' + (e.message || '网络异常') })
-      }
-    } finally {
-      setIsFetchingModels(false)
-    }
-  }
-
-  // 打开模型弹窗时自动拉取可用模型
-  useEffect(() => {
-    if (isModelModalOpen) {
-      fetchAvailableModels(false)
-    }
-  }, [isModelModalOpen])
 
   // 动态推荐指令刷新状态
   const [isRefreshingPrompts, setIsRefreshingPrompts] = useState<boolean>(false)
@@ -1118,7 +1095,7 @@ export const AgentPanel: React.FC = () => {
   }, [])
 
   // 切换 BOT 时拉取详情与历史
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (activeBotId) {
       activeBotIdRef.current = activeBotId
       const requestEpoch = ++botRequestEpochRef.current
@@ -1127,6 +1104,34 @@ export const AgentPanel: React.FC = () => {
         abortControllerRef.current = null
       }
       setIsGenerating(false)
+      setActiveBot(null)
+      setIsRefreshingPrompts(false)
+      setIsSavingBasePrompt(false)
+      setIsSavingProfile(false)
+      setMessages([])
+      setHasMoreHistory(false)
+      setTotalHistoryCount(0)
+      setIsLoadingMoreHistory(false)
+      setInputMessage('')
+      setAttachedFiles([])
+      setIsUploadingFile(false)
+      setBotFiles([])
+      setIsLoadingFiles(false)
+      setKnowledgeDocs([])
+      setKnowledgeSearchQuery('')
+      setKnowledgeSearchResults([])
+      setHasSearchedKnowledge(false)
+      setIsSearchingKnowledge(false)
+      setIsUploadingKnowledge(false)
+      setIsLoadingKnowledge(false)
+      setInspectingSkill(null)
+      setIsSkillModalOpen(false)
+      setIsSaveSkillModalOpen(false)
+      setIsEditProfileModalOpen(false)
+      setIsModelModalOpen(false)
+      setPreviewImage(null)
+      localPreviewUrlsRef.current.forEach((url) => URL.revokeObjectURL(url))
+      localPreviewUrlsRef.current.clear()
       loadBotDetails(activeBotId, requestEpoch)
       loadBotHistory(activeBotId, requestEpoch)
     }
@@ -1220,279 +1225,233 @@ export const AgentPanel: React.FC = () => {
     botId: string,
     controller: AbortController
   ) => {
-    const reader = response.body?.getReader()
-    const decoder = new TextDecoder('utf-8')
-    let buffer = ''
+    const body = response.body
     let terminalEventReceived = false
+    let terminalFailed = false
 
-    if (!reader) throw new Error('无法读取响应流')
+    if (!body) throw new Error('无法读取响应流')
 
     try {
-      while (true) {
-        const { value, done } = await reader.read()
-        if (done) break
+      for await (const { event: currentEvent, data: rawData } of readSSEEvents(body)) {
         if (abortControllerRef.current !== controller || activeBotIdRef.current !== botId) return
+        if (!rawData) continue
 
-        buffer += decoder.decode(value, { stream: true })
-        const lines = buffer.split('\n')
-        buffer = lines.pop() || ''
-
-        let currentEvent = 'message'
-
-        for (const line of lines) {
-          if (abortControllerRef.current !== controller || activeBotIdRef.current !== botId) return
-          if (line.startsWith('event: ')) {
-            currentEvent = line.slice(7).trim()
-          } else if (line.startsWith('data: ')) {
-            const rawData = line.slice(6).trim()
-            if (!rawData) continue
-
-            try {
-              const payload = JSON.parse(rawData)
-
-              setMessages((prev) =>
-                prev.map((msg) => {
-                  if (msg.id !== assistantMsgId) return msg
-
-                  const updated = { ...msg }
-
-                  if (currentEvent === 'sync') {
-                    const r = payload.run || payload
-                    if (r.thought) updated.thought = r.thought
-                    if (r.code_blocks && Array.isArray(r.code_blocks)) {
-                      updated.codeBlocks = r.code_blocks.map((c: any) => ({
-                        ...c,
-                        status: c.status === 'error' ? 'error' : c.status === 'running' ? 'running' : 'success',
-                      }))
-                    }
-                    if (r.execution_logs && Array.isArray(r.execution_logs)) {
-                      updated.executionLogs = r.execution_logs.map((l: any) => ({
-                        ...l,
-                        status: l.status === 'error' ? 'error' : 'success',
-                      }))
-                    }
-                    if (r.content) updated.content = r.content
-                    if (r.stream_status) updated.streamStatus = r.stream_status
-                    if (r.current_step) updated.currentStep = r.current_step
-                    if (r.pending_approval !== undefined) updated.pendingApproval = r.pending_approval
-                    if (r.status === 'done' || r.status === 'error' || r.status === 'stopped') {
-                      terminalEventReceived = true
-                      updated.isStreaming = false
-                      updated.streamStatus = r.status === 'error' ? 'error' : 'done'
-                      setActiveRunsMap((prev) => {
-                        if (!prev[botId]) return prev
-                        const next = { ...prev }
-                        delete next[botId]
-                        return next
-                      })
-                    } else {
-                      setActiveRunsMap((prev) => ({
-                        ...prev,
-                        [botId]: {
-                          run_id: r.run_id || prev[botId]?.run_id || '',
-                          bot_id: botId,
-                          status: 'running',
-                          stream_status: r.stream_status || 'thinking',
-                          start_time: r.start_time,
-                          current_step: r.current_step || 1,
-                          user_message: r.user_message || prev[botId]?.user_message || '',
-                        },
-                      }))
-                    }
-                  } else if (currentEvent === 'thought_chunk') {
-                    const delta = payload.delta || ''
-                    if (delta) {
-                      updated.thought = (updated.thought || '') + delta
-                      updated.streamStatus = 'thinking'
-                    }
-                  } else if (currentEvent === 'thought') {
-                    const clean = (payload.content || '').trim()
-                    if (clean) {
-                      updated.thought = (updated.thought ? updated.thought + '\n\n' : '') + clean
-                    }
-                  } else if (currentEvent === 'code_start') {
-                    updated.streamStatus = 'executing'
-                    updated.currentStep = payload.step || 1
-                    setActiveRunsMap((prev) => {
-                      if (!prev[botId]) return prev
-                      return {
-                        ...prev,
-                        [botId]: {
-                          ...prev[botId],
-                          stream_status: 'executing',
-                          current_step: payload.step || prev[botId].current_step || 1,
-                        },
-                      }
-                    })
-                    const existingCodes = [...(updated.codeBlocks || [])]
-                    const idx = existingCodes.findIndex((c) => (c.step || 1) === (payload.step || 1))
-                    const item = { step: payload.step || 1, code: payload.code || '', status: 'running' as const }
-                    if (idx >= 0) {
-                      existingCodes[idx] = item
-                    } else {
-                      existingCodes.push(item)
-                    }
-                    updated.codeBlocks = existingCodes
-                  } else if (currentEvent === 'code') {
-                    updated.codeBlocks = [
-                      ...(updated.codeBlocks || []),
-                      { step: payload.step || 1, code: payload.code || '', status: 'running' as const },
-                    ]
-                  } else if (currentEvent === 'execution_result') {
-                    const stepNum = payload.step || 1
-                    const existingLogs = [...(updated.executionLogs || [])]
-                    const logIdx = existingLogs.findIndex((l) => (l.step || 1) === stepNum)
-                    const logItem = { step: stepNum, output: payload.output || '', status: 'success' as const }
-                    if (logIdx >= 0) {
-                      existingLogs[logIdx] = logItem
-                    } else {
-                      existingLogs.push(logItem)
-                    }
-                    updated.executionLogs = existingLogs
-
-                    if (updated.codeBlocks) {
-                      updated.codeBlocks = updated.codeBlocks.map((c) =>
-                        (c.step || 1) === stepNum ? { ...c, status: 'success' as const } : c
-                      )
-                    }
-                  } else if (currentEvent === 'execution' || currentEvent === 'tool') {
-                    const stepNum = payload.step || 1
-                    updated.executionLogs = [
-                      ...(updated.executionLogs || []),
-                      { step: stepNum, output: payload.output || '', status: 'success' as const },
-                    ]
-                    if (updated.codeBlocks) {
-                      updated.codeBlocks = updated.codeBlocks.map((c) =>
-                        (c.step || 1) === stepNum ? { ...c, status: 'success' as const } : c
-                      )
-                    }
-                  } else if (currentEvent === 'approval_required') {
-                    updated.pendingApproval = payload
-                    updated.streamStatus = 'waiting_approval'
-                    setActiveRunsMap((prev) => {
-                      if (!prev[botId]) return prev
-                      return {
-                        ...prev,
-                        [botId]: {
-                          ...prev[botId],
-                          stream_status: 'waiting_approval',
-                          pending_approval: payload,
-                        },
-                      }
-                    })
-                  } else if (currentEvent === 'approval_resolved') {
-                    if (updated.pendingApproval && updated.pendingApproval.approval_id === payload.approval_id) {
-                      updated.pendingApproval = {
-                        ...updated.pendingApproval,
-                        decision: payload.decision,
-                      }
-                    }
-                    if (payload.decision === 'approve') {
-                      updated.streamStatus = 'executing'
-                    }
-                    setActiveRunsMap((prev) => {
-                      if (!prev[botId]) return prev
-                      return {
-                        ...prev,
-                        [botId]: {
-                          ...prev[botId],
-                          stream_status: payload.decision === 'approve' ? 'executing' : prev[botId].stream_status,
-                          pending_approval: undefined,
-                        },
-                      }
-                    })
-                  } else if (currentEvent === 'orchestration') {
-                    const existingOrchs = [...(updated.orchestrations || [])]
-                    existingOrchs.push(payload)
-                    updated.orchestrations = existingOrchs
-                  } else if (currentEvent === 'answer_start') {
-                    updated.streamStatus = 'answering'
-                    setActiveRunsMap((prev) => {
-                      if (!prev[botId]) return prev
-                      return {
-                        ...prev,
-                        [botId]: {
-                          ...prev[botId],
-                          stream_status: 'answering',
-                        },
-                      }
-                    })
-                    if (updated.codeBlocks) {
-                      updated.codeBlocks = updated.codeBlocks.map((c) =>
-                        c.status === 'running' ? { ...c, status: 'success' as const } : c
-                      )
-                    }
-                  } else if (currentEvent === 'chunk' || currentEvent === 'message') {
-                    let text = currentEvent === 'chunk' ? (payload.delta || '') : (payload.content || '')
-                    updated.streamStatus = 'answering'
-                    if (updated.codeBlocks) {
-                      updated.codeBlocks = updated.codeBlocks.map((c) =>
-                        c.status === 'running' ? { ...c, status: 'success' as const } : c
-                      )
-                    }
-                    if (text.includes('<think>')) {
-                      const thinkMatch = text.match(/<think>([\s\S]*?)(?:<\/think>|$)/i)
-                      if (thinkMatch) {
-                        const extracted = thinkMatch[1].trim()
-                        if (extracted) {
-                          updated.thought = (updated.thought ? updated.thought + '\n\n' : '') + extracted
-                        }
-                        text = text.replace(/<think>[\s\S]*?(?:<\/think>|$)/gi, '').trim()
-                      }
-                    }
-                    if (currentEvent === 'chunk') {
-                      updated.content = (updated.content || '') + text
-                    } else {
-                      updated.content = text || updated.content
-                    }
-                  } else if (currentEvent === 'done') {
-                    terminalEventReceived = true
-                    updated.isStreaming = false
-                    updated.streamStatus = 'done'
-                    if (payload.orchestrations) {
-                      updated.orchestrations = payload.orchestrations
-                    }
-                    if (payload.attachments && payload.attachments.length > 0) {
-                      updated.attachments = payload.attachments
-                    } else if (payload.files && payload.files.length > 0) {
-                      updated.attachments = payload.files
-                    }
-                    setActiveRunsMap((prev) => {
-                      if (!prev[botId]) return prev
-                      const next = { ...prev }
-                      delete next[botId]
-                      return next
-                    })
-                    if (updated.codeBlocks) {
-                      updated.codeBlocks = updated.codeBlocks.map((c) =>
-                        c.status === 'running' ? { ...c, status: 'success' as const } : c
-                      )
-                    }
-                    if (updated.startTime) {
-                      updated.elapsedSeconds = Number(((Date.now() - updated.startTime) / 1000).toFixed(1))
-                    }
-                    // 实时联动刷新右侧抽屉「产出物与文件中心」
-                    fetchBotFiles(botId)
-                  } else if (currentEvent === 'error') {
-                    terminalEventReceived = true
-                    updated.isStreaming = false
-                    updated.streamStatus = 'error'
-                    updated.content = `❌ **执行遇到错误**: ${payload.error || '未知异常'}`
-                    setActiveRunsMap((prev) => {
-                      if (!prev[botId]) return prev
-                      const next = { ...prev }
-                      delete next[botId]
-                      return next
-                    })
-                  }
-
-                  return updated
-                })
-              )
-            } catch (err) {
-              console.warn('Error parsing SSE json:', err, rawData)
-            }
+        try {
+          const parsed = JSON.parse(rawData)
+          // Reconnected terminal events wrap their result in a run snapshot.
+          const payload = parsed.run || parsed
+          const terminalStatus = currentEvent === 'sync' ? payload.status : currentEvent
+          const isTerminalEvent = terminalStatus === 'done' || terminalStatus === 'error' || terminalStatus === 'stopped'
+          if (isTerminalEvent) {
+            // React may defer updater execution until after EOF. Record the
+            // terminal state synchronously before scheduling any UI updates.
+            terminalEventReceived = true
+            terminalFailed = terminalStatus === 'error'
           }
+
+          setActiveRunsMap((prev) => {
+            if (isTerminalEvent) {
+              if (!prev[botId]) return prev
+              const next = { ...prev }
+              delete next[botId]
+              return next
+            }
+            if (currentEvent === 'sync') {
+              return {
+                ...prev,
+                [botId]: {
+                  run_id: payload.run_id || prev[botId]?.run_id || '',
+                  bot_id: botId,
+                  status: 'running',
+                  stream_status: payload.stream_status || 'thinking',
+                  start_time: payload.start_time,
+                  current_step: payload.current_step || 1,
+                  user_message: payload.user_message || prev[botId]?.user_message || '',
+                },
+              }
+            }
+            const run = prev[botId]
+            if (!run) return prev
+            if (currentEvent === 'code_start') {
+              return { ...prev, [botId]: { ...run, stream_status: 'executing', current_step: payload.step || run.current_step || 1 } }
+            }
+            if (currentEvent === 'approval_required') {
+              return { ...prev, [botId]: { ...run, stream_status: 'waiting_approval', pending_approval: payload } }
+            }
+            if (currentEvent === 'approval_resolved') {
+              return { ...prev, [botId]: { ...run, stream_status: payload.decision === 'approve' ? 'executing' : run.stream_status, pending_approval: undefined } }
+            }
+            if (currentEvent === 'answer_start') {
+              return { ...prev, [botId]: { ...run, stream_status: 'answering' } }
+            }
+            return prev
+          })
+
+          setMessages((prev) =>
+            prev.map((msg) => {
+              if (msg.id !== assistantMsgId) return msg
+
+              const updated = { ...msg }
+
+              if (currentEvent === 'sync') {
+                const r = payload
+                if (r.thought) updated.thought = r.thought
+                if (r.code_blocks && Array.isArray(r.code_blocks)) {
+                  updated.codeBlocks = r.code_blocks.map((c: any) => ({
+                    ...c,
+                    status: c.status === 'error' ? 'error' : c.status === 'running' ? 'running' : 'success',
+                  }))
+                }
+                if (r.execution_logs && Array.isArray(r.execution_logs)) {
+                  updated.executionLogs = r.execution_logs.map((l: any) => ({
+                    ...l,
+                    status: l.status === 'error' ? 'error' : 'success',
+                  }))
+                }
+                if (r.content) updated.content = r.content
+                if (r.status === 'error') updated.content = `❌ **执行遇到错误**: ${r.error || '未知异常'}`
+                if (Array.isArray(r.attachments)) updated.attachments = r.attachments
+                if (r.stream_status) updated.streamStatus = r.stream_status
+                if (r.current_step) updated.currentStep = r.current_step
+                if (r.pending_approval !== undefined) updated.pendingApproval = r.pending_approval
+                if (r.status === 'done' || r.status === 'error' || r.status === 'stopped') {
+                  updated.isStreaming = false
+                  updated.streamStatus = r.status === 'error' ? 'error' : 'done'
+                }
+              } else if (currentEvent === 'thought_chunk') {
+                const delta = payload.delta || ''
+                if (delta) {
+                  updated.thought = (updated.thought || '') + delta
+                  updated.streamStatus = 'thinking'
+                }
+              } else if (currentEvent === 'thought') {
+                const clean = (payload.content || '').trim()
+                if (clean) {
+                  updated.thought = (updated.thought ? updated.thought + '\n\n' : '') + clean
+                }
+              } else if (currentEvent === 'code_start') {
+                updated.streamStatus = 'executing'
+                updated.currentStep = payload.step || 1
+                const existingCodes = [...(updated.codeBlocks || [])]
+                const idx = existingCodes.findIndex((c) => (c.step || 1) === (payload.step || 1))
+                const item = { step: payload.step || 1, code: payload.code || '', status: 'running' as const }
+                if (idx >= 0) {
+                  existingCodes[idx] = item
+                } else {
+                  existingCodes.push(item)
+                }
+                updated.codeBlocks = existingCodes
+              } else if (currentEvent === 'code') {
+                updated.codeBlocks = [
+                  ...(updated.codeBlocks || []),
+                  { step: payload.step || 1, code: payload.code || '', status: 'running' as const },
+                ]
+              } else if (currentEvent === 'execution_result') {
+                const stepNum = payload.step || 1
+                const existingLogs = [...(updated.executionLogs || [])]
+                const logIdx = existingLogs.findIndex((l) => (l.step || 1) === stepNum)
+                const logItem = { step: stepNum, output: payload.output || '', status: 'success' as const }
+                if (logIdx >= 0) {
+                  existingLogs[logIdx] = logItem
+                } else {
+                  existingLogs.push(logItem)
+                }
+                updated.executionLogs = existingLogs
+
+                if (updated.codeBlocks) {
+                  updated.codeBlocks = updated.codeBlocks.map((c) =>
+                    (c.step || 1) === stepNum ? { ...c, status: 'success' as const } : c
+                  )
+                }
+              } else if (currentEvent === 'execution' || currentEvent === 'tool') {
+                const stepNum = payload.step || 1
+                updated.executionLogs = [
+                  ...(updated.executionLogs || []),
+                  { step: stepNum, output: payload.output || '', status: 'success' as const },
+                ]
+                if (updated.codeBlocks) {
+                  updated.codeBlocks = updated.codeBlocks.map((c) =>
+                    (c.step || 1) === stepNum ? { ...c, status: 'success' as const } : c
+                  )
+                }
+              } else if (currentEvent === 'approval_required') {
+                updated.pendingApproval = payload
+                updated.streamStatus = 'waiting_approval'
+              } else if (currentEvent === 'approval_resolved') {
+                if (updated.pendingApproval && updated.pendingApproval.approval_id === payload.approval_id) {
+                  updated.pendingApproval = {
+                    ...updated.pendingApproval,
+                    decision: payload.decision,
+                  }
+                }
+                if (payload.decision === 'approve') {
+                  updated.streamStatus = 'executing'
+                }
+              } else if (currentEvent === 'orchestration') {
+                const existingOrchs = [...(updated.orchestrations || [])]
+                existingOrchs.push(payload)
+                updated.orchestrations = existingOrchs
+              } else if (currentEvent === 'answer_start') {
+                updated.streamStatus = 'answering'
+                if (updated.codeBlocks) {
+                  updated.codeBlocks = updated.codeBlocks.map((c) =>
+                    c.status === 'running' ? { ...c, status: 'success' as const } : c
+                  )
+                }
+              } else if (currentEvent === 'chunk' || currentEvent === 'message') {
+                let text = currentEvent === 'chunk' ? (payload.delta || '') : (payload.content || '')
+                updated.streamStatus = 'answering'
+                if (updated.codeBlocks) {
+                  updated.codeBlocks = updated.codeBlocks.map((c) =>
+                    c.status === 'running' ? { ...c, status: 'success' as const } : c
+                  )
+                }
+                if (text.includes('<think>')) {
+                  const thinkMatch = text.match(/<think>([\s\S]*?)(?:<\/think>|$)/i)
+                  if (thinkMatch) {
+                    const extracted = thinkMatch[1].trim()
+                    if (extracted) {
+                      updated.thought = (updated.thought ? updated.thought + '\n\n' : '') + extracted
+                    }
+                    text = text.replace(/<think>[\s\S]*?(?:<\/think>|$)/gi, '').trim()
+                  }
+                }
+                if (currentEvent === 'chunk') {
+                  updated.content = (updated.content || '') + text
+                } else {
+                  updated.content = text || updated.content
+                }
+              } else if (currentEvent === 'done' || currentEvent === 'stopped') {
+                updated.isStreaming = false
+                updated.streamStatus = 'done'
+                if (payload.orchestrations) {
+                  updated.orchestrations = payload.orchestrations
+                }
+                if (payload.attachments && payload.attachments.length > 0) {
+                  updated.attachments = payload.attachments
+                } else if (payload.files && payload.files.length > 0) {
+                  updated.attachments = payload.files
+                }
+                if (updated.codeBlocks) {
+                  updated.codeBlocks = updated.codeBlocks.map((c) =>
+                    c.status === 'running' ? { ...c, status: 'success' as const } : c
+                  )
+                }
+                if (updated.startTime) {
+                  updated.elapsedSeconds = Number(((Date.now() - updated.startTime) / 1000).toFixed(1))
+                }
+              } else if (currentEvent === 'error') {
+                updated.isStreaming = false
+                updated.streamStatus = 'error'
+                updated.content = `❌ **执行遇到错误**: ${payload.error || '未知异常'}`
+              }
+
+              return updated
+            })
+          )
+          if (terminalEventReceived) break
+        } catch (err) {
+          console.warn('Error parsing SSE json:', err)
         }
       }
     } finally {
@@ -1542,7 +1501,7 @@ export const AgentPanel: React.FC = () => {
               streamStatus: msg.streamStatus === 'error' ? 'error' : 'done',
               elapsedSeconds: msg.elapsedSeconds || elapsed,
               codeBlocks: msg.codeBlocks?.map((c) =>
-                !terminalEventReceived && c.status === 'running'
+                (!terminalEventReceived || terminalFailed) && c.status === 'running'
                   ? { ...c, status: 'error' as const }
                   : terminalEventReceived && c.status === 'running'
                     ? { ...c, status: 'success' as const }
@@ -1555,6 +1514,7 @@ export const AgentPanel: React.FC = () => {
       )
 
       // 刷新当前 BOT 的资产（可能已经自增强了提示词、写入了记忆或沉淀了新技能）
+      fetchBotFiles(botId)
       loadBotDetails(botId, botRequestEpochRef.current)
       fetchBots()
     }
@@ -2132,6 +2092,8 @@ export const AgentPanel: React.FC = () => {
 
   const handleRefreshSuggestedPrompts = async () => {
     if (!activeBotId || isRefreshingPrompts) return
+    const botId = activeBotId
+    const requestEpoch = botRequestEpochRef.current
     setIsRefreshingPrompts(true)
     try {
       const res = await fetch(`/api/agent/bots/${activeBotId}/suggested-prompts`, {
@@ -2139,6 +2101,7 @@ export const AgentPanel: React.FC = () => {
       })
       const data = await res.json()
       if (res.ok && data.success && data.suggested_prompts) {
+        if (!isCurrentBotRequest(botId, requestEpoch)) return
         setActiveBot((prev: any) => ({
           ...prev,
           suggested_prompts: data.suggested_prompts,
@@ -2150,7 +2113,7 @@ export const AgentPanel: React.FC = () => {
     } catch {
       showToast({ type: 'warning', message: '网络异常' })
     } finally {
-      setIsRefreshingPrompts(false)
+      if (isCurrentBotRequest(botId, requestEpoch)) setIsRefreshingPrompts(false)
     }
   }
 
@@ -2182,6 +2145,8 @@ export const AgentPanel: React.FC = () => {
 
   const handleSaveBasePrompt = async (newPrompt: string) => {
     if (!activeBotId) return
+    const botId = activeBotId
+    const requestEpoch = botRequestEpochRef.current
     if (activeBotId === 'default_assistant') {
       showToast({ type: 'warning', message: '内置智能体基础设定受系统保护，不可修改' })
       return
@@ -2194,6 +2159,7 @@ export const AgentPanel: React.FC = () => {
         body: JSON.stringify({ base_prompt: newPrompt }),
       })
       const data = await res.json()
+      if (!isCurrentBotRequest(botId, requestEpoch)) return
       if (res.ok) {
         showToast({ type: 'success', message: '智能体人设与提示词已更新！' })
         if (data.bot) {
@@ -2208,7 +2174,7 @@ export const AgentPanel: React.FC = () => {
     } catch (e: any) {
       showToast({ type: 'warning', message: e.message || '网络异常' })
     } finally {
-      setIsSavingBasePrompt(false)
+      if (isCurrentBotRequest(botId, requestEpoch)) setIsSavingBasePrompt(false)
     }
   }
 
@@ -2227,6 +2193,8 @@ export const AgentPanel: React.FC = () => {
 
   const handleSaveProfile = async () => {
     if (!activeBotId || activeBotId === 'default_assistant') return
+    const botId = activeBotId
+    const requestEpoch = botRequestEpochRef.current
     if (!editProfileData.name.trim()) {
       showToast({ type: 'warning', message: '智能体名称不能为空' })
       return
@@ -2243,6 +2211,7 @@ export const AgentPanel: React.FC = () => {
         }),
       })
       const data = await res.json()
+      if (!isCurrentBotRequest(botId, requestEpoch)) return
       if (res.ok) {
         showToast({ type: 'success', message: '智能体资料已更新！' })
         setIsEditProfileModalOpen(false)
@@ -2258,7 +2227,7 @@ export const AgentPanel: React.FC = () => {
     } catch (e: any) {
       showToast({ type: 'warning', message: e.message || '网络异常' })
     } finally {
-      setIsSavingProfile(false)
+      if (isCurrentBotRequest(botId, requestEpoch)) setIsSavingProfile(false)
     }
   }
   const handleSaveSkillConfirm = async () => {
@@ -2300,46 +2269,6 @@ export const AgentPanel: React.FC = () => {
       }
     } catch {
       showToast({ type: 'error', message: '删除失败' })
-    }
-  }
-
-  const handleSaveModelConfig = async () => {
-    try {
-      const res = await fetch('/api/agent/config', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          ...llmConfig,
-          api_key: inputApiKey.trim() || undefined,
-        }),
-      })
-      const data = await res.json()
-      if (res.ok) {
-        showToast({ type: 'success', message: '大模型配置已保存' }, 3000)
-        setIsModelModalOpen(false)
-        fetchLlmConfig()
-      } else {
-        showToast({ type: 'error', message: data.detail || '保存失败' })
-      }
-    } catch (e: any) {
-      showToast({ type: 'error', message: e.message || '网络异常' })
-    }
-  }
-
-  const handleTestModelConnection = async () => {
-    setIsTestingModel(true)
-    try {
-      const res = await fetch('/api/agent/config/test', { method: 'POST' })
-      const data = await res.json()
-      if (data.success) {
-        showToast({ type: 'success', message: data.message || '模型连接测试成功！' }, 4000)
-      } else {
-        showToast({ type: 'error', message: data.error || '模型连接失败' }, 5000)
-      }
-    } catch (e: any) {
-      showToast({ type: 'error', message: e.message || '测试连接异常' })
-    } finally {
-      setIsTestingModel(false)
     }
   }
 
@@ -2439,6 +2368,24 @@ export const AgentPanel: React.FC = () => {
               const isRunning = Boolean(activeRun && activeRun.status === 'running')
               const streamStatus = activeRun?.stream_status || 'thinking'
               const currentStep = activeRun?.current_step || 1
+              const runningLabel = streamStatus === 'waiting_approval'
+                ? '待确认'
+                : streamStatus === 'executing'
+                ? `执行中${currentStep > 1 ? ` #${currentStep}` : ''}`
+                : streamStatus === 'coding'
+                ? '编写中'
+                : streamStatus === 'answering'
+                ? '回复中'
+                : '思考中'
+              const runningDescription = streamStatus === 'waiting_approval'
+                ? '等待确认操作……'
+                : streamStatus === 'executing'
+                ? '正在执行 Python / 工具代码……'
+                : streamStatus === 'coding'
+                ? '正在编写执行代码……'
+                : streamStatus === 'answering'
+                ? '正在组织并输出回答……'
+                : '正在分析问题……'
               const domain = getBotDomain(bot)
 
               return (
@@ -2510,43 +2457,26 @@ export const AgentPanel: React.FC = () => {
                           </span>
                         )}
                       </div>
-                    {isRunning ? (
-                      <span
-                        className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full text-[10px] font-semibold bg-blue-100/90 dark:bg-blue-900/70 text-blue-600 dark:text-blue-300 border border-blue-200 dark:border-blue-700 shrink-0 shadow-2xs animate-pulse"
-                        title={`智能体正在运行: ${streamStatus}`}
-                      >
-                        <Loader2 className="w-2.5 h-2.5 animate-spin text-blue-500 shrink-0" />
-                        <span>
-                          {streamStatus === 'executing'
-                            ? `执行中${currentStep > 1 ? ` #${currentStep}` : ''}`
-                            : streamStatus === 'answering'
-                            ? '回复中'
-                            : '思考中'}
-                        </span>
-                      </span>
-                    ) : (
-                      timeStr && (
+                    {timeStr && (
                         <span className="text-[10px] text-slate-400 shrink-0 font-mono">
                           {timeStr}
                         </span>
-                      )
                     )}
                   </div>
 
-                  {isRunning ? (
-                    <p className="text-[11px] text-blue-600 dark:text-blue-400 truncate leading-tight flex items-center gap-1 font-medium animate-pulse">
-                      <Sparkles className="w-3 h-3 shrink-0 text-blue-500" />
-                      <span className="truncate">
-                        {streamStatus === 'executing'
-                          ? '正在执行 Python / 工具代码...'
-                          : streamStatus === 'answering'
-                          ? '正在组织并输出回答...'
-                          : '正在分析问题并规划思路...'}
+                  <p className="text-[11px] text-slate-500 dark:text-slate-400 leading-tight flex items-center gap-1 min-w-0">
+                    {isRunning && (
+                      <span className="inline-flex items-center gap-1 shrink-0 text-blue-600 dark:text-blue-400" role="status">
+                        {streamStatus === 'waiting_approval'
+                          ? <Shield className="w-2.5 h-2.5" />
+                          : <Loader2 className="w-2.5 h-2.5 animate-spin" />}
+                        <span>[{runningLabel}]</span>
                       </span>
-                    </p>
-                  ) : (
-                    <p className="text-[11px] text-slate-500 dark:text-slate-400 truncate leading-tight">
-                      {bot.last_message ? (
+                    )}
+                    <span className="truncate">
+                      {isRunning ? (
+                        <span className="text-blue-600 dark:text-blue-400">我：{runningDescription}</span>
+                      ) : bot.last_message ? (
                         <>
                           <span className="text-slate-400 dark:text-slate-500">
                             {bot.last_message.role === 'user' ? '我: ' : ''}
@@ -2558,8 +2488,8 @@ export const AgentPanel: React.FC = () => {
                           {bot.description || '点击开始对话...'}
                         </span>
                       )}
-                    </p>
-                  )}
+                    </span>
+                  </p>
 
                   {/* 资产统计微徽章 */}
                   {(bot.skills_count || bot.guidelines_count || bot.memories_count) ? (
@@ -2579,13 +2509,18 @@ export const AgentPanel: React.FC = () => {
         <div className="p-3 border-t border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-900/60">
           <div className="flex items-center justify-between mb-1">
             <span className="text-[10px] font-semibold text-slate-400 uppercase tracking-wider">大模型引擎</span>
+            {isAdminUser && (
             <button
+              ref={modelSettingsTriggerRef}
+              aria-haspopup="dialog"
+              aria-expanded={isModelModalOpen}
               onClick={() => setIsModelModalOpen(true)}
               className="text-[11px] text-blue-600 dark:text-blue-400 hover:underline flex items-center gap-0.5 cursor-pointer"
             >
               <Settings className="h-3 w-3" />
               <span>配置</span>
             </button>
+            )}
           </div>
           <div className="flex items-center gap-2 text-xs font-mono text-slate-600 dark:text-slate-300">
             <span className={`h-2 w-2 rounded-full ${llmConfig.has_api_key ? 'bg-emerald-500' : 'bg-amber-500'}`} />
@@ -2617,9 +2552,8 @@ export const AgentPanel: React.FC = () => {
               <span className="text-xl group-hover:scale-105 transition-transform shrink-0">{activeBot?.avatar || '🤖'}</span>
               <div className="min-w-0">
                 <div className="flex items-center gap-1.5 sm:gap-2 flex-wrap">
-                  <h2 className="text-xs sm:text-sm font-bold text-slate-900 dark:text-slate-100 group-hover:text-blue-600 dark:group-hover:text-blue-400 transition-colors flex items-center gap-1.5 truncate">
+                  <h2 className="text-xs sm:text-sm font-bold text-slate-900 dark:text-slate-100 group-hover:text-blue-600 dark:group-hover:text-blue-400 transition-colors truncate">
                     <span>{activeBot?.name || '加载中...'}</span>
-                    <Settings className="w-3.5 h-3.5 opacity-0 group-hover:opacity-100 transition-opacity text-slate-400 hidden sm:inline" />
                   </h2>
                   {activeBot?.id === 'default_assistant' ? (
                     <Badge variant="secondary" className="font-mono text-[9px] px-1.5 py-0 bg-amber-50 text-amber-700 dark:bg-amber-950 dark:text-amber-300 border border-amber-200 dark:border-amber-800 font-semibold shrink-0">
@@ -2793,7 +2727,7 @@ export const AgentPanel: React.FC = () => {
                   </span>
                   <button
                     onClick={handleRefreshSuggestedPrompts}
-                    disabled={isRefreshingPrompts}
+                    disabled={isRefreshingPrompts || !activeBot?.permissions?.can_edit_definition}
                     className="text-[11px] text-blue-600 dark:text-blue-400 hover:text-blue-700 dark:hover:text-blue-300 flex items-center gap-1 cursor-pointer font-medium disabled:opacity-40 transition-colors"
                     title="点击根据当前智能体人设，通过大模型换一批推荐指令"
                   >
@@ -3407,6 +3341,12 @@ export const AgentPanel: React.FC = () => {
                 </button>
               </div>
 
+              {activeBot?.visibility === 'public' && (
+                <p className="px-3 pt-3 text-xs text-slate-500 dark:text-slate-400">
+                  共享助手人设；对话、偏好记忆、技能、文件与知识库仅属于当前用户。共享准则由对应范围的管理员显式维护。
+                </p>
+              )}
+
               {isAdminUser && activeBot && activeBot.visibility !== 'public' && (
                 <div className="mx-3 mt-3 rounded-lg border border-amber-200 bg-amber-50 p-2.5 dark:border-amber-800 dark:bg-amber-950/30">
                   <div className="mb-1 text-[11px] font-semibold text-amber-800 dark:text-amber-300">
@@ -3417,13 +3357,25 @@ export const AgentPanel: React.FC = () => {
                       当前所有者：<span className="font-mono">{activeBot.owner_id}</span>
                     </div>
                   )}
+                  <div className="mb-1.5 text-[11px] text-amber-700 dark:text-amber-400">
+                    当前身份：<span className="font-mono">{currentIdentity.subject || '加载中'}</span>
+                    {currentIdentity.authMode === 'local' && '。本地模式填 local；所有浏览器共享此开发身份。'}
+                  </div>
                   <div className="flex gap-1.5">
                     <input
                       value={ownershipSubject}
                       onChange={(event) => setOwnershipSubject(event.target.value)}
-                      placeholder="输入 OIDC subject"
+                      placeholder="输入目标用户 subject"
                       className="min-w-0 flex-1 rounded-md border border-amber-200 bg-white px-2 py-1 text-[11px] dark:border-amber-700 dark:bg-slate-900"
                     />
+                    <button
+                      type="button"
+                      onClick={() => setOwnershipSubject(currentIdentity.subject)}
+                      disabled={!currentIdentity.subject}
+                      className="shrink-0 rounded-md border border-amber-200 px-2 py-1 text-[11px] disabled:opacity-50 dark:border-amber-700"
+                    >
+                      使用当前身份
+                    </button>
                     <button
                       type="button"
                       onClick={handleTransferOwnership}
@@ -3525,6 +3477,7 @@ export const AgentPanel: React.FC = () => {
             <div className="flex-1 overflow-y-auto p-3 text-xs space-y-3">
               {activeTab === 'prompt' && (
                 <AgentPromptTab
+                  key={activeBotId}
                   activeBot={activeBot}
                   llmConfig={llmConfig}
                   botFilesCount={botFiles.length}
@@ -3546,6 +3499,8 @@ export const AgentPanel: React.FC = () => {
               {activeTab === 'guidelines' && (
                 <AgentGuidelinesTab
                   guidelines={activeBot?.learned_guidelines || []}
+                  isPublicBot={activeBot?.visibility === 'public'}
+                  canEdit={Boolean(activeBot?.permissions?.can_edit_definition)}
                   onDeleteGuideline={handleDeleteGuideline}
                 />
               )}
@@ -3553,6 +3508,7 @@ export const AgentPanel: React.FC = () => {
               {activeTab === 'skills' && (
                 <AgentSkillsTab
                   skills={activeBot?.skills || []}
+                  isPublicBot={activeBot?.visibility === 'public'}
                   onInspectSkill={(s) => {
                     setInspectingSkill(s)
                     setIsSkillModalOpen(true)
@@ -3585,6 +3541,7 @@ export const AgentPanel: React.FC = () => {
               {activeTab === 'knowledge' && (
                 <AgentKnowledgeTab
                   activeBotId={activeBotId}
+                  isPublicBot={activeBot?.visibility === 'public'}
                   knowledgeDocs={knowledgeDocs}
                   isLoadingKnowledge={isLoadingKnowledge}
                   isUploadingKnowledge={isUploadingKnowledge}
@@ -4066,291 +4023,9 @@ export const AgentPanel: React.FC = () => {
         </div>
       )}
 
-      {/* 6. 大模型配置弹窗 */}
-      {isModelModalOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/60 backdrop-blur-xs p-4">
-          <div className="w-full max-w-lg max-h-[92vh] overflow-y-auto bg-white dark:bg-slate-900 rounded-2xl border border-slate-200 dark:border-slate-800 p-5 shadow-2xl space-y-4">
-            <div className="flex items-center justify-between">
-              <h3 className="text-sm font-bold text-slate-900 dark:text-slate-100 flex items-center gap-2">
-                <Settings className="h-4 w-4 text-blue-600" />
-                <span>大模型连接配置</span>
-              </h3>
-              <button onClick={() => setIsModelModalOpen(false)} className="text-slate-400 hover:text-slate-600 cursor-pointer">
-                &times;
-              </button>
-            </div>
-
-            <div className="space-y-3 text-xs">
-              <div>
-                <label className="block text-slate-600 dark:text-slate-400 mb-1 font-medium">模型提供商</label>
-                <select
-                  value={llmConfig.provider}
-                  onChange={(e) => {
-                    const p = e.target.value
-                    let updated: LLMConfigData
-                    if (p === 'deepseek') {
-                      updated = { ...llmConfig, provider: p, model_name: 'deepseek-chat', base_url: 'https://api.deepseek.com', context_budget: 32000, max_context_turns: 25 }
-                    } else if (p === 'qwen') {
-                      updated = { ...llmConfig, provider: p, model_name: 'qwen-plus', base_url: 'https://dashscope.aliyuncs.com/compatible-mode/v1', context_budget: 32000, max_context_turns: 25 }
-                    } else if (p === 'ollama') {
-                      updated = { ...llmConfig, provider: p, model_name: 'qwen2.5-coder:7b', base_url: 'http://localhost:11434/v1', context_budget: 16000, max_context_turns: 15 }
-                    } else if (p === 'openai') {
-                      updated = { ...llmConfig, provider: p, model_name: 'gpt-4o', base_url: 'https://api.openai.com/v1', context_budget: 48000, max_context_turns: 30 }
-                    } else {
-                      updated = { ...llmConfig, provider: p }
-                    }
-                    setLlmConfig(updated)
-                    fetchAvailableModels(false, updated)
-                  }}
-                  className="w-full px-3 py-2 rounded-xl bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 text-xs"
-                >
-                  <option value="deepseek">DeepSeek (推荐: 高性价比、代码与编排强劲)</option>
-                  <option value="qwen">通义千问 (DashScope / 阿里百炼)</option>
-                  <option value="ollama">Ollama (本地内网运行，0 成本)</option>
-                  <option value="openai">OpenAI (GPT-4o)</option>
-                  <option value="custom">自定义 OpenAI 兼容接口 (vLLM / FastChat)</option>
-                </select>
-              </div>
-
-              <div>
-                <div className="flex items-center justify-between mb-1">
-                  <div className="flex items-center gap-1.5 min-w-0">
-                    <label className="text-slate-600 dark:text-slate-400 font-medium">模型标识 (Model ID)</label>
-                    {modelFetchMsg && (
-                      <span className={`text-[10px] truncate ${modelFetchMsg.type === 'success' ? 'text-emerald-600 dark:text-emerald-400 font-medium' : 'text-amber-500'}`}>
-                        · {modelFetchMsg.text}
-                      </span>
-                    )}
-                  </div>
-                  <button
-                    type="button"
-                    onClick={() => fetchAvailableModels(true)}
-                    disabled={isFetchingModels}
-                    className="text-[11px] text-blue-600 dark:text-blue-400 hover:underline flex items-center gap-1 font-medium cursor-pointer shrink-0 ml-2"
-                    title="请求该提供商的 /models 接口在线获取可用模型"
-                  >
-                    <RefreshCw className={`h-3 w-3 ${isFetchingModels ? 'animate-spin text-blue-500' : ''}`} />
-                    <span>{isFetchingModels ? '探测中...' : '通过 /models 在线拉取'}</span>
-                  </button>
-                </div>
-
-                <div className="relative">
-                  <input
-                    type="text"
-                    list="available-models-datalist"
-                    value={llmConfig.model_name}
-                    onChange={(e) => setLlmConfig({ ...llmConfig, model_name: e.target.value })}
-                    placeholder="输入或选择模型标识，如 deepseek-chat, qwen-plus..."
-                    className="w-full px-3 py-2 rounded-xl bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 text-xs font-mono focus:border-blue-500 outline-none"
-                  />
-                  {availableModels.length > 0 && (
-                    <datalist id="available-models-datalist">
-                      {availableModels.map((m) => (
-                        <option key={m} value={m} />
-                      ))}
-                    </datalist>
-                  )}
-                </div>
-
-                {/* 候选模型快捷点选标签 (保持完全自定义，亦可一键点选切换) */}
-                {availableModels.length > 0 && (
-                  <div className="mt-2 space-y-1">
-                    <div className="flex items-center justify-between text-[10px] text-slate-400">
-                      <span>可用模型推荐 (点击一键填入，亦可自由输入修改)：</span>
-                      <span className="font-mono text-slate-500">{availableModels.length} 个候选</span>
-                    </div>
-                    <div className="flex flex-wrap gap-1.5 max-h-24 overflow-y-auto p-1.5 rounded-xl bg-slate-50 dark:bg-slate-950/70 border border-slate-200/70 dark:border-slate-800">
-                      {availableModels.map((m) => {
-                        const isSelected = llmConfig.model_name === m
-                        return (
-                          <button
-                            key={m}
-                            type="button"
-                            onClick={() => setLlmConfig({ ...llmConfig, model_name: m })}
-                            className={`px-2 py-0.5 rounded-lg text-[10px] font-mono transition-all cursor-pointer border ${
-                              isSelected
-                                ? 'bg-blue-600 text-white border-blue-600 font-bold shadow-2xs'
-                                : 'bg-white dark:bg-slate-850 text-slate-700 dark:text-slate-300 hover:border-blue-400 dark:hover:border-blue-500 hover:text-blue-600 dark:hover:text-blue-400 border-slate-200 dark:border-slate-750'
-                            }`}
-                          >
-                            {m}
-                          </button>
-                        )
-                      })}
-                    </div>
-                  </div>
-                )}
-              </div>
-
-              <div>
-                <label className="block text-slate-600 dark:text-slate-400 mb-1 font-medium">Base URL</label>
-                <input
-                  type="text"
-                  value={llmConfig.base_url}
-                  onChange={(e) => setLlmConfig({ ...llmConfig, base_url: e.target.value })}
-                  placeholder="https://api.deepseek.com"
-                  className="w-full px-3 py-2 rounded-xl bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 text-xs font-mono"
-                />
-              </div>
-
-              <div>
-                <label className="block text-slate-600 dark:text-slate-400 mb-1 font-medium">
-                  API Key
-                  {llmConfig.api_key_masked && (
-                    <span className="ml-2 text-[10px] text-emerald-500 font-mono">已配置: {llmConfig.api_key_masked}</span>
-                  )}
-                </label>
-                <input
-                  type="password"
-                  value={inputApiKey}
-                  onChange={(e) => setInputApiKey(e.target.value)}
-                  placeholder={llmConfig.has_api_key ? '留空保持原有 Key，或输入新 Key' : '请输入 API Key'}
-                  className="w-full px-3 py-2 rounded-xl bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 text-xs font-mono"
-                />
-              </div>
-
-              <div className="grid grid-cols-2 gap-3 pt-1">
-                <div>
-                  <label className="block text-slate-600 dark:text-slate-400 mb-1 font-medium">
-                    执行轮数上限 (Max Steps)
-                  </label>
-                  <input
-                    type="number"
-                    min={5}
-                    max={100}
-                    value={llmConfig.max_steps ?? 30}
-                    onChange={(e) => setLlmConfig({ ...llmConfig, max_steps: parseInt(e.target.value) || 30 })}
-                    placeholder="30"
-                    className="w-full px-3 py-2 rounded-xl bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 text-xs font-mono"
-                  />
-                  <p className="text-[10px] text-slate-400 mt-0.5">默认 30 轮（支持 10~100 轮）</p>
-                </div>
-                <div>
-                  <label className="block text-slate-600 dark:text-slate-400 mb-1 font-medium">
-                    模型温度 (Temperature)
-                  </label>
-                  <input
-                    type="number"
-                    step={0.1}
-                    min={0}
-                    max={2}
-                    value={llmConfig.temperature ?? 0.2}
-                    onChange={(e) => setLlmConfig({ ...llmConfig, temperature: parseFloat(e.target.value) || 0.2 })}
-                    placeholder="0.2"
-                    className="w-full px-3 py-2 rounded-xl bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 text-xs font-mono"
-                  />
-                  <p className="text-[10px] text-slate-400 mt-0.5">推荐 0.1 ~ 0.3</p>
-                </div>
-              </div>
-
-              {/* 四层分级架构：即时工作记忆上下文预算 (Context Budgeting) */}
-              <div className="pt-2 border-t border-slate-100 dark:border-slate-800 space-y-2">
-                <div className="flex items-center justify-between">
-                  <label className="text-slate-600 dark:text-slate-400 font-medium flex items-center gap-1.5">
-                    <span>上下文工作区预算 (Context Budget)</span>
-                  </label>
-                  <span className="text-[10px] text-slate-400 font-mono">
-                    约 {Math.round((llmConfig.context_budget ?? 32000) / 2)} Tokens / {llmConfig.max_context_turns ?? 25} 轮
-                  </span>
-                </div>
-
-                {/* 快捷档位预设 */}
-                <div className="grid grid-cols-4 gap-1.5">
-                  {[
-                    { label: '精简省流', chars: 16000, turns: 15, hint: '适合本地 Ollama / 低显存' },
-                    { label: '标准均衡', chars: 32000, turns: 25, hint: '推荐 DeepSeek / Qwen 黄金比' },
-                    { label: '超长深度', chars: 64000, turns: 35, hint: '适合长周期复杂对账' },
-                    { label: '海量吞吐', chars: 128000, turns: 50, hint: '适合 1M+ 超长上下文模型' },
-                  ].map((p) => {
-                    const active = (llmConfig.context_budget ?? 32000) === p.chars
-                    return (
-                      <button
-                        key={p.chars}
-                        type="button"
-                        onClick={() =>
-                          setLlmConfig({
-                            ...llmConfig,
-                            context_budget: p.chars,
-                            max_context_turns: p.turns,
-                          })
-                        }
-                        title={p.hint}
-                        className={`px-2 py-1.5 rounded-lg text-center transition-all cursor-pointer border ${
-                          active
-                            ? 'bg-blue-600 text-white border-blue-600 font-bold shadow-2xs'
-                            : 'bg-slate-50 dark:bg-slate-950 text-slate-600 dark:text-slate-300 border-slate-200 dark:border-slate-800 hover:border-blue-400'
-                        }`}
-                      >
-                        <div className="text-[11px] font-medium leading-tight">{p.label}</div>
-                        <div className={`text-[9px] mt-0.5 ${active ? 'text-blue-100' : 'text-slate-400'}`}>
-                          {p.chars / 1000}k 字符
-                        </div>
-                      </button>
-                    )
-                  })}
-                </div>
-
-                <div className="grid grid-cols-2 gap-3 pt-1">
-                  <div>
-                    <label className="block text-slate-500 dark:text-slate-400 mb-0.5 text-[11px]">
-                      字符预算 (Char Budget)
-                    </label>
-                    <input
-                      type="number"
-                      step={4000}
-                      min={4000}
-                      max={256000}
-                      value={llmConfig.context_budget ?? 32000}
-                      onChange={(e) =>
-                        setLlmConfig({ ...llmConfig, context_budget: parseInt(e.target.value) || 32000 })
-                      }
-                      placeholder="32000"
-                      className="w-full px-2.5 py-1.5 rounded-xl bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 text-xs font-mono"
-                    />
-                  </div>
-                  <div>
-                    <label className="block text-slate-500 dark:text-slate-400 mb-0.5 text-[11px]">
-                      高保真保留轮数 (Max Turns)
-                    </label>
-                    <input
-                      type="number"
-                      min={5}
-                      max={100}
-                      value={llmConfig.max_context_turns ?? 25}
-                      onChange={(e) =>
-                        setLlmConfig({ ...llmConfig, max_context_turns: parseInt(e.target.value) || 25 })
-                      }
-                      placeholder="25"
-                      className="w-full px-2.5 py-1.5 rounded-xl bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 text-xs font-mono"
-                    />
-                  </div>
-                </div>
-              </div>
-            </div>
-
-            <div className="flex items-center justify-between pt-2">
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={handleTestModelConnection}
-                disabled={isTestingModel}
-                className="text-xs text-slate-600 dark:text-slate-300 cursor-pointer"
-              >
-                {isTestingModel ? <RefreshCw className="h-3 w-3 animate-spin mr-1" /> : <Server className="h-3 w-3 mr-1" />}
-                <span>测试连通性</span>
-              </Button>
-
-              <div className="flex gap-2">
-                <Button variant="outline" size="sm" onClick={() => setIsModelModalOpen(false)}>
-                  取消
-                </Button>
-                <Button size="sm" onClick={handleSaveModelConfig} className="bg-blue-600 hover:bg-blue-500 text-white">
-                  保存配置
-                </Button>
-              </div>
-            </div>
-          </div>
-        </div>
+      {/* 服务级配置与当前认证范围的能力策略，共用一个草稿/保存入口。 */}
+      {isModelModalOpen && isAdminUser && (
+        <AgentSettingsDialog onClose={() => setIsModelModalOpen(false)} onModelSaved={setLlmConfig} returnFocusTo={modelSettingsTriggerRef.current} />
       )}
 
       {/* 6.5 编辑智能体资料弹窗 (名称、头像、描述) */}
